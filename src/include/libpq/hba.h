@@ -36,7 +36,8 @@ typedef enum IPCompareMethod
 {
 	ipCmpMask,
 	ipCmpSameHost,
-	ipCmpSameNet
+	ipCmpSameNet,
+	ipCmpAll
 } IPCompareMethod;
 
 typedef enum ConnType
@@ -56,6 +57,7 @@ typedef struct
 	struct sockaddr_storage addr;
 	struct sockaddr_storage mask;
 	IPCompareMethod ip_cmp_method;
+	char	   *hostname;
 	UserAuth	auth_method;
 
 	char	   *usermap;

@@ -896,6 +896,7 @@ typedef struct InsertStmt
 	List	   *cols;			/* optional: names of the target columns */
 	Node	   *selectStmt;		/* the source SELECT/VALUES, or NULL */
 	List	   *returningList;	/* list of expressions to return */
+	WithClause *withClause;		/* WITH clause */
 } InsertStmt;
 
 /* ----------------------
@@ -909,6 +910,7 @@ typedef struct DeleteStmt
 	List	   *usingClause;	/* optional using clause for more tables */
 	Node	   *whereClause;	/* qualifications */
 	List	   *returningList;	/* list of expressions to return */
+	WithClause *withClause;		/* WITH clause */
 } DeleteStmt;
 
 /* ----------------------
@@ -923,6 +925,7 @@ typedef struct UpdateStmt
 	Node	   *whereClause;	/* qualifications */
 	List	   *fromClause;		/* optional from clause for more tables */
 	List	   *returningList;	/* list of expressions to return */
+	WithClause *withClause;		/* WITH clause */
 } UpdateStmt;
 
 /* ----------------------
@@ -1608,10 +1611,11 @@ typedef struct CreateTrigStmt
 	RangeVar   *relation;		/* relation trigger is on */
 	List	   *funcname;		/* qual. name of function to call */
 	List	   *args;			/* list of (T_String) Values or NIL */
-	bool		before;			/* BEFORE/AFTER */
 	bool		row;			/* ROW/STATEMENT */
+	/* timing uses the TRIGGER_TYPE bits defined in catalog/pg_trigger.h */
+	int16		timing;			/* BEFORE, AFTER, or INSTEAD */
 	/* events uses the TRIGGER_TYPE bits defined in catalog/pg_trigger.h */
-	int16		events;			/* INSERT/UPDATE/DELETE/TRUNCATE */
+	int16		events;			/* "OR" of INSERT/UPDATE/DELETE/TRUNCATE */
 	List	   *columns;		/* column names, or NIL for all columns */
 	Node	   *whenClause;		/* qual expression, or NULL if none */
 	bool		isconstraint;	/* This is a constraint trigger */

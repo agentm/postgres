@@ -172,10 +172,10 @@ entryIsMoveRight(GinBtree btree, Page page)
 
 	itup = getRightMostTuple(page);
 
-	if (compareAttEntries(btree->ginstate,
-						  btree->entryAttnum, btree->entryValue,
-						  gintuple_get_attrnum(btree->ginstate, itup),
-						  gin_index_getattr(btree->ginstate, itup)) > 0)
+	if (ginCompareAttEntries(btree->ginstate,
+							 btree->entryAttnum, btree->entryValue,
+							 gintuple_get_attrnum(btree->ginstate, itup),
+							 gin_index_getattr(btree->ginstate, itup)) > 0)
 		return TRUE;
 
 	return FALSE;
@@ -221,8 +221,9 @@ entryLocateEntry(GinBtree btree, GinBtreeStack *stack)
 		else
 		{
 			itup = (IndexTuple) PageGetItem(page, PageGetItemId(page, mid));
-			result = compareAttEntries(btree->ginstate,
-									   btree->entryAttnum, btree->entryValue,
+			result = ginCompareAttEntries(btree->ginstate,
+										  btree->entryAttnum,
+										  btree->entryValue,
 								 gintuple_get_attrnum(btree->ginstate, itup),
 								   gin_index_getattr(btree->ginstate, itup));
 		}
@@ -286,8 +287,9 @@ entryLocateLeafEntry(GinBtree btree, GinBtreeStack *stack)
 		int			result;
 
 		itup = (IndexTuple) PageGetItem(page, PageGetItemId(page, mid));
-		result = compareAttEntries(btree->ginstate,
-								   btree->entryAttnum, btree->entryValue,
+		result = ginCompareAttEntries(btree->ginstate,
+									  btree->entryAttnum,
+									  btree->entryValue,
 								 gintuple_get_attrnum(btree->ginstate, itup),
 								   gin_index_getattr(btree->ginstate, itup));
 		if (result == 0)
@@ -636,7 +638,7 @@ ginPageGetLinkItup(Buffer buf)
  * Also called from ginxlog, should not use btree
  */
 void
-entryFillRoot(GinBtree btree, Buffer root, Buffer lbuf, Buffer rbuf)
+ginEntryFillRoot(GinBtree btree, Buffer root, Buffer lbuf, Buffer rbuf)
 {
 	Page		page;
 	IndexTuple	itup;
@@ -655,27 +657,29 @@ entryFillRoot(GinBtree btree, Buffer root, Buffer lbuf, Buffer rbuf)
 }
 
 void
-prepareEntryScan(GinBtree btree, Relation index, OffsetNumber attnum, Datum value, GinState *ginstate)
+ginPrepareEntryScan(GinBtree btree, Relation index, OffsetNumber attnum, Datum value, GinState *ginstate)
 {
 	memset(btree, 0, sizeof(GinBtreeData));
 
-	btree->isMoveRight = entryIsMoveRight;
+	btree->index = index;
+	btree->ginstate = ginstate;
+
 	btree->findChildPage = entryLocateEntry;
+	btree->isMoveRight = entryIsMoveRight;
 	btree->findItem = entryLocateLeafEntry;
 	btree->findChildPtr = entryFindChildPtr;
 	btree->getLeftMostPage = entryGetLeftMostPage;
 	btree->isEnoughSpace = entryIsEnoughSpace;
 	btree->placeToPage = entryPlaceToPage;
 	btree->splitPage = entrySplitPage;
-	btree->fillRoot = entryFillRoot;
+	btree->fillRoot = ginEntryFillRoot;
 
-	btree->index = index;
-	btree->ginstate = ginstate;
-	btree->entryAttnum = attnum;
-	btree->entryValue = value;
-
-	btree->isDelete = FALSE;
+	btree->isData = FALSE;
 	btree->searchMode = FALSE;
 	btree->fullScan = FALSE;
 	btree->isBuild = FALSE;
+
+	btree->entryAttnum = attnum;
+	btree->entryValue = value;
+	btree->isDelete = FALSE;
 }

@@ -13,10 +13,12 @@
  */
 
 #include "postgres.h"
+
 #include "access/genam.h"
 #include "access/gin.h"
 #include "access/reloptions.h"
 #include "catalog/pg_type.h"
+#include "miscadmin.h"
 #include "storage/bufmgr.h"
 #include "storage/freespace.h"
 #include "storage/indexfsm.h"
@@ -227,25 +229,25 @@ GinInitMetabuffer(Buffer b)
 	metadata->tailFreeSize = 0;
 	metadata->nPendingPages = 0;
 	metadata->nPendingHeapTuples = 0;
+	metadata->nTotalPages = 0;
+	metadata->nEntryPages = 0;
+	metadata->nDataPages = 0;
+	metadata->nEntries = 0;
 }
 
 int
-compareEntries(GinState *ginstate, OffsetNumber attnum, Datum a, Datum b)
+ginCompareEntries(GinState *ginstate, OffsetNumber attnum, Datum a, Datum b)
 {
-	return DatumGetInt32(
-						 FunctionCall2(
-									   &ginstate->compareFn[attnum - 1],
-									   a, b
-									   )
-		);
+	return DatumGetInt32(FunctionCall2(&ginstate->compareFn[attnum - 1],
+									   a, b));
 }
 
 int
-compareAttEntries(GinState *ginstate, OffsetNumber attnum_a, Datum a,
-				  OffsetNumber attnum_b, Datum b)
+ginCompareAttEntries(GinState *ginstate, OffsetNumber attnum_a, Datum a,
+					 OffsetNumber attnum_b, Datum b)
 {
 	if (attnum_a == attnum_b)
-		return compareEntries(ginstate, attnum_a, a, b);
+		return ginCompareEntries(ginstate, attnum_a, a, b);
 
 	return (attnum_a < attnum_b) ? -1 : 1;
 }
@@ -269,7 +271,7 @@ cmpEntries(const Datum *a, const Datum *b, cmpEntriesData *arg)
 }
 
 Datum *
-extractEntriesS(GinState *ginstate, OffsetNumber attnum, Datum value, int32 *nentries,
+ginExtractEntriesS(GinState *ginstate, OffsetNumber attnum, Datum value, int32 *nentries,
 				bool *needUnique)
 {
 	Datum	   *entries;
@@ -299,11 +301,11 @@ extractEntriesS(GinState *ginstate, OffsetNumber attnum, Datum value, int32 *nen
 
 
 Datum *
-extractEntriesSU(GinState *ginstate, OffsetNumber attnum, Datum value, int32 *nentries)
+ginExtractEntriesSU(GinState *ginstate, OffsetNumber attnum, Datum value, int32 *nentries)
 {
 	bool		needUnique;
-	Datum	   *entries = extractEntriesS(ginstate, attnum, value, nentries,
-										  &needUnique);
+	Datum	   *entries = ginExtractEntriesS(ginstate, attnum, value, nentries,
+											 &needUnique);
 
 	if (needUnique)
 	{
@@ -314,7 +316,7 @@ extractEntriesSU(GinState *ginstate, OffsetNumber attnum, Datum value, int32 *ne
 
 		while (ptr - entries < *nentries)
 		{
-			if (compareEntries(ginstate, attnum, *ptr, *res) != 0)
+			if (ginCompareEntries(ginstate, attnum, *ptr, *res) != 0)
 				*(++res) = *ptr++;
 			else
 				ptr++;
@@ -353,4 +355,83 @@ ginoptions(PG_FUNCTION_ARGS)
 	pfree(options);
 
 	PG_RETURN_BYTEA_P(rdopts);
+}
+
+/*
+ * Fetch index's statistical data into *stats
+ *
+ * Note: in the result, nPendingPages can be trusted to be up-to-date,
+ * but the other fields are as of the last VACUUM.
+ */
+void
+ginGetStats(Relation index, GinStatsData *stats)
+{
+	Buffer			metabuffer;
+	Page			metapage;
+	GinMetaPageData	*metadata;
+
+	metabuffer = ReadBuffer(index, GIN_METAPAGE_BLKNO);
+	LockBuffer(metabuffer, GIN_SHARE);
+	metapage = BufferGetPage(metabuffer);
+	metadata = GinPageGetMeta(metapage);
+
+	stats->nPendingPages = metadata->nPendingPages;
+	stats->nTotalPages = metadata->nTotalPages;
+	stats->nEntryPages = metadata->nEntryPages;
+	stats->nDataPages = metadata->nDataPages;
+	stats->nEntries = metadata->nEntries;
+
+	UnlockReleaseBuffer(metabuffer);
+}
+
+/*
+ * Write the given statistics to the index's metapage
+ *
+ * Note: nPendingPages is *not* copied over
+ */
+void
+ginUpdateStats(Relation index, const GinStatsData *stats)
+{
+	Buffer			metabuffer;
+	Page			metapage;
+	GinMetaPageData	*metadata;
+
+	metabuffer = ReadBuffer(index, GIN_METAPAGE_BLKNO);
+	LockBuffer(metabuffer, GIN_EXCLUSIVE);
+	metapage = BufferGetPage(metabuffer);
+	metadata = GinPageGetMeta(metapage);
+
+	START_CRIT_SECTION();
+
+	metadata->nTotalPages = stats->nTotalPages;
+	metadata->nEntryPages = stats->nEntryPages;
+	metadata->nDataPages = stats->nDataPages;
+	metadata->nEntries = stats->nEntries;
+
+	MarkBufferDirty(metabuffer);
+
+	if (!index->rd_istemp)
+	{
+		XLogRecPtr			recptr;
+		ginxlogUpdateMeta	data;
+		XLogRecData			rdata;
+
+		data.node = index->rd_node;
+		data.ntuples = 0;
+		data.newRightlink = data.prevTail = InvalidBlockNumber;
+		memcpy(&data.metadata, metadata, sizeof(GinMetaPageData));
+
+		rdata.buffer = InvalidBuffer;
+		rdata.data = (char *) &data;
+		rdata.len = sizeof(ginxlogUpdateMeta);
+		rdata.next = NULL;
+
+		recptr = XLogInsert(RM_GIN_ID, XLOG_GIN_UPDATE_META_PAGE, &rdata);
+		PageSetLSN(metapage, recptr);
+		PageSetTLI(metapage, ThisTimeLineID);
+	}
+
+	UnlockReleaseBuffer(metabuffer);
+
+	END_CRIT_SECTION();
 }

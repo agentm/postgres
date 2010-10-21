@@ -19,7 +19,7 @@
 #include "utils/rel.h"
 
 int
-compareItemPointers(ItemPointer a, ItemPointer b)
+ginCompareItemPointers(ItemPointer a, ItemPointer b)
 {
 	if (GinItemPointerGetBlockNumber(a) == GinItemPointerGetBlockNumber(b))
 	{
@@ -37,9 +37,9 @@ compareItemPointers(ItemPointer a, ItemPointer b)
  * Caller is responsible that there is enough space at *dst.
  */
 uint32
-MergeItemPointers(ItemPointerData *dst,
-				  ItemPointerData *a, uint32 na,
-				  ItemPointerData *b, uint32 nb)
+ginMergeItemPointers(ItemPointerData *dst,
+					 ItemPointerData *a, uint32 na,
+					 ItemPointerData *b, uint32 nb)
 {
 	ItemPointerData *dptr = dst;
 	ItemPointerData *aptr = a,
@@ -47,7 +47,7 @@ MergeItemPointers(ItemPointerData *dst,
 
 	while (aptr - a < na && bptr - b < nb)
 	{
-		int			cmp = compareItemPointers(aptr, bptr);
+		int			cmp = ginCompareItemPointers(aptr, bptr);
 
 		if (cmp > 0)
 			*dptr++ = *bptr++;
@@ -82,7 +82,7 @@ dataIsMoveRight(GinBtree btree, Page page)
 	if (GinPageRightMost(page))
 		return FALSE;
 
-	return (compareItemPointers(btree->items + btree->curitem, iptr) > 0) ? TRUE : FALSE;
+	return (ginCompareItemPointers(btree->items + btree->curitem, iptr) > 0) ? TRUE : FALSE;
 }
 
 /*
@@ -131,7 +131,7 @@ dataLocateItem(GinBtree btree, GinBtreeStack *stack)
 		else
 		{
 			pitem = (PostingItem *) GinDataPageGetItem(page, mid);
-			result = compareItemPointers(btree->items + btree->curitem, &(pitem->key));
+			result = ginCompareItemPointers(btree->items + btree->curitem, &(pitem->key));
 		}
 
 		if (result == 0)
@@ -189,7 +189,7 @@ dataLocateLeafItem(GinBtree btree, GinBtreeStack *stack)
 	{
 		OffsetNumber mid = low + ((high - low) / 2);
 
-		result = compareItemPointers(btree->items + btree->curitem, (ItemPointer) GinDataPageGetItem(page, mid));
+		result = ginCompareItemPointers(btree->items + btree->curitem, (ItemPointer) GinDataPageGetItem(page, mid));
 
 		if (result == 0)
 		{
@@ -297,7 +297,7 @@ GinDataPageAddItem(Page page, void *data, OffsetNumber offset)
  * Deletes posting item from non-leaf page
  */
 void
-PageDeletePostingItem(Page page, OffsetNumber offset)
+GinPageDeletePostingItem(Page page, OffsetNumber offset)
 {
 	OffsetNumber maxoff = GinPageGetOpaque(page)->maxoff;
 
@@ -571,7 +571,7 @@ dataSplitPage(GinBtree btree, Buffer lbuf, Buffer rbuf, OffsetNumber off, XLogRe
  * Also called from ginxlog, should not use btree
  */
 void
-dataFillRoot(GinBtree btree, Buffer root, Buffer lbuf, Buffer rbuf)
+ginDataFillRoot(GinBtree btree, Buffer root, Buffer lbuf, Buffer rbuf)
 {
 	Page		page = BufferGetPage(root),
 				lpage = BufferGetPage(lbuf),
@@ -589,20 +589,23 @@ dataFillRoot(GinBtree btree, Buffer root, Buffer lbuf, Buffer rbuf)
 }
 
 void
-prepareDataScan(GinBtree btree, Relation index)
+ginPrepareDataScan(GinBtree btree, Relation index)
 {
 	memset(btree, 0, sizeof(GinBtreeData));
+
 	btree->index = index;
-	btree->isMoveRight = dataIsMoveRight;
+
 	btree->findChildPage = dataLocateItem;
+	btree->isMoveRight = dataIsMoveRight;
 	btree->findItem = dataLocateLeafItem;
 	btree->findChildPtr = dataFindChildPtr;
 	btree->getLeftMostPage = dataGetLeftMostPage;
 	btree->isEnoughSpace = dataIsEnoughSpace;
 	btree->placeToPage = dataPlaceToPage;
 	btree->splitPage = dataSplitPage;
-	btree->fillRoot = dataFillRoot;
+	btree->fillRoot = ginDataFillRoot;
 
+	btree->isData = TRUE;
 	btree->searchMode = FALSE;
 	btree->isDelete = FALSE;
 	btree->fullScan = FALSE;
@@ -610,11 +613,11 @@ prepareDataScan(GinBtree btree, Relation index)
 }
 
 GinPostingTreeScan *
-prepareScanPostingTree(Relation index, BlockNumber rootBlkno, bool searchMode)
+ginPrepareScanPostingTree(Relation index, BlockNumber rootBlkno, bool searchMode)
 {
 	GinPostingTreeScan *gdi = (GinPostingTreeScan *) palloc0(sizeof(GinPostingTreeScan));
 
-	prepareDataScan(&gdi->btree, index);
+	ginPrepareDataScan(&gdi->btree, index);
 
 	gdi->btree.searchMode = searchMode;
 	gdi->btree.fullScan = searchMode;
@@ -628,7 +631,9 @@ prepareScanPostingTree(Relation index, BlockNumber rootBlkno, bool searchMode)
  * Inserts array of item pointers, may execute several tree scan (very rare)
  */
 void
-insertItemPointer(GinPostingTreeScan *gdi, ItemPointerData *items, uint32 nitem)
+ginInsertItemPointer(GinPostingTreeScan *gdi,
+					 ItemPointerData *items, uint32 nitem,
+					 GinStatsData *buildStats)
 {
 	BlockNumber rootBlkno = gdi->stack->blkno;
 
@@ -653,14 +658,14 @@ insertItemPointer(GinPostingTreeScan *gdi, ItemPointerData *items, uint32 nitem)
 			freeGinBtreeStack(gdi->stack);
 		}
 		else
-			ginInsertValue(&(gdi->btree), gdi->stack);
+			ginInsertValue(&(gdi->btree), gdi->stack, buildStats);
 
 		gdi->stack = NULL;
 	}
 }
 
 Buffer
-scanBeginPostingTree(GinPostingTreeScan *gdi)
+ginScanBeginPostingTree(GinPostingTreeScan *gdi)
 {
 	gdi->stack = ginFindLeafPage(&gdi->btree, gdi->stack);
 	return gdi->stack->buffer;

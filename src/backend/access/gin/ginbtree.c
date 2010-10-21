@@ -173,8 +173,8 @@ freeGinBtreeStack(GinBtreeStack *stack)
  * with vacuum process
  */
 void
-findParents(GinBtree btree, GinBtreeStack *stack,
-			BlockNumber rootBlkno)
+ginFindParents(GinBtree btree, GinBtreeStack *stack,
+			   BlockNumber rootBlkno)
 {
 
 	Page		page;
@@ -268,10 +268,13 @@ findParents(GinBtree btree, GinBtreeStack *stack,
 /*
  * Insert value (stored in GinBtree) to tree described by stack
  *
+ * During an index build, buildStats is non-null and the counters
+ * it contains should be incremented as needed.
+ *
  * NB: the passed-in stack is freed, as though by freeGinBtreeStack.
  */
 void
-ginInsertValue(GinBtree btree, GinBtreeStack *stack)
+ginInsertValue(GinBtree btree, GinBtreeStack *stack, GinStatsData *buildStats)
 {
 	GinBtreeStack *parent = stack;
 	BlockNumber rootBlkno = InvalidBuffer;
@@ -330,6 +333,15 @@ ginInsertValue(GinBtree btree, GinBtreeStack *stack)
 
 			((ginxlogSplit *) (rdata->data))->rootBlkno = rootBlkno;
 
+			/* During index build, count the newly-split page */
+			if (buildStats)
+			{
+				if (btree->isData)
+					buildStats->nDataPages++;
+				else
+					buildStats->nEntryPages++;
+			}
+
 			parent = stack->parent;
 
 			if (parent == NULL)
@@ -380,6 +392,15 @@ ginInsertValue(GinBtree btree, GinBtreeStack *stack)
 				END_CRIT_SECTION();
 
 				freeGinBtreeStack(stack);
+
+				/* During index build, count the newly-added root page */
+				if (buildStats)
+				{
+					if (btree->isData)
+						buildStats->nDataPages++;
+					else
+						buildStats->nEntryPages++;
+				}
 
 				return;
 			}
@@ -435,7 +456,7 @@ ginInsertValue(GinBtree btree, GinBtreeStack *stack)
 				 * rightmost page, but we don't find parent, we should use
 				 * plain search...
 				 */
-				findParents(btree, stack, rootBlkno);
+				ginFindParents(btree, stack, rootBlkno);
 				parent = stack->parent;
 				page = BufferGetPage(parent->buffer);
 				break;

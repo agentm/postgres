@@ -526,7 +526,7 @@ plpgsql_exec_trigger(PLpgSQL_function *func,
 	rec_old->tupdesc = trigdata->tg_relation->rd_att;
 	rec_old->freetupdesc = false;
 
-	if (TRIGGER_FIRED_FOR_STATEMENT(trigdata->tg_event))
+	if (!TRIGGER_FIRED_FOR_ROW(trigdata->tg_event))
 	{
 		/*
 		 * Per-statement triggers don't use OLD/NEW variables
@@ -581,8 +581,10 @@ plpgsql_exec_trigger(PLpgSQL_function *func,
 		var->value = CStringGetTextDatum("BEFORE");
 	else if (TRIGGER_FIRED_AFTER(trigdata->tg_event))
 		var->value = CStringGetTextDatum("AFTER");
+	else if (TRIGGER_FIRED_INSTEAD(trigdata->tg_event))
+		var->value = CStringGetTextDatum("INSTEAD OF");
 	else
-		elog(ERROR, "unrecognized trigger execution time: not BEFORE or AFTER");
+		elog(ERROR, "unrecognized trigger execution time: not BEFORE, AFTER, or INSTEAD OF");
 	var->isnull = false;
 	var->freeval = true;
 
@@ -715,7 +717,7 @@ plpgsql_exec_trigger(PLpgSQL_function *func,
 	 * attributes don't have the correct atttypmod's length. It's up to the
 	 * trigger's programmer to ensure that this doesn't happen. Jan
 	 */
-	if (estate.retisnull || TRIGGER_FIRED_FOR_STATEMENT(trigdata->tg_event))
+	if (estate.retisnull || !TRIGGER_FIRED_FOR_ROW(trigdata->tg_event))
 		rettup = NULL;
 	else
 	{

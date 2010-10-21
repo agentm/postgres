@@ -5690,8 +5690,8 @@ CreateFKCheckTrigger(RangeVar *myRel, Constraint *fkconstraint,
 	fk_trigger = makeNode(CreateTrigStmt);
 	fk_trigger->trigname = "RI_ConstraintTrigger";
 	fk_trigger->relation = myRel;
-	fk_trigger->before = false;
 	fk_trigger->row = true;
+	fk_trigger->timing = TRIGGER_TYPE_AFTER;
 
 	/* Either ON INSERT or ON UPDATE */
 	if (on_insert)
@@ -5753,8 +5753,8 @@ createForeignKeyTriggers(Relation rel, Constraint *fkconstraint,
 	fk_trigger = makeNode(CreateTrigStmt);
 	fk_trigger->trigname = "RI_ConstraintTrigger";
 	fk_trigger->relation = fkconstraint->pktable;
-	fk_trigger->before = false;
 	fk_trigger->row = true;
+	fk_trigger->timing = TRIGGER_TYPE_AFTER;
 	fk_trigger->events = TRIGGER_TYPE_DELETE;
 	fk_trigger->columns = NIL;
 	fk_trigger->whenClause = NULL;
@@ -5806,8 +5806,8 @@ createForeignKeyTriggers(Relation rel, Constraint *fkconstraint,
 	fk_trigger = makeNode(CreateTrigStmt);
 	fk_trigger->trigname = "RI_ConstraintTrigger";
 	fk_trigger->relation = fkconstraint->pktable;
-	fk_trigger->before = false;
 	fk_trigger->row = true;
+	fk_trigger->timing = TRIGGER_TYPE_AFTER;
 	fk_trigger->events = TRIGGER_TYPE_UPDATE;
 	fk_trigger->columns = NIL;
 	fk_trigger->whenClause = NULL;
@@ -6411,6 +6411,24 @@ ATExecAlterColumnType(AlteredTableInfo *tab, Relation rel,
 								   colName)));
 				break;
 
+			case OCLASS_TRIGGER:
+				/*
+				 * A trigger can depend on a column because the column is
+				 * specified as an update target, or because the column is
+				 * used in the trigger's WHEN condition.  The first case would
+				 * not require any extra work, but the second case would
+				 * require updating the WHEN expression, which will take a
+				 * significant amount of new code.  Since we can't easily tell
+				 * which case applies, we punt for both.  FIXME someday.
+				 */
+				ereport(ERROR,
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("cannot alter type of a column used in a trigger definition"),
+						 errdetail("%s depends on column \"%s\"",
+								   getObjectDescription(&foundObject),
+								   colName)));
+				break;
+
 			case OCLASS_DEFAULT:
 
 				/*
@@ -6431,7 +6449,6 @@ ATExecAlterColumnType(AlteredTableInfo *tab, Relation rel,
 			case OCLASS_OPFAMILY:
 			case OCLASS_AMOP:
 			case OCLASS_AMPROC:
-			case OCLASS_TRIGGER:
 			case OCLASS_SCHEMA:
 			case OCLASS_TSPARSER:
 			case OCLASS_TSDICT:

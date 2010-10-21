@@ -545,8 +545,13 @@ pg_get_triggerdef_worker(Oid trigid, bool pretty)
 
 	if (TRIGGER_FOR_BEFORE(trigrec->tgtype))
 		appendStringInfo(&buf, "BEFORE");
-	else
+	else if (TRIGGER_FOR_AFTER(trigrec->tgtype))
 		appendStringInfo(&buf, "AFTER");
+	else if (TRIGGER_FOR_INSTEAD(trigrec->tgtype))
+		appendStringInfo(&buf, "INSTEAD OF");
+	else
+		elog(ERROR, "unexpected tgtype value: %d", trigrec->tgtype);
+
 	if (TRIGGER_FOR_INSERT(trigrec->tgtype))
 	{
 		appendStringInfo(&buf, " INSERT");
@@ -2169,15 +2174,17 @@ set_deparse_planstate(deparse_namespace *dpns, PlanState *ps)
 	dpns->planstate = ps;
 
 	/*
-	 * We special-case Append to pretend that the first child plan is the
-	 * OUTER referent; we have to interpret OUTER Vars in the Append's tlist
-	 * according to one of the children, and the first one is the most natural
-	 * choice.	Likewise special-case ModifyTable to pretend that the first
-	 * child plan is the OUTER referent; this is to support RETURNING lists
-	 * containing references to non-target relations.
+	 * We special-case Append and MergeAppend to pretend that the first child
+	 * plan is the OUTER referent; we have to interpret OUTER Vars in their
+	 * tlists according to one of the children, and the first one is the most
+	 * natural choice.  Likewise special-case ModifyTable to pretend that the
+	 * first child plan is the OUTER referent; this is to support RETURNING
+	 * lists containing references to non-target relations.
 	 */
 	if (IsA(ps, AppendState))
 		dpns->outer_planstate = ((AppendState *) ps)->appendplans[0];
+	else if (IsA(ps, MergeAppendState))
+		dpns->outer_planstate = ((MergeAppendState *) ps)->mergeplans[0];
 	else if (IsA(ps, ModifyTableState))
 		dpns->outer_planstate = ((ModifyTableState *) ps)->mt_plans[0];
 	else
@@ -3345,6 +3352,9 @@ get_insert_query_def(Query *query, deparse_context *context)
 	ListCell   *l;
 	List	   *strippedexprs;
 
+	/* Insert the WITH clause if given */
+	get_with_clause(query, context);
+
 	/*
 	 * If it's an INSERT ... SELECT or VALUES (...), (...), ... there will be
 	 * a single RTE for the SELECT or VALUES.
@@ -3444,15 +3454,11 @@ get_insert_query_def(Query *query, deparse_context *context)
 	}
 	else if (values_rte)
 	{
-		/* A WITH clause is possible here */
-		get_with_clause(query, context);
 		/* Add the multi-VALUES expression lists */
 		get_values_def(values_rte->values_lists, context);
 	}
 	else
 	{
-		/* A WITH clause is possible here */
-		get_with_clause(query, context);
 		/* Add the single-VALUES expression list */
 		appendContextKeyword(context, "VALUES (",
 							 -PRETTYINDENT_STD, PRETTYINDENT_STD, 2);
@@ -3481,6 +3487,9 @@ get_update_query_def(Query *query, deparse_context *context)
 	char	   *sep;
 	RangeTblEntry *rte;
 	ListCell   *l;
+
+	/* Insert the WITH clause if given */
+	get_with_clause(query, context);
 
 	/*
 	 * Start the query with UPDATE relname SET
@@ -3562,6 +3571,9 @@ get_delete_query_def(Query *query, deparse_context *context)
 {
 	StringInfo	buf = context->buf;
 	RangeTblEntry *rte;
+
+	/* Insert the WITH clause if given */
+	get_with_clause(query, context);
 
 	/*
 	 * Start the query with DELETE FROM relname

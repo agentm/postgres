@@ -1071,33 +1071,37 @@ cost_recursive_union(Plan *runion, Plan *nrterm, Plan *rterm)
  *	  Determines and returns the cost of sorting a relation, including
  *	  the cost of reading the input data.
  *
- * If the total volume of data to sort is less than work_mem, we will do
+ * If the total volume of data to sort is less than sort_mem, we will do
  * an in-memory sort, which requires no I/O and about t*log2(t) tuple
  * comparisons for t tuples.
  *
- * If the total volume exceeds work_mem, we switch to a tape-style merge
+ * If the total volume exceeds sort_mem, we switch to a tape-style merge
  * algorithm.  There will still be about t*log2(t) tuple comparisons in
  * total, but we will also need to write and read each tuple once per
  * merge pass.	We expect about ceil(logM(r)) merge passes where r is the
  * number of initial runs formed and M is the merge order used by tuplesort.c.
- * Since the average initial run should be about twice work_mem, we have
- *		disk traffic = 2 * relsize * ceil(logM(p / (2*work_mem)))
+ * Since the average initial run should be about twice sort_mem, we have
+ *		disk traffic = 2 * relsize * ceil(logM(p / (2*sort_mem)))
  *		cpu = comparison_cost * t * log2(t)
  *
  * If the sort is bounded (i.e., only the first k result tuples are needed)
- * and k tuples can fit into work_mem, we use a heap method that keeps only
+ * and k tuples can fit into sort_mem, we use a heap method that keeps only
  * k tuples in the heap; this will require about t*log2(k) tuple comparisons.
  *
  * The disk traffic is assumed to be 3/4ths sequential and 1/4th random
  * accesses (XXX can't we refine that guess?)
  *
- * We charge two operator evals per tuple comparison, which should be in
- * the right ballpark in most cases.
+ * By default, we charge two operator evals per tuple comparison, which should
+ * be in the right ballpark in most cases.  The caller can tweak this by
+ * specifying nonzero comparison_cost; typically that's used for any extra
+ * work that has to be done to prepare the inputs to the comparison operators.
  *
  * 'pathkeys' is a list of sort keys
  * 'input_cost' is the total cost for reading the input data
  * 'tuples' is the number of tuples in the relation
  * 'width' is the average tuple width in bytes
+ * 'comparison_cost' is the extra cost per comparison, if any
+ * 'sort_mem' is the number of kilobytes of work memory allowed for the sort
  * 'limit_tuples' is the bound on the number of output tuples; -1 if no bound
  *
  * NOTE: some callers currently pass NIL for pathkeys because they
@@ -1110,6 +1114,7 @@ cost_recursive_union(Plan *runion, Plan *nrterm, Plan *rterm)
 void
 cost_sort(Path *path, PlannerInfo *root,
 		  List *pathkeys, Cost input_cost, double tuples, int width,
+		  Cost comparison_cost, int sort_mem,
 		  double limit_tuples)
 {
 	Cost		startup_cost = input_cost;
@@ -1117,7 +1122,7 @@ cost_sort(Path *path, PlannerInfo *root,
 	double		input_bytes = relation_byte_size(tuples, width);
 	double		output_bytes;
 	double		output_tuples;
-	long		work_mem_bytes = work_mem * 1024L;
+	long		sort_mem_bytes = sort_mem * 1024L;
 
 	if (!enable_sort)
 		startup_cost += disable_cost;
@@ -1128,6 +1133,9 @@ cost_sort(Path *path, PlannerInfo *root,
 	 */
 	if (tuples < 2.0)
 		tuples = 2.0;
+
+	/* Include the default cost-per-comparison */
+	comparison_cost += 2.0 * cpu_operator_cost;
 
 	/* Do we have a useful LIMIT? */
 	if (limit_tuples > 0 && limit_tuples < tuples)
@@ -1141,24 +1149,23 @@ cost_sort(Path *path, PlannerInfo *root,
 		output_bytes = input_bytes;
 	}
 
-	if (output_bytes > work_mem_bytes)
+	if (output_bytes > sort_mem_bytes)
 	{
 		/*
 		 * We'll have to use a disk-based sort of all the tuples
 		 */
 		double		npages = ceil(input_bytes / BLCKSZ);
-		double		nruns = (input_bytes / work_mem_bytes) * 0.5;
-		double		mergeorder = tuplesort_merge_order(work_mem_bytes);
+		double		nruns = (input_bytes / sort_mem_bytes) * 0.5;
+		double		mergeorder = tuplesort_merge_order(sort_mem_bytes);
 		double		log_runs;
 		double		npageaccesses;
 
 		/*
 		 * CPU costs
 		 *
-		 * Assume about two operator evals per tuple comparison and N log2 N
-		 * comparisons
+		 * Assume about N log2 N comparisons
 		 */
-		startup_cost += 2.0 * cpu_operator_cost * tuples * LOG2(tuples);
+		startup_cost += comparison_cost * tuples * LOG2(tuples);
 
 		/* Disk costs */
 
@@ -1172,7 +1179,7 @@ cost_sort(Path *path, PlannerInfo *root,
 		startup_cost += npageaccesses *
 			(seq_page_cost * 0.75 + random_page_cost * 0.25);
 	}
-	else if (tuples > 2 * output_tuples || input_bytes > work_mem_bytes)
+	else if (tuples > 2 * output_tuples || input_bytes > sort_mem_bytes)
 	{
 		/*
 		 * We'll use a bounded heap-sort keeping just K tuples in memory, for
@@ -1180,12 +1187,12 @@ cost_sort(Path *path, PlannerInfo *root,
 		 * factor is a bit higher than for quicksort.  Tweak it so that the
 		 * cost curve is continuous at the crossover point.
 		 */
-		startup_cost += 2.0 * cpu_operator_cost * tuples * LOG2(2.0 * output_tuples);
+		startup_cost += comparison_cost * tuples * LOG2(2.0 * output_tuples);
 	}
 	else
 	{
 		/* We'll use plain quicksort on all the input tuples */
-		startup_cost += 2.0 * cpu_operator_cost * tuples * LOG2(tuples);
+		startup_cost += comparison_cost * tuples * LOG2(tuples);
 	}
 
 	/*
@@ -1200,6 +1207,70 @@ cost_sort(Path *path, PlannerInfo *root,
 
 	path->startup_cost = startup_cost;
 	path->total_cost = startup_cost + run_cost;
+}
+
+/*
+ * cost_merge_append
+ *	  Determines and returns the cost of a MergeAppend node.
+ *
+ * MergeAppend merges several pre-sorted input streams, using a heap that
+ * at any given instant holds the next tuple from each stream.  If there
+ * are N streams, we need about N*log2(N) tuple comparisons to construct
+ * the heap at startup, and then for each output tuple, about log2(N)
+ * comparisons to delete the top heap entry and another log2(N) comparisons
+ * to insert its successor from the same stream.
+ *
+ * (The effective value of N will drop once some of the input streams are
+ * exhausted, but it seems unlikely to be worth trying to account for that.)
+ *
+ * The heap is never spilled to disk, since we assume N is not very large.
+ * So this is much simpler than cost_sort.
+ *
+ * As in cost_sort, we charge two operator evals per tuple comparison.
+ *
+ * 'pathkeys' is a list of sort keys
+ * 'n_streams' is the number of input streams
+ * 'input_startup_cost' is the sum of the input streams' startup costs
+ * 'input_total_cost' is the sum of the input streams' total costs
+ * 'tuples' is the number of tuples in all the streams
+ */
+void
+cost_merge_append(Path *path, PlannerInfo *root,
+				  List *pathkeys, int n_streams,
+				  Cost input_startup_cost, Cost input_total_cost,
+				  double tuples)
+{
+	Cost		startup_cost = 0;
+	Cost		run_cost = 0;
+	Cost		comparison_cost;
+	double		N;
+	double		logN;
+
+	/*
+	 * Avoid log(0)...
+	 */
+	N = (n_streams < 2) ? 2.0 : (double) n_streams;
+	logN = LOG2(N);
+
+	/* Assumed cost per tuple comparison */
+	comparison_cost = 2.0 * cpu_operator_cost;
+
+	/* Heap creation cost */
+	startup_cost += comparison_cost * N * logN;
+
+	/* Per-tuple heap maintenance cost */
+	run_cost += tuples * comparison_cost * 2.0 * logN;
+
+	/*
+	 * Also charge a small amount (arbitrarily set equal to operator cost) per
+	 * extracted tuple.  We don't charge cpu_tuple_cost because a MergeAppend
+	 * node doesn't do qual-checking or projection, so it has less overhead
+	 * than most plan nodes.
+	 */
+	run_cost += cpu_operator_cost * tuples;
+
+	path->startup_cost = startup_cost + input_startup_cost;
+	path->total_cost = startup_cost + run_cost + input_total_cost;
 }
 
 /*
@@ -1398,7 +1469,9 @@ cost_group(Path *path, PlannerInfo *root,
  * output row count, which may be lower than the restriction-clause-only row
  * count of its parent.  (We don't include this case in the PATH_ROWS macro
  * because it applies *only* to a nestloop's inner relation.)  We have to
- * be prepared to recurse through Append nodes in case of an appendrel.
+ * be prepared to recurse through Append or MergeAppend nodes in case of an
+ * appendrel.  (It's not clear MergeAppend can be seen here, but we may as
+ * well handle it if so.)
  */
 static double
 nestloop_inner_path_rows(Path *path)
@@ -1415,6 +1488,16 @@ nestloop_inner_path_rows(Path *path)
 
 		result = 0;
 		foreach(l, ((AppendPath *) path)->subpaths)
+		{
+			result += nestloop_inner_path_rows((Path *) lfirst(l));
+		}
+	}
+	else if (IsA(path, MergeAppendPath))
+	{
+		ListCell   *l;
+
+		result = 0;
+		foreach(l, ((MergeAppendPath *) path)->subpaths)
 		{
 			result += nestloop_inner_path_rows((Path *) lfirst(l));
 		}
@@ -1786,6 +1869,8 @@ cost_mergejoin(MergePath *path, PlannerInfo *root, SpecialJoinInfo *sjinfo)
 				  outer_path->total_cost,
 				  outer_path_rows,
 				  outer_path->parent->width,
+				  0.0,
+				  work_mem,
 				  -1.0);
 		startup_cost += sort_path.startup_cost;
 		startup_cost += (sort_path.total_cost - sort_path.startup_cost)
@@ -1810,6 +1895,8 @@ cost_mergejoin(MergePath *path, PlannerInfo *root, SpecialJoinInfo *sjinfo)
 				  inner_path->total_cost,
 				  inner_path_rows,
 				  inner_path->parent->width,
+				  0.0,
+				  work_mem,
 				  -1.0);
 		startup_cost += sort_path.startup_cost;
 		startup_cost += (sort_path.total_cost - sort_path.startup_cost)

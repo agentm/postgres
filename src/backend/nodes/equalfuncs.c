@@ -890,6 +890,7 @@ _equalInsertStmt(InsertStmt *a, InsertStmt *b)
 	COMPARE_NODE_FIELD(cols);
 	COMPARE_NODE_FIELD(selectStmt);
 	COMPARE_NODE_FIELD(returningList);
+	COMPARE_NODE_FIELD(withClause);
 
 	return true;
 }
@@ -901,6 +902,7 @@ _equalDeleteStmt(DeleteStmt *a, DeleteStmt *b)
 	COMPARE_NODE_FIELD(usingClause);
 	COMPARE_NODE_FIELD(whereClause);
 	COMPARE_NODE_FIELD(returningList);
+	COMPARE_NODE_FIELD(withClause);
 
 	return true;
 }
@@ -913,6 +915,7 @@ _equalUpdateStmt(UpdateStmt *a, UpdateStmt *b)
 	COMPARE_NODE_FIELD(whereClause);
 	COMPARE_NODE_FIELD(fromClause);
 	COMPARE_NODE_FIELD(returningList);
+	COMPARE_NODE_FIELD(withClause);
 
 	return true;
 }
@@ -1698,8 +1701,8 @@ _equalCreateTrigStmt(CreateTrigStmt *a, CreateTrigStmt *b)
 	COMPARE_NODE_FIELD(relation);
 	COMPARE_NODE_FIELD(funcname);
 	COMPARE_NODE_FIELD(args);
-	COMPARE_SCALAR_FIELD(before);
 	COMPARE_SCALAR_FIELD(row);
+	COMPARE_SCALAR_FIELD(timing);
 	COMPARE_SCALAR_FIELD(events);
 	COMPARE_NODE_FIELD(columns);
 	COMPARE_NODE_FIELD(whenClause);
