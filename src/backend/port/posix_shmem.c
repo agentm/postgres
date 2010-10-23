@@ -37,11 +37,8 @@ uint8	UsedShmemInstanceId = 0;
 void	*UsedShmemSegAddr = NULL;
 
 static void GenerateIPCName(uint8 instanceId, char destIPCName[IPCNameLength]);
-static void *InternalIpcMemoryCreate(const char ipcName[IPCNameLength],
-									 uint8 instanceId, Size size);
+static void *InternalIpcMemoryCreate(const char ipcName[IPCNameLength],uint8 instanceId, Size size);
 static void IpcMemoryDetach(int status, Datum shmaddr);
-static void IpcMemoryDelete(int status, Datum instanceId);
-static PGShmemHeader *PGSharedMemoryAttach(uint8 instanceId);
 static int POSIXSharedMemoryFD=-1;
 
 
@@ -69,7 +66,7 @@ GenerateIPCName(uint8 instanceId, char destIPCName[IPCNameLength])
    * The string is formed starting with a slash, then the identifier 'PG.',
    * then the pid of the current process.
    */
-  snprintf(destIPCName, IPCNameLength, "/PG.%6ld", getpid());
+  snprintf(destIPCName, IPCNameLength, "/PG.%6ld", (long int)getpid());
 }
 
 /*
@@ -88,6 +85,9 @@ static void *
 InternalIpcMemoryCreate(const char ipcName[IPCNameLength], uint8 instanceId, Size size)
 {
 	int			fd;
+	int unlink_status=0;
+	int fstat_status=0;
+	int ftruncate_status=0;
 	void	   *shmaddr;
 	struct		stat statbuf;
 	
@@ -119,35 +119,38 @@ InternalIpcMemoryCreate(const char ipcName[IPCNameLength], uint8 instanceId, Siz
 	}
 	/* the race between creation and unlinking is protected by the shared memory pid file */
 
-	int unlink_status = shm_unlink(ipcName);
+	
+	unlink_status = shm_unlink(ipcName);
 	if(unlink_status<0)
 	  {
 	    /* It would be virtually impossible for us to fail to unlink a shared memory region we just created, but we need to handle this anyway- refuse to use this shared memory segment. */
-	    char * hint = NULL;
-	    if(errno==EACCESS)
-	      {
-		hint = "This error means that unlink access was denied on a shared memory segment that the process created.";
-	      }
-	    else if(errno==ENAMETOOLONG)
-	      {
-		hint = "This error means that the shared memory region could be unlinked because its name was too long.";
-	      }
-	    else if(errno==ENOENT)
-	      {
-		hint = "This error means that the shared memory segment was deleted by another process.";
-	      }
 	    ereport(FATAL,
 		    (errmsg("could not unlink shared memory segment : %m"),
-		     errdetail("Failed system call was shm_unlink(name=%s).",ipcName),
-		     errhint(hint)));
+		     errdetail("Failed system call was shm_unlink(name=%s).",ipcName)));
 	    return NULL;
 	  }
 	
 	/* Increase the size of the file descriptor to the desired length.
 	 * If this fails so will mmap since it can't map size bytes. */
-	fstat(fd, &statbuf);
+	fstat_status = fstat(fd, &statbuf);
+	if(fstat_status<0)
+	  {
+	    ereport(FATAL,
+		    (errmsg("could not fstat the shared memory segment : %m"),
+		     errdetail("Failed system call was fstat(fd=%d,stat=%p).",fd,&statbuf)));
+	    return NULL;
+	  }
 	if (statbuf.st_size < size)
-	  ftruncate(fd, size);
+	  {
+	    ftruncate_status = ftruncate(fd, size);
+	    if(ftruncate_status<0)
+	      {
+		ereport(FATAL,
+			(errmsg("could not set the proper shared memory segment size : %m"),
+			 errdetail("Failed system call was ftruncate(fd=%d,size=%lu).",fd,size)));
+		  return NULL;
+	      }
+	  }
 	
 	/* OK, should be able to attach to the segment */
 	shmaddr = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
@@ -178,16 +181,6 @@ IpcMemoryDetach(int status, Datum shmaddr)
 	
 	if (munmap(DatumGetPointer(shmaddr), hdr->totalsize) < 0)
 		elog(LOG, "munmap(%p, ...) failed: %m", DatumGetPointer(shmaddr));
-}
-
-/****************************************************************************/
-/*	IpcMemoryDelete(status, fd)		deletes a shared memory segment		*/
-/*	(called as an on_shmem_exit callback, hence funny argument list)		*/
-/****************************************************************************/
-static void
-IpcMemoryDelete(int status, Datum instanceId)
-{
-  /*nothing to do- last close on the shm file descriptor deletes it*/
 }
 
 /*
