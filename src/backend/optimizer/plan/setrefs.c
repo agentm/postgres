@@ -4,7 +4,7 @@
  *	  Post-processing of a completed plan tree: fix references to subplan
  *	  vars, compute regproc values for operators, etc
  *
- * Portions Copyright (c) 1996-2010, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2011, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -213,9 +213,11 @@ set_plan_references(PlannerGlobal *glob, Plan *plan,
 		newrte->funcexpr = NULL;
 		newrte->funccoltypes = NIL;
 		newrte->funccoltypmods = NIL;
+		newrte->funccolcollations = NIL;
 		newrte->values_lists = NIL;
 		newrte->ctecoltypes = NIL;
 		newrte->ctecoltypmods = NIL;
+		newrte->ctecolcollations = NIL;
 
 		glob->finalrtable = lappend(glob->finalrtable, newrte);
 
@@ -250,7 +252,7 @@ set_plan_references(PlannerGlobal *glob, Plan *plan,
 		newrc = (PlanRowMark *) palloc(sizeof(PlanRowMark));
 		memcpy(newrc, rc, sizeof(PlanRowMark));
 
-		/* adjust indexes */
+		/* adjust indexes ... but *not* the rowmarkId */
 		newrc->rti += rtoffset;
 		newrc->prti += rtoffset;
 
@@ -301,6 +303,10 @@ set_plan_refs(PlannerGlobal *glob, Plan *plan, int rtoffset)
 					fix_scan_list(glob, splan->indexqual, rtoffset);
 				splan->indexqualorig =
 					fix_scan_list(glob, splan->indexqualorig, rtoffset);
+				splan->indexorderby =
+					fix_scan_list(glob, splan->indexorderby, rtoffset);
+				splan->indexorderbyorig =
+					fix_scan_list(glob, splan->indexorderbyorig, rtoffset);
 			}
 			break;
 		case T_BitmapIndexScan:
@@ -1115,6 +1121,7 @@ set_dummy_tlist_references(Plan *plan, int rtoffset)
 						 tle->resno,
 						 exprType((Node *) oldvar),
 						 exprTypmod((Node *) oldvar),
+						 exprCollation((Node *) oldvar),
 						 0);
 		if (IsA(oldvar, Var))
 		{

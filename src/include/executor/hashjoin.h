@@ -4,7 +4,7 @@
  *	  internal structures for hash joins
  *
  *
- * Portions Copyright (c) 1996-2010, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2011, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/executor/hashjoin.h
@@ -15,6 +15,7 @@
 #define HASHJOIN_H
 
 #include "fmgr.h"
+#include "nodes/execnodes.h"
 #include "storage/buffile.h"
 
 /* ----------------------------------------------------------------
@@ -111,6 +112,8 @@ typedef struct HashJoinTableData
 	/* buckets[i] is head of list of tuples in i'th in-memory bucket */
 	struct HashJoinTupleData **buckets;
 	/* buckets array is per-batch storage, as are all the tuples */
+
+	bool		keepNulls;		/* true to store unmatchable NULL tuples */
 
 	bool		skewEnabled;	/* are we using skew optimization? */
 	HashSkewBucket **skewBucket;	/* hashtable of skew buckets */

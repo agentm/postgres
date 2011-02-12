@@ -4,7 +4,7 @@
  *	  Functions to convert stored expressions/querytrees back to
  *	  source text
  *
- * Portions Copyright (c) 1996-2010, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2011, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -23,6 +23,7 @@
 #include "catalog/dependency.h"
 #include "catalog/indexing.h"
 #include "catalog/pg_authid.h"
+#include "catalog/pg_collation.h"
 #include "catalog/pg_constraint.h"
 #include "catalog/pg_depend.h"
 #include "catalog/pg_language.h"
@@ -233,13 +234,14 @@ static void get_from_clause_item(Node *jtnode, Query *query,
 					 deparse_context *context);
 static void get_from_clause_alias(Alias *alias, RangeTblEntry *rte,
 					  deparse_context *context);
-static void get_from_clause_coldeflist(List *names, List *types, List *typmods,
+static void get_from_clause_coldeflist(List *names, List *types, List *typmods, List *collations,
 						   deparse_context *context);
 static void get_opclass_name(Oid opclass, Oid actual_datatype,
 				 StringInfo buf);
 static Node *processIndirection(Node *node, deparse_context *context,
 				   bool printit);
 static void printSubscripts(ArrayRef *aref, deparse_context *context);
+static char *get_relation_name(Oid relid);
 static char *generate_relation_name(Oid relid, List *namespaces);
 static char *generate_function_name(Oid funcid, int nargs, List *argnames,
 					   Oid *argtypes, bool *is_variadic);
@@ -787,9 +789,11 @@ pg_get_indexdef_worker(Oid indexrelid, int colno,
 	Oid			indrelid;
 	int			keyno;
 	Oid			keycoltype;
+	Datum		indcollDatum;
 	Datum		indclassDatum;
 	Datum		indoptionDatum;
 	bool		isnull;
+	oidvector  *indcollation;
 	oidvector  *indclass;
 	int2vector *indoption;
 	StringInfoData buf;
@@ -807,11 +811,17 @@ pg_get_indexdef_worker(Oid indexrelid, int colno,
 	indrelid = idxrec->indrelid;
 	Assert(indexrelid == idxrec->indexrelid);
 
-	/* Must get indclass and indoption the hard way */
+	/* Must get indcollation, indclass, and indoption the hard way */
+	indcollDatum = SysCacheGetAttr(INDEXRELID, ht_idx,
+								   Anum_pg_index_indcollation, &isnull);
+	Assert(!isnull);
+	indcollation = (oidvector *) DatumGetPointer(indcollDatum);
+
 	indclassDatum = SysCacheGetAttr(INDEXRELID, ht_idx,
 									Anum_pg_index_indclass, &isnull);
 	Assert(!isnull);
 	indclass = (oidvector *) DatumGetPointer(indclassDatum);
+
 	indoptionDatum = SysCacheGetAttr(INDEXRELID, ht_idx,
 									 Anum_pg_index_indoption, &isnull);
 	Assert(!isnull);
@@ -857,7 +867,7 @@ pg_get_indexdef_worker(Oid indexrelid, int colno,
 
 	indexpr_item = list_head(indexprs);
 
-	context = deparse_context_for(get_rel_name(indrelid), indrelid);
+	context = deparse_context_for(get_relation_name(indrelid), indrelid);
 
 	/*
 	 * Start the index definition.	Note that the index's name should never be
@@ -927,6 +937,13 @@ pg_get_indexdef_worker(Oid indexrelid, int colno,
 
 		if (!attrsOnly && (!colno || colno == keyno + 1))
 		{
+			Oid coll;
+
+			/* Add collation, if not default */
+			coll = indcollation->values[keyno];
+			if (coll && coll != DEFAULT_COLLATION_OID && coll != get_attcollation(indrelid, attnum))
+				appendStringInfo(&buf, " COLLATE %s", generate_collation_name((indcollation->values[keyno])));
+
 			/* Add the operator class name, if not default */
 			get_opclass_name(indclass->values[keyno], keycoltype, &buf);
 
@@ -1261,7 +1278,7 @@ pg_get_constraintdef_worker(Oid constraintId, bool fullCommand,
 				if (conForm->conrelid != InvalidOid)
 				{
 					/* relation constraint */
-					context = deparse_context_for(get_rel_name(conForm->conrelid),
+					context = deparse_context_for(get_relation_name(conForm->conrelid),
 												  conForm->conrelid);
 				}
 				else
@@ -4368,6 +4385,7 @@ print_parameter_expr(Node *expr, ListCell *ancestor_cell,
 {
 	deparse_namespace save_dpns;
 	bool		save_varprefix;
+	bool		need_paren;
 
 	/* Switch attention to the ancestor plan node */
 	push_ancestor_plan(dpns, ancestor_cell, &save_dpns);
@@ -4380,12 +4398,20 @@ print_parameter_expr(Node *expr, ListCell *ancestor_cell,
 	context->varprefix = true;
 
 	/*
-	 * We don't need to add parentheses because a Param's expansion is
-	 * (currently) always a Var or Aggref.
+	 * A Param's expansion is typically a Var, Aggref, or upper-level Param,
+	 * which wouldn't need extra parentheses.  Otherwise, insert parens to
+	 * ensure the expression looks atomic.
 	 */
-	Assert(IsA(expr, Var) || IsA(expr, Aggref));
+	need_paren = !(IsA(expr, Var) ||
+				   IsA(expr, Aggref) ||
+				   IsA(expr, Param));
+	if (need_paren)
+		appendStringInfoChar(context->buf, '(');
 
 	get_rule_expr(expr, context, false);
+
+	if (need_paren)
+		appendStringInfoChar(context->buf, ')');
 
 	context->varprefix = save_varprefix;
 
@@ -4850,7 +4876,7 @@ get_rule_expr(Node *node, deparse_context *context,
 				appendStringInfo(buf, " %s %s (",
 								 generate_operator_name(expr->opno,
 														exprType(arg1),
-										   get_element_type(exprType(arg2))),
+									   get_base_element_type(exprType(arg2))),
 								 expr->useOr ? "ANY" : "ALL");
 				get_rule_expr_paren(arg2, context, true, node);
 				appendStringInfoChar(buf, ')');
@@ -5044,6 +5070,20 @@ get_rule_expr(Node *node, deparse_context *context,
 			}
 			break;
 
+		case T_CollateClause:
+			{
+				CollateClause *collate = (CollateClause *) node;
+				Node	   *arg = (Node *) collate->arg;
+
+				if (!PRETTY_PAREN(context))
+					appendStringInfoChar(buf, '(');
+				get_rule_expr_paren(arg, context, false, node);
+				appendStringInfo(buf, " COLLATE %s", generate_collation_name(collate->collOid));
+				if (!PRETTY_PAREN(context))
+					appendStringInfoChar(buf, ')');
+			}
+			break;
+
 		case T_CoerceViaIO:
 			{
 				CoerceViaIO *iocoerce = (CoerceViaIO *) node;
@@ -5136,23 +5176,19 @@ get_rule_expr(Node *node, deparse_context *context,
 						 * boolexpr WHEN TRUE THEN ...", then the optimizer's
 						 * simplify_boolean_equality() may have reduced this
 						 * to just "CaseTestExpr" or "NOT CaseTestExpr", for
-						 * which we have to show "TRUE" or "FALSE".  Also,
-						 * depending on context the original CaseTestExpr
-						 * might have been reduced to a Const (but we won't
-						 * see "WHEN Const").  We have also to consider the
-						 * possibility that an implicit coercion was inserted
-						 * between the CaseTestExpr and the operator.
+						 * which we have to show "TRUE" or "FALSE".  We have
+						 * also to consider the possibility that an implicit
+						 * coercion was inserted between the CaseTestExpr and
+						 * the operator.
 						 */
 						if (IsA(w, OpExpr))
 						{
 							List	   *args = ((OpExpr *) w)->args;
-							Node	   *lhs;
 							Node	   *rhs;
 
 							Assert(list_length(args) == 2);
-							lhs = strip_implicit_coercions(linitial(args));
-							Assert(IsA(lhs, CaseTestExpr) ||
-								   IsA(lhs, Const));
+							Assert(IsA(strip_implicit_coercions(linitial(args)),
+									   CaseTestExpr));
 							rhs = (Node *) lsecond(args);
 							get_rule_expr(rhs, context, false);
 						}
@@ -6305,7 +6341,7 @@ get_from_clause_item(Node *jtnode, Query *query, deparse_context *context)
 			gavealias = true;
 		}
 		else if (rte->rtekind == RTE_RELATION &&
-				 strcmp(rte->eref->aliasname, get_rel_name(rte->relid)) != 0)
+				 strcmp(rte->eref->aliasname, get_relation_name(rte->relid)) != 0)
 		{
 			/*
 			 * Apparently the rel has been renamed since the rule was made.
@@ -6339,6 +6375,7 @@ get_from_clause_item(Node *jtnode, Query *query, deparse_context *context)
 				get_from_clause_coldeflist(rte->eref->colnames,
 										   rte->funccoltypes,
 										   rte->funccoltypmods,
+										   rte->funccolcollations,
 										   context);
 			}
 			else
@@ -6537,35 +6574,42 @@ get_from_clause_alias(Alias *alias, RangeTblEntry *rte,
  * responsible for ensuring that an alias or AS is present before it.
  */
 static void
-get_from_clause_coldeflist(List *names, List *types, List *typmods,
+get_from_clause_coldeflist(List *names, List *types, List *typmods, List *collations,
 						   deparse_context *context)
 {
 	StringInfo	buf = context->buf;
 	ListCell   *l1;
 	ListCell   *l2;
 	ListCell   *l3;
+	ListCell   *l4;
 	int			i = 0;
 
 	appendStringInfoChar(buf, '(');
 
 	l2 = list_head(types);
 	l3 = list_head(typmods);
+	l4 = list_head(collations);
 	foreach(l1, names)
 	{
 		char	   *attname = strVal(lfirst(l1));
 		Oid			atttypid;
 		int32		atttypmod;
+		Oid			attcollation;
 
 		atttypid = lfirst_oid(l2);
 		l2 = lnext(l2);
 		atttypmod = lfirst_int(l3);
 		l3 = lnext(l3);
+		attcollation = lfirst_oid(l4);
+		l4 = lnext(l4);
 
 		if (i > 0)
 			appendStringInfo(buf, ", ");
 		appendStringInfo(buf, "%s %s",
 						 quote_identifier(attname),
 						 format_type_with_typemod(atttypid, atttypmod));
+		if (attcollation && attcollation != DEFAULT_COLLATION_OID)
+			appendStringInfo(buf, " COLLATE %s", generate_collation_name(attcollation));
 		i++;
 	}
 
@@ -6809,6 +6853,23 @@ quote_qualified_identifier(const char *qualifier,
 }
 
 /*
+ * get_relation_name
+ *		Get the unqualified name of a relation specified by OID
+ *
+ * This differs from the underlying get_rel_name() function in that it will
+ * throw error instead of silently returning NULL if the OID is bad.
+ */
+static char *
+get_relation_name(Oid relid)
+{
+	char	   *relname = get_rel_name(relid);
+
+	if (!relname)
+		elog(ERROR, "cache lookup failed for relation %u", relid);
+	return relname;
+}
+
+/*
  * generate_relation_name
  *		Compute the name to display for a relation specified by OID
  *
@@ -7013,6 +7074,39 @@ generate_operator_name(Oid operid, Oid arg1, Oid arg2)
 	ReleaseSysCache(opertup);
 
 	return buf.data;
+}
+
+/*
+ * generate_collation_name
+ *		Compute the name to display for a collation specified by OID
+ *
+ * The result includes all necessary quoting and schema-prefixing.
+ */
+char *
+generate_collation_name(Oid collid)
+{
+	HeapTuple	tp;
+	Form_pg_collation colltup;
+	char	   *collname;
+	char	   *nspname;
+	char	   *result;
+
+	tp = SearchSysCache1(COLLOID, ObjectIdGetDatum(collid));
+	if (!HeapTupleIsValid(tp))
+		elog(ERROR, "cache lookup failed for collation %u", collid);
+	colltup = (Form_pg_collation) GETSTRUCT(tp);
+	collname = NameStr(colltup->collname);
+
+	if (!CollationIsVisible(collid))
+		nspname = get_namespace_name(colltup->collnamespace);
+	else
+		nspname = NULL;
+
+	result = quote_qualified_identifier(nspname, collname);
+
+	ReleaseSysCache(tp);
+
+	return result;
 }
 
 /*

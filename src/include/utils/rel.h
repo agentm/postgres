@@ -4,7 +4,7 @@
  *	  POSTGRES relation descriptor (a/k/a relcache entry) definitions.
  *
  *
- * Portions Copyright (c) 1996-2010, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2011, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/utils/rel.h
@@ -114,6 +114,7 @@ typedef struct RelationAmInfo
 	FmgrInfo	ammarkpos;
 	FmgrInfo	amrestrpos;
 	FmgrInfo	ambuild;
+	FmgrInfo	ambuildempty;
 	FmgrInfo	ambulkdelete;
 	FmgrInfo	amvacuumcleanup;
 	FmgrInfo	amcostestimate;
@@ -132,7 +133,6 @@ typedef struct RelationData
 	struct SMgrRelationData *rd_smgr;	/* cached file handle, or NULL */
 	int			rd_refcnt;		/* reference count */
 	BackendId	rd_backend;		/* owning backend id, if temporary relation */
-	bool		rd_istemp;		/* rel is a temporary relation */
 	bool		rd_isnailed;	/* rel is nailed in cache */
 	bool		rd_isvalid;		/* relcache entry is valid */
 	char		rd_indexvalid;	/* state of rd_indexlist: 0 = not valid, 1 =
@@ -178,10 +178,10 @@ typedef struct RelationData
 	/*
 	 * index access support info (used only for an index relation)
 	 *
-	 * Note: only default operators and support procs for each opclass are
-	 * cached, namely those with lefttype and righttype equal to the opclass's
-	 * opcintype.  The arrays are indexed by strategy or support number, which
-	 * is a sufficient identifier given that restriction.
+	 * Note: only default support procs for each opclass are cached, namely
+	 * those with lefttype and righttype equal to the opclass's opcintype.
+	 * The arrays are indexed by support function number, which is a
+	 * sufficient identifier given that restriction.
 	 *
 	 * Note: rd_amcache is available for index AMs to cache private data about
 	 * an index.  This must be just a cache since it may get reset at any time
@@ -194,7 +194,6 @@ typedef struct RelationData
 	RelationAmInfo *rd_aminfo;	/* lookup info for funcs found in pg_am */
 	Oid		   *rd_opfamily;	/* OIDs of op families for each index col */
 	Oid		   *rd_opcintype;	/* OIDs of opclass declared input data types */
-	Oid		   *rd_operator;	/* OIDs of index operators */
 	RegProcedure *rd_support;	/* OIDs of support procedures */
 	FmgrInfo   *rd_supportinfo; /* lookup info for support procedures */
 	int16	   *rd_indoption;	/* per-column AM-specific flags */
@@ -204,6 +203,7 @@ typedef struct RelationData
 	Oid		   *rd_exclprocs;	/* OIDs of exclusion ops' procs, if any */
 	uint16	   *rd_exclstrats;	/* exclusion ops' strategy numbers, if any */
 	void	   *rd_amcache;		/* available for use by index AM */
+	Oid		   *rd_indcollation; /* OIDs of index collations */
 
 	/*
 	 * Hack for CLUSTER, rewriting ALTER TABLE, etc: when writing a new
@@ -391,6 +391,27 @@ typedef struct StdRdOptions
 	} while (0)
 
 /*
+ * RelationNeedsWAL
+ *		True if relation needs WAL.
+ */
+#define RelationNeedsWAL(relation) \
+	((relation)->rd_rel->relpersistence == RELPERSISTENCE_PERMANENT)
+
+/*
+ * RelationUsesLocalBuffers
+ *		True if relation's pages are stored in local buffers.
+ */
+#define RelationUsesLocalBuffers(relation) \
+	((relation)->rd_rel->relpersistence == RELPERSISTENCE_TEMP)
+
+/*
+ * RelationUsesTempNamespace
+ *		True if relation's catalog entries live in a private namespace.
+ */
+#define RelationUsesTempNamespace(relation) \
+	((relation)->rd_rel->relpersistence == RELPERSISTENCE_TEMP)
+
+/*
  * RELATION_IS_LOCAL
  *		If a rel is either temp or newly created in the current transaction,
  *		it can be assumed to be visible only to the current backend.
@@ -408,7 +429,8 @@ typedef struct StdRdOptions
  * Beware of multiple eval of argument
  */
 #define RELATION_IS_OTHER_TEMP(relation) \
-	((relation)->rd_istemp && (relation)->rd_backend != MyBackendId)
+	((relation)->rd_rel->relpersistence == RELPERSISTENCE_TEMP \
+	&& (relation)->rd_backend != MyBackendId)
 
 /* routines in utils/cache/relcache.c */
 extern void RelationIncrementReferenceCount(Relation rel);

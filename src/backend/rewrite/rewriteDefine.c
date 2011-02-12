@@ -3,7 +3,7 @@
  * rewriteDefine.c
  *	  routines for defining a rewrite rule
  *
- * Portions Copyright (c) 1996-2010, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2011, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -19,6 +19,7 @@
 #include "catalog/dependency.h"
 #include "catalog/indexing.h"
 #include "catalog/namespace.h"
+#include "catalog/objectaccess.h"
 #include "catalog/pg_rewrite.h"
 #include "catalog/storage.h"
 #include "miscadmin.h"
@@ -142,7 +143,7 @@ InsertRule(char *rulname,
 
 	/* If replacing, get rid of old dependencies and make new ones */
 	if (is_update)
-		deleteDependencyRecordsFor(RewriteRelationId, rewriteObjectId);
+		deleteDependencyRecordsFor(RewriteRelationId, rewriteObjectId, false);
 
 	/*
 	 * Install dependency on rule's relation to ensure it will go away on
@@ -176,6 +177,10 @@ InsertRule(char *rulname,
 		recordDependencyOnExpr(&myself, event_qual, qry->rtable,
 							   DEPENDENCY_NORMAL);
 	}
+
+	/* Post creation hook for new rule */
+	InvokeObjectAccessHook(OAT_POST_CREATE,
+						   RewriteRelationId, rewriteObjectId, 0);
 
 	heap_close(pg_rewrite_desc, RowExclusiveLock);
 

@@ -25,17 +25,18 @@ my $postgres;
 my $libpq;
 
 my $contrib_defines = {'refint' => 'REFINT_VERBOSE'};
-my @contrib_uselibpq = ('dblink', 'oid2name', 'pgbench', 'pg_upgrade', 
-						'vacuumlo');
-my @contrib_uselibpgport = ('oid2name', 'pgbench', 'pg_standby', 
-							'pg_archivecleanup', 'pg_upgrade', 'vacuumlo');
+my @contrib_uselibpq = ('dblink', 'oid2name', 'pgbench', 'pg_upgrade','vacuumlo');
+my @contrib_uselibpgport =(
+    'oid2name', 'pgbench', 'pg_standby','pg_archivecleanup',
+    'pg_test_fsync', 'pg_upgrade', 'vacuumlo'
+);
 my $contrib_extralibs = {'pgbench' => ['wsock32.lib']};
 my $contrib_extraincludes = {'tsearch2' => ['contrib/tsearch2'], 'dblink' => ['src/backend']};
 my $contrib_extrasource = {
     'cube' => ['cubescan.l','cubeparse.y'],
     'seg' => ['segscan.l','segparse.y']
 };
-my @contrib_excludes = ('pgcrypto','intagg');
+my @contrib_excludes = ('pgcrypto','intagg','sepgsql');
 
 sub mkvcbuild
 {
@@ -48,10 +49,11 @@ sub mkvcbuild
 
     our @pgportfiles = qw(
       chklocale.c crypt.c fseeko.c getrusage.c inet_aton.c random.c srandom.c
-      getaddrinfo.c gettimeofday.c kill.c open.c erand48.c
-      snprintf.c strlcat.c strlcpy.c dirmod.c exec.c noblock.c path.c pipe.c
-      pgsleep.c pgstrcasecmp.c qsort.c qsort_arg.c sprompt.c thread.c
-      getopt.c getopt_long.c dirent.c rint.c win32env.c win32error.c);
+      getaddrinfo.c gettimeofday.c inet_net_ntop.c kill.c open.c erand48.c
+      snprintf.c strlcat.c strlcpy.c dirmod.c exec.c noblock.c path.c
+      pgcheckdir.c pgmkdirp.c pgsleep.c pgstrcasecmp.c qsort.c qsort_arg.c
+      sprompt.c thread.c getopt.c getopt_long.c dirent.c rint.c win32env.c
+      win32error.c);
 
     $libpgport = $solution->AddProject('libpgport','lib','misc');
     $libpgport->AddDefine('FRONTEND');
@@ -66,10 +68,12 @@ sub mkvcbuild
     $postgres->ReplaceFile('src\backend\port\pg_shmem.c','src\backend\port\win32_shmem.c');
     $postgres->ReplaceFile('src\backend\port\pg_latch.c','src\backend\port\win32_latch.c');
     $postgres->AddFiles('src\port',@pgportfiles);
+    $postgres->AddFile('src\backend\port\pipe.c');
     $postgres->AddDir('src\timezone');
     $postgres->AddFiles('src\backend\parser','scan.l','gram.y');
     $postgres->AddFiles('src\backend\bootstrap','bootscanner.l','bootparse.y');
     $postgres->AddFiles('src\backend\utils\misc','guc-file.l');
+    $postgres->AddFiles('src\backend\replication', 'repl_scanner.l', 'repl_gram.y');
     $postgres->AddDefine('BUILDING_DLL');
     $postgres->AddLibrary('wsock32.lib');
     $postgres->AddLibrary('ws2_32.lib');
@@ -272,6 +276,8 @@ sub mkvcbuild
     $initdb->AddLibrary('wsock32.lib');
     $initdb->AddLibrary('ws2_32.lib');
 
+    my $pgbasebackup = AddSimpleFrontend('pg_basebackup', 1);
+
     my $pgconfig = AddSimpleFrontend('pg_config');
 
     my $pgcontrol = AddSimpleFrontend('pg_controldata');
@@ -431,7 +437,7 @@ sub mkvcbuild
             { # Also catches mbprint.c
                 $proj->AddFile('src\bin\psql\\' . $f);
             }
-            else
+            elsif ($f =~ /\.c$/)
             {
                 $proj->AddFile('src\bin\scripts\\' . $f);
             }

@@ -3,7 +3,7 @@
  * lsyscache.c
  *	  Convenience routines for common queries in the system catalog cache.
  *
- * Portions Copyright (c) 1996-2010, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2011, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -20,6 +20,7 @@
 #include "bootstrap/bootstrap.h"
 #include "catalog/pg_amop.h"
 #include "catalog/pg_amproc.h"
+#include "catalog/pg_collation.h"
 #include "catalog/pg_constraint.h"
 #include "catalog/pg_namespace.h"
 #include "catalog/pg_opclass.h"
@@ -34,6 +35,7 @@
 #include "utils/datum.h"
 #include "utils/lsyscache.h"
 #include "utils/syscache.h"
+#include "utils/typcache.h"
 
 /* Hook for plugins to get control in get_attavgwidth() */
 get_attavgwidth_hook_type get_attavgwidth_hook = NULL;
@@ -45,12 +47,15 @@ get_attavgwidth_hook_type get_attavgwidth_hook = NULL;
  * op_in_opfamily
  *
  *		Return t iff operator 'opno' is in operator family 'opfamily'.
+ *
+ * This function only considers search operators, not ordering operators.
  */
 bool
 op_in_opfamily(Oid opno, Oid opfamily)
 {
-	return SearchSysCacheExists2(AMOPOPID,
+	return SearchSysCacheExists3(AMOPOPID,
 								 ObjectIdGetDatum(opno),
+								 CharGetDatum(AMOP_SEARCH),
 								 ObjectIdGetDatum(opfamily));
 }
 
@@ -59,6 +64,8 @@ op_in_opfamily(Oid opno, Oid opfamily)
  *
  *		Get the operator's strategy number within the specified opfamily,
  *		or 0 if it's not a member of the opfamily.
+ *
+ * This function only considers search operators, not ordering operators.
  */
 int
 get_op_opfamily_strategy(Oid opno, Oid opfamily)
@@ -67,13 +74,39 @@ get_op_opfamily_strategy(Oid opno, Oid opfamily)
 	Form_pg_amop amop_tup;
 	int			result;
 
-	tp = SearchSysCache2(AMOPOPID,
+	tp = SearchSysCache3(AMOPOPID,
 						 ObjectIdGetDatum(opno),
+						 CharGetDatum(AMOP_SEARCH),
 						 ObjectIdGetDatum(opfamily));
 	if (!HeapTupleIsValid(tp))
 		return 0;
 	amop_tup = (Form_pg_amop) GETSTRUCT(tp);
 	result = amop_tup->amopstrategy;
+	ReleaseSysCache(tp);
+	return result;
+}
+
+/*
+ * get_op_opfamily_sortfamily
+ *
+ *		If the operator is an ordering operator within the specified opfamily,
+ *		return its amopsortfamily OID; else return InvalidOid.
+ */
+Oid
+get_op_opfamily_sortfamily(Oid opno, Oid opfamily)
+{
+	HeapTuple	tp;
+	Form_pg_amop amop_tup;
+	Oid			result;
+
+	tp = SearchSysCache3(AMOPOPID,
+						 ObjectIdGetDatum(opno),
+						 CharGetDatum(AMOP_ORDER),
+						 ObjectIdGetDatum(opfamily));
+	if (!HeapTupleIsValid(tp))
+		return InvalidOid;
+	amop_tup = (Form_pg_amop) GETSTRUCT(tp);
+	result = amop_tup->amopsortfamily;
 	ReleaseSysCache(tp);
 	return result;
 }
@@ -88,7 +121,7 @@ get_op_opfamily_strategy(Oid opno, Oid opfamily)
  * therefore we raise an error if the tuple is not found.
  */
 void
-get_op_opfamily_properties(Oid opno, Oid opfamily,
+get_op_opfamily_properties(Oid opno, Oid opfamily, bool ordering_op,
 						   int *strategy,
 						   Oid *lefttype,
 						   Oid *righttype)
@@ -96,8 +129,9 @@ get_op_opfamily_properties(Oid opno, Oid opfamily,
 	HeapTuple	tp;
 	Form_pg_amop amop_tup;
 
-	tp = SearchSysCache2(AMOPOPID,
+	tp = SearchSysCache3(AMOPOPID,
 						 ObjectIdGetDatum(opno),
+						 CharGetDatum(ordering_op ? AMOP_ORDER : AMOP_SEARCH),
 						 ObjectIdGetDatum(opfamily));
 	if (!HeapTupleIsValid(tp))
 		elog(ERROR, "operator %u is not a member of opfamily %u",
@@ -870,6 +904,33 @@ get_atttypmod(Oid relid, AttrNumber attnum)
 }
 
 /*
+ * get_attcollation
+ *
+ *		Given the relation id and the attribute number,
+ *		return the "attcollation" field from the attribute relation.
+ */
+Oid
+get_attcollation(Oid relid, AttrNumber attnum)
+{
+	HeapTuple	tp;
+
+	tp = SearchSysCache2(ATTNUM,
+						 ObjectIdGetDatum(relid),
+						 Int16GetDatum(attnum));
+	if (HeapTupleIsValid(tp))
+	{
+		Form_pg_attribute att_tup = (Form_pg_attribute) GETSTRUCT(tp);
+		Oid		result;
+
+		result = att_tup->attcollation;
+		ReleaseSysCache(tp);
+		return result;
+	}
+	else
+		return InvalidOid;
+}
+
+/*
  * get_atttypetypmod
  *
  *		A two-fer: given the relation id and the attribute number,
@@ -896,6 +957,36 @@ get_atttypetypmod(Oid relid, AttrNumber attnum,
 	*typid = att_tup->atttypid;
 	*typmod = att_tup->atttypmod;
 	ReleaseSysCache(tp);
+}
+
+/*				---------- COLLATION CACHE ----------					 */
+
+/*
+ * get_collation_name
+ *		Returns the name of a given pg_collation entry.
+ *
+ * Returns a palloc'd copy of the string, or NULL if no such constraint.
+ *
+ * NOTE: since collation name is not unique, be wary of code that uses this
+ * for anything except preparing error messages.
+ */
+char *
+get_collation_name(Oid colloid)
+{
+	HeapTuple	tp;
+
+	tp = SearchSysCache1(COLLOID, ObjectIdGetDatum(colloid));
+	if (HeapTupleIsValid(tp))
+	{
+		Form_pg_collation colltup = (Form_pg_collation) GETSTRUCT(tp);
+		char	   *result;
+
+		result = pstrdup(NameStr(colltup->collname));
+		ReleaseSysCache(tp);
+		return result;
+	}
+	else
+		return NULL;
 }
 
 /*				---------- CONSTRAINT CACHE ----------					 */
@@ -1054,20 +1145,47 @@ op_input_types(Oid opno, Oid *lefttype, Oid *righttype)
  * will fail to find any mergejoin plans unless there are suitable btree
  * opfamily entries for this operator and associated sortops.  The pg_operator
  * flag is just a hint to tell the planner whether to bother looking.)
+ *
+ * In some cases (currently only array_eq), mergejoinability depends on the
+ * specific input data type the operator is invoked for, so that must be
+ * passed as well.  We currently assume that only one input's type is needed
+ * to check this --- by convention, pass the left input's data type.
  */
 bool
-op_mergejoinable(Oid opno)
+op_mergejoinable(Oid opno, Oid inputtype)
 {
 	HeapTuple	tp;
 	bool		result = false;
 
-	tp = SearchSysCache1(OPEROID, ObjectIdGetDatum(opno));
-	if (HeapTupleIsValid(tp))
+	if (opno == ARRAY_EQ_OP)
 	{
-		Form_pg_operator optup = (Form_pg_operator) GETSTRUCT(tp);
+		/*
+		 * For array_eq, can sort if element type has a default btree opclass.
+		 * We could use GetDefaultOpClass, but that's fairly expensive and not
+		 * cached, so let's use the typcache instead.
+		 */
+		Oid			elem_type = get_base_element_type(inputtype);
 
-		result = optup->oprcanmerge;
-		ReleaseSysCache(tp);
+		if (OidIsValid(elem_type))
+		{
+			TypeCacheEntry *typentry;
+
+			typentry = lookup_type_cache(elem_type, TYPECACHE_BTREE_OPFAMILY);
+			if (OidIsValid(typentry->btree_opf))
+				result = true;
+		}
+	}
+	else
+	{
+		/* For all other operators, rely on pg_operator.oprcanmerge */
+		tp = SearchSysCache1(OPEROID, ObjectIdGetDatum(opno));
+		if (HeapTupleIsValid(tp))
+		{
+			Form_pg_operator optup = (Form_pg_operator) GETSTRUCT(tp);
+
+			result = optup->oprcanmerge;
+			ReleaseSysCache(tp);
+		}
 	}
 	return result;
 }
@@ -1077,20 +1195,43 @@ op_mergejoinable(Oid opno)
  *
  * Returns true if the operator is hashjoinable.  (There must be a suitable
  * hash opfamily entry for this operator if it is so marked.)
+ *
+ * In some cases (currently only array_eq), hashjoinability depends on the
+ * specific input data type the operator is invoked for, so that must be
+ * passed as well.  We currently assume that only one input's type is needed
+ * to check this --- by convention, pass the left input's data type.
  */
 bool
-op_hashjoinable(Oid opno)
+op_hashjoinable(Oid opno, Oid inputtype)
 {
 	HeapTuple	tp;
 	bool		result = false;
 
-	tp = SearchSysCache1(OPEROID, ObjectIdGetDatum(opno));
-	if (HeapTupleIsValid(tp))
+	if (opno == ARRAY_EQ_OP)
 	{
-		Form_pg_operator optup = (Form_pg_operator) GETSTRUCT(tp);
+		/* For array_eq, can hash if element type has a default hash opclass */
+		Oid			elem_type = get_base_element_type(inputtype);
 
-		result = optup->oprcanhash;
-		ReleaseSysCache(tp);
+		if (OidIsValid(elem_type))
+		{
+			TypeCacheEntry *typentry;
+
+			typentry = lookup_type_cache(elem_type, TYPECACHE_HASH_OPFAMILY);
+			if (OidIsValid(typentry->hash_opf))
+				result = true;
+		}
+	}
+	else
+	{
+		/* For all other operators, rely on pg_operator.oprcanhash */
+		tp = SearchSysCache1(OPEROID, ObjectIdGetDatum(opno));
+		if (HeapTupleIsValid(tp))
+		{
+			Form_pg_operator optup = (Form_pg_operator) GETSTRUCT(tp);
+
+			result = optup->oprcanhash;
+			ReleaseSysCache(tp);
+		}
 	}
 	return result;
 }
@@ -2213,6 +2354,52 @@ get_array_type(Oid typid)
 }
 
 /*
+ * get_base_element_type
+ *		Given the type OID, get the typelem, looking "through" any domain
+ *		to its underlying array type.
+ *
+ * This is equivalent to get_element_type(getBaseType(typid)), but avoids
+ * an extra cache lookup.  Note that it fails to provide any information
+ * about the typmod of the array.
+ */
+Oid
+get_base_element_type(Oid typid)
+{
+	/*
+	 * We loop to find the bottom base type in a stack of domains.
+	 */
+	for (;;)
+	{
+		HeapTuple	tup;
+		Form_pg_type typTup;
+
+		tup = SearchSysCache1(TYPEOID, ObjectIdGetDatum(typid));
+		if (!HeapTupleIsValid(tup))
+			break;
+		typTup = (Form_pg_type) GETSTRUCT(tup);
+		if (typTup->typtype != TYPTYPE_DOMAIN)
+		{
+			/* Not a domain, so stop descending */
+			Oid			result;
+
+			/* This test must match get_element_type */
+			if (typTup->typlen == -1)
+				result = typTup->typelem;
+			else
+				result = InvalidOid;
+			ReleaseSysCache(tup);
+			return result;
+		}
+
+		typid = typTup->typbasetype;
+		ReleaseSysCache(tup);
+	}
+
+	/* Like get_element_type, silently return InvalidOid for bogus input */
+	return InvalidOid;
+}
+
+/*
  * getTypeInputInfo
  *
  *		Get info needed for converting values of a type to internal form
@@ -2393,6 +2580,42 @@ get_typmodout(Oid typid)
 		return InvalidOid;
 }
 #endif   /* NOT_USED */
+
+/*
+ * get_typcollation
+ *
+ *		Given the type OID, return the type's typcollation attribute.
+ */
+Oid
+get_typcollation(Oid typid)
+{
+	HeapTuple	tp;
+
+	tp = SearchSysCache1(TYPEOID, ObjectIdGetDatum(typid));
+	if (HeapTupleIsValid(tp))
+	{
+		Form_pg_type typtup = (Form_pg_type) GETSTRUCT(tp);
+		Oid			result;
+
+		result = typtup->typcollation;
+		ReleaseSysCache(tp);
+		return result;
+	}
+	else
+		return InvalidOid;
+}
+
+
+/*
+ * type_is_collatable
+ *
+ *		Return whether the type cares about collations
+ */
+bool
+type_is_collatable(Oid typid)
+{
+	return OidIsValid(get_typcollation(typid));
+}
 
 
 /*				---------- STATISTICS CACHE ----------					 */

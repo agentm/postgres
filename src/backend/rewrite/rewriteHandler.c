@@ -3,7 +3,7 @@
  * rewriteHandler.c
  *		Primary module of query rewriter.
  *
- * Portions Copyright (c) 1996-2010, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2011, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -52,7 +52,8 @@ static TargetEntry *process_matched_tle(TargetEntry *src_tle,
 static Node *get_assignment_input(Node *node);
 static void rewriteValuesRTE(RangeTblEntry *rte, Relation target_relation,
 				 List *attrnos);
-static void rewriteTargetListUD(Query *parsetree, Relation target_relation);
+static void rewriteTargetListUD(Query *parsetree, RangeTblEntry *target_rte,
+								Relation target_relation);
 static void markQueryForLocking(Query *qry, Node *jtnode,
 					bool forUpdate, bool noWait, bool pushedDown);
 static List *matchLocks(CmdType event, RuleLock *rulelocks,
@@ -746,6 +747,7 @@ rewriteTargetListIU(Query *parsetree, Relation target_relation,
 										attrno,
 										att_tup->atttypid,
 										att_tup->atttypmod,
+										att_tup->attcollation,
 										0);
 
 			new_tle = makeTargetEntry((Expr *) new_expr,
@@ -1110,7 +1112,8 @@ rewriteValuesRTE(RangeTblEntry *rte, Relation target_relation, List *attrnos)
  * ordering isn't actually critical at the moment.
  */
 static void
-rewriteTargetListUD(Query *parsetree, Relation target_relation)
+rewriteTargetListUD(Query *parsetree, RangeTblEntry *target_rte,
+					Relation target_relation)
 {
 	Var		   *var;
 	const char *attrname;
@@ -1125,6 +1128,7 @@ rewriteTargetListUD(Query *parsetree, Relation target_relation)
 					  SelfItemPointerAttributeNumber,
 					  TIDOID,
 					  -1,
+					  InvalidOid,
 					  0);
 
 		attrname = "ctid";
@@ -1135,11 +1139,9 @@ rewriteTargetListUD(Query *parsetree, Relation target_relation)
 		 * Emit whole-row Var so that executor will have the "old" view row
 		 * to pass to the INSTEAD OF trigger.
 		 */
-		var = makeVar(parsetree->resultRelation,
-					  InvalidAttrNumber,
-					  RECORDOID,
-					  -1,
-					  0);
+		var = makeWholeRowVar(target_rte,
+							  parsetree->resultRelation,
+							  0);
 
 		attrname = "wholerow";
 	}
@@ -1858,11 +1860,11 @@ RewriteQuery(Query *parsetree, List *rewrite_events)
 		else if (event == CMD_UPDATE)
 		{
 			rewriteTargetListIU(parsetree, rt_entry_relation, NULL);
-			rewriteTargetListUD(parsetree, rt_entry_relation);
+			rewriteTargetListUD(parsetree, rt_entry, rt_entry_relation);
 		}
 		else if (event == CMD_DELETE)
 		{
-			rewriteTargetListUD(parsetree, rt_entry_relation);
+			rewriteTargetListUD(parsetree, rt_entry, rt_entry_relation);
 		}
 		else
 			elog(ERROR, "unrecognized commandType: %d", (int) event);

@@ -3,7 +3,7 @@
  * nodeMergejoin.c
  *	  routines supporting merge joins
  *
- * Portions Copyright (c) 1996-2010, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2011, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -95,7 +95,6 @@
 #include "access/nbtree.h"
 #include "catalog/pg_amop.h"
 #include "executor/execdebug.h"
-#include "executor/execdefs.h"
 #include "executor/nodeMergejoin.h"
 #include "miscadmin.h"
 #include "utils/acl.h"
@@ -103,6 +102,21 @@
 #include "utils/memutils.h"
 #include "utils/syscache.h"
 
+
+/*
+ * States of the ExecMergeJoin state machine
+ */
+#define EXEC_MJ_INITIALIZE_OUTER		1
+#define EXEC_MJ_INITIALIZE_INNER		2
+#define EXEC_MJ_JOINTUPLES				3
+#define EXEC_MJ_NEXTOUTER				4
+#define EXEC_MJ_TESTOUTER				5
+#define EXEC_MJ_NEXTINNER				6
+#define EXEC_MJ_SKIP_TEST				7
+#define EXEC_MJ_SKIPOUTER_ADVANCE		8
+#define EXEC_MJ_SKIPINNER_ADVANCE		9
+#define EXEC_MJ_ENDOUTER				10
+#define EXEC_MJ_ENDINNER				11
 
 /*
  * Runtime data for each mergejoin clause
@@ -166,6 +180,7 @@ typedef enum
 static MergeJoinClause
 MJExamineQuals(List *mergeclauses,
 			   Oid *mergefamilies,
+			   Oid *mergecollations,
 			   int *mergestrategies,
 			   bool *mergenullsfirst,
 			   PlanState *parent)
@@ -183,6 +198,7 @@ MJExamineQuals(List *mergeclauses,
 		OpExpr	   *qual = (OpExpr *) lfirst(cl);
 		MergeJoinClause clause = &clauses[iClause];
 		Oid			opfamily = mergefamilies[iClause];
+		Oid			collation = mergecollations[iClause];
 		StrategyNumber opstrategy = mergestrategies[iClause];
 		bool		nulls_first = mergenullsfirst[iClause];
 		int			op_strategy;
@@ -201,7 +217,7 @@ MJExamineQuals(List *mergeclauses,
 		clause->rexpr = ExecInitExpr((Expr *) lsecond(qual->args), parent);
 
 		/* Extract the operator's declared left/right datatypes */
-		get_op_opfamily_properties(qual->opno, opfamily,
+		get_op_opfamily_properties(qual->opno, opfamily, false,
 								   &op_strategy,
 								   &op_lefttype,
 								   &op_righttype);
@@ -226,6 +242,7 @@ MJExamineQuals(List *mergeclauses,
 
 		/* Set up the fmgr lookup information */
 		fmgr_info(cmpproc, &(clause->cmpfinfo));
+		fmgr_info_collation(collation, &(clause->cmpfinfo));
 
 		/* Fill the additional comparison-strategy flags */
 		if (opstrategy == BTLessStrategyNumber)
@@ -1622,6 +1639,7 @@ ExecInitMergeJoin(MergeJoin *node, EState *estate, int eflags)
 	mergestate->mj_NumClauses = list_length(node->mergeclauses);
 	mergestate->mj_Clauses = MJExamineQuals(node->mergeclauses,
 											node->mergeFamilies,
+											node->mergeCollations,
 											node->mergeStrategies,
 											node->mergeNullsFirst,
 											(PlanState *) mergestate);

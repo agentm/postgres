@@ -1,11 +1,230 @@
 <!-- doc/src/sgml/release-8.1.sgml -->
 <!-- See header comment in release.sgml about typical markup -->
 
+ <sect1 id="release-8-1-23">
+  <title>Release 8.1.23</title>
+
+  <note>
+  <title>Release Date</title>
+  <simpara>2010-12-16</simpara>
+  </note>
+
+  <para>
+   This release contains a variety of fixes from 8.1.22.
+   For information about new features in the 8.1 major release, see
+   <xref linkend="release-8-1">.
+  </para>
+
+  <para>
+   This is expected to be the last <productname>PostgreSQL</> release
+   in the 8.1.X series.  Users are encouraged to update to a newer
+   release branch soon.
+  </para>
+
+  <sect2>
+   <title>Migration to Version 8.1.23</title>
+
+   <para>
+    A dump/restore is not required for those running 8.1.X.
+    However, if you are upgrading from a version earlier than 8.1.18,
+    see the release notes for 8.1.18.
+   </para>
+
+  </sect2>
+
+  <sect2>
+   <title>Changes</title>
+
+   <itemizedlist>
+
+    <listitem>
+     <para>
+      Force the default
+      <link linkend="guc-wal-sync-method"><varname>wal_sync_method</></link>
+      to be <literal>fdatasync</> on Linux (Tom Lane, Marti Raudsepp)
+     </para>
+
+     <para>
+      The default on Linux has actually been <literal>fdatasync</> for many
+      years, but recent kernel changes caused <productname>PostgreSQL</> to
+      choose <literal>open_datasync</> instead.  This choice did not result
+      in any performance improvement, and caused outright failures on
+      certain filesystems, notably <literal>ext4</> with the
+      <literal>data=journal</> mount option.
+     </para>
+    </listitem>
+
+    <listitem>
+     <para>
+      Fix recovery from base backup when the starting checkpoint WAL record
+      is not in the same WAL segment as its redo point (Jeff Davis)
+     </para>
+    </listitem>
+
+    <listitem>
+     <para>
+      Add support for detecting register-stack overrun on <literal>IA64</>
+      (Tom Lane)
+     </para>
+
+     <para>
+      The <literal>IA64</> architecture has two hardware stacks.  Full
+      prevention of stack-overrun failures requires checking both.
+     </para>
+    </listitem>
+
+    <listitem>
+     <para>
+      Add a check for stack overflow in <function>copyObject()</> (Tom Lane)
+     </para>
+
+     <para>
+      Certain code paths could crash due to stack overflow given a
+      sufficiently complex query.
+     </para>
+    </listitem>
+
+    <listitem>
+     <para>
+      Fix detection of page splits in temporary GiST indexes (Heikki
+      Linnakangas)
+     </para>
+
+     <para>
+      It is possible to have a <quote>concurrent</> page split in a
+      temporary index, if for example there is an open cursor scanning the
+      index when an insertion is done.  GiST failed to detect this case and
+      hence could deliver wrong results when execution of the cursor
+      continued.
+     </para>
+    </listitem>
+
+    <listitem>
+     <para>
+      Avoid memory leakage while <command>ANALYZE</>'ing complex index
+      expressions (Tom Lane)
+     </para>
+    </listitem>
+
+    <listitem>
+     <para>
+      Ensure an index that uses a whole-row Var still depends on its table
+      (Tom Lane)
+     </para>
+
+     <para>
+      An index declared like <literal>create index i on t (foo(t.*))</>
+      would not automatically get dropped when its table was dropped.
+     </para>
+    </listitem>
+
+    <listitem>
+     <para>
+      Do not <quote>inline</> a SQL function with multiple <literal>OUT</>
+      parameters (Tom Lane)
+     </para>
+
+     <para>
+      This avoids a possible crash due to loss of information about the
+      expected result rowtype.
+     </para>
+    </listitem>
+
+    <listitem>
+     <para>
+      Fix constant-folding of <literal>COALESCE()</> expressions (Tom Lane)
+     </para>
+
+     <para>
+      The planner would sometimes attempt to evaluate sub-expressions that
+      in fact could never be reached, possibly leading to unexpected errors.
+     </para>
+    </listitem>
+
+    <listitem>
+     <para>
+      Add print functionality for <structname>InhRelation</> nodes (Tom Lane)
+     </para>
+
+     <para>
+      This avoids a failure when <varname>debug_print_parse</> is enabled
+      and certain types of query are executed.
+     </para>
+    </listitem>
+
+    <listitem>
+     <para>
+      Fix incorrect calculation of distance from a point to a horizontal
+      line segment (Tom Lane)
+     </para>
+
+     <para>
+      This bug affected several different geometric distance-measurement
+      operators.
+     </para>
+    </listitem>
+
+    <listitem>
+     <para>
+      Fix <application>PL/pgSQL</>'s handling of <quote>simple</>
+      expressions to not fail in recursion or error-recovery cases (Tom Lane)
+     </para>
+    </listitem>
+
+    <listitem>
+     <para>
+      Fix bug in <filename>contrib/cube</>'s GiST picksplit algorithm
+      (Alexander Korotkov)
+     </para>
+
+     <para>
+      This could result in considerable inefficiency, though not actually
+      incorrect answers, in a GiST index on a <type>cube</> column.
+      If you have such an index, consider <command>REINDEX</>ing it after
+      installing this update.
+     </para>
+    </listitem>
+
+    <listitem>
+     <para>
+      Don't emit <quote>identifier will be truncated</> notices in
+      <filename>contrib/dblink</> except when creating new connections
+      (Itagaki Takahiro)
+     </para>
+    </listitem>
+
+    <listitem>
+     <para>
+      Fix potential coredump on missing public key in
+      <filename>contrib/pgcrypto</> (Marti Raudsepp)
+     </para>
+    </listitem>
+
+    <listitem>
+     <para>
+      Fix memory leak in <filename>contrib/xml2</>'s XPath query functions
+      (Tom Lane)
+     </para>
+    </listitem>
+
+    <listitem>
+     <para>
+      Update time zone data files to <application>tzdata</> release 2010o
+      for DST law changes in Fiji and Samoa;
+      also historical corrections for Hong Kong.
+     </para>
+    </listitem>
+
+   </itemizedlist>
+
+  </sect2>
+ </sect1>
+
  <sect1 id="release-8-1-22">
   <title>Release 8.1.22</title>
 
   <note>
-  <title>Release date</title>
+  <title>Release Date</title>
   <simpara>2010-10-04</simpara>
   </note>
 
@@ -223,7 +442,7 @@
   <title>Release 8.1.21</title>
 
   <note>
-  <title>Release date</title>
+  <title>Release Date</title>
   <simpara>2010-05-17</simpara>
   </note>
 
@@ -377,7 +596,7 @@
   <title>Release 8.1.20</title>
 
   <note>
-  <title>Release date</title>
+  <title>Release Date</title>
   <simpara>2010-03-15</simpara>
   </note>
 
@@ -567,7 +786,7 @@
   <title>Release 8.1.19</title>
 
   <note>
-  <title>Release date</title>
+  <title>Release Date</title>
   <simpara>2009-12-14</simpara>
   </note>
 
@@ -748,7 +967,7 @@
   <title>Release 8.1.18</title>
 
   <note>
-  <title>Release date</title>
+  <title>Release Date</title>
   <simpara>2009-09-09</simpara>
   </note>
 
@@ -912,7 +1131,7 @@
   <title>Release 8.1.17</title>
 
   <note>
-  <title>Release date</title>
+  <title>Release Date</title>
   <simpara>2009-03-16</simpara>
   </note>
 
@@ -1035,7 +1254,7 @@
   <title>Release 8.1.16</title>
 
   <note>
-  <title>Release date</title>
+  <title>Release Date</title>
   <simpara>2009-02-02</simpara>
   </note>
 
@@ -1155,7 +1374,7 @@
   <title>Release 8.1.15</title>
 
   <note>
-  <title>Release date</title>
+  <title>Release Date</title>
   <simpara>2008-11-03</simpara>
   </note>
 
@@ -1307,7 +1526,7 @@
   <title>Release 8.1.14</title>
 
   <note>
-  <title>Release date</title>
+  <title>Release Date</title>
   <simpara>2008-09-22</simpara>
   </note>
 
@@ -1483,7 +1702,7 @@
   <title>Release 8.1.13</title>
 
   <note>
-  <title>Release date</title>
+  <title>Release Date</title>
   <simpara>2008-06-12</simpara>
   </note>
 
@@ -1550,7 +1769,7 @@
   <title>Release 8.1.12</title>
 
   <note>
-  <title>Release date</title>
+  <title>Release Date</title>
   <simpara>never released</simpara>
   </note>
 
@@ -1800,7 +2019,7 @@
   <title>Release 8.1.11</title>
 
   <note>
-  <title>Release date</title>
+  <title>Release Date</title>
   <simpara>2008-01-07</simpara>
   </note>
 
@@ -2052,7 +2271,7 @@
   <title>Release 8.1.10</title>
 
   <note>
-  <title>Release date</title>
+  <title>Release Date</title>
   <simpara>2007-09-17</simpara>
   </note>
 
@@ -2173,7 +2392,7 @@
   <title>Release 8.1.9</title>
 
   <note>
-  <title>Release date</title>
+  <title>Release Date</title>
   <simpara>2007-04-23</simpara>
   </note>
 
@@ -2264,7 +2483,7 @@
   <title>Release 8.1.8</title>
 
   <note>
-  <title>Release date</title>
+  <title>Release Date</title>
   <simpara>2007-02-07</simpara>
   </note>
 
@@ -2306,7 +2525,7 @@
   <title>Release 8.1.7</title>
 
   <note>
-  <title>Release date</title>
+  <title>Release Date</title>
   <simpara>2007-02-05</simpara>
   </note>
 
@@ -2408,7 +2627,7 @@
   <title>Release 8.1.6</title>
 
   <note>
-  <title>Release date</title>
+  <title>Release Date</title>
   <simpara>2007-01-08</simpara>
   </note>
 
@@ -2558,7 +2777,7 @@
   <title>Release 8.1.5</title>
 
   <note>
-  <title>Release date</title>
+  <title>Release Date</title>
   <simpara>2006-10-16</simpara>
   </note>
 
@@ -2635,7 +2854,7 @@ compilers (Hiroshi Saito)</para></listitem>
   <title>Release 8.1.4</title>
 
   <note>
-  <title>Release date</title>
+  <title>Release Date</title>
   <simpara>2006-05-23</simpara>
   </note>
 
@@ -2789,7 +3008,7 @@ documented (Tom)</para></listitem>
   <title>Release 8.1.3</title>
 
   <note>
-  <title>Release date</title>
+  <title>Release Date</title>
   <simpara>2006-02-14</simpara>
   </note>
 
@@ -2911,7 +3130,7 @@ creation (Tom)</para></listitem>
   <title>Release 8.1.2</title>
 
   <note>
-  <title>Release date</title>
+  <title>Release Date</title>
   <simpara>2006-01-09</simpara>
   </note>
 
@@ -3014,7 +3233,7 @@ what's actually returned by the query (Joe)</para></listitem>
   <title>Release 8.1.1</title>
 
   <note>
-  <title>Release date</title>
+  <title>Release Date</title>
   <simpara>2005-12-12</simpara>
   </note>
 
@@ -3106,7 +3325,7 @@ DISTINCT query</para></listitem>
   <title>Release 8.1</title>
 
   <note>
-   <title>Release date</title>
+   <title>Release Date</title>
    <simpara>2005-11-08</simpara>
   </note>
 

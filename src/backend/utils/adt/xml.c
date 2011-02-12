@@ -4,7 +4,7 @@
  *	  XML data type support.
  *
  *
- * Portions Copyright (c) 1996-2010, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2011, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/backend/utils/adt/xml.c
@@ -1615,7 +1615,7 @@ map_xml_name_to_sql_identifier(char *name)
 char *
 map_sql_value_to_xml_value(Datum value, Oid type, bool xml_escape_strings)
 {
-	if (type_is_array(type))
+	if (type_is_array_domain(type))
 	{
 		ArrayType  *array;
 		Oid			elmtype;
@@ -3601,7 +3601,7 @@ xml_is_well_formed(PG_FUNCTION_ARGS)
 {
 #ifdef USE_LIBXML
 	text	   *data = PG_GETARG_TEXT_P(0);
-	
+
 	PG_RETURN_BOOL(wellformed_xml(data, xmloption));
 #else
 	NO_XML_SUPPORT();
@@ -3614,7 +3614,7 @@ xml_is_well_formed_document(PG_FUNCTION_ARGS)
 {
 #ifdef USE_LIBXML
 	text	   *data = PG_GETARG_TEXT_P(0);
-	
+
 	PG_RETURN_BOOL(wellformed_xml(data, XMLOPTION_DOCUMENT));
 #else
 	NO_XML_SUPPORT();
@@ -3627,7 +3627,7 @@ xml_is_well_formed_content(PG_FUNCTION_ARGS)
 {
 #ifdef USE_LIBXML
 	text	   *data = PG_GETARG_TEXT_P(0);
-	
+
 	PG_RETURN_BOOL(wellformed_xml(data, XMLOPTION_CONTENT));
 #else
 	NO_XML_SUPPORT();

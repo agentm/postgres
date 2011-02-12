@@ -8,7 +8,7 @@
  *
  * This code is released under the terms of the PostgreSQL License.
  *
- * Portions Copyright (c) 1996-2010, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2011, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/test/regress/pg_regress.c
@@ -84,6 +84,7 @@ bool		debug = false;
 char	   *inputdir = ".";
 char	   *outputdir = ".";
 char	   *psqldir = PGBINDIR;
+char	   *launcher = NULL;
 static _stringlist *loadlanguage = NULL;
 static int	max_connections = 0;
 static char *encoding = NULL;
@@ -1674,7 +1675,7 @@ run_single_test(const char *test, test_function tfunc)
 			   *tl;
 	bool		differ = false;
 
-	status(_("test %-20s ... "), test);
+	status(_("test %-24s ... "), test);
 	pid = (tfunc) (test, &resultfiles, &expectfiles, &tags);
 	wait_for_tests(&pid, &exit_status, NULL, 1);
 
@@ -1871,6 +1872,7 @@ help(void)
 	printf(_("  --dlpath=DIR              look for dynamic libraries in DIR\n"));
 	printf(_("  --temp-install=DIR        create a temporary installation in DIR\n"));
 	printf(_("  --use-existing            use an existing installation\n"));
+	printf(_("  --launcher=CMD            use CMD as launcher of psql\n"));
 	printf(_("\n"));
 	printf(_("Options for \"temp-install\" mode:\n"));
 	printf(_("  --no-locale               use C locale\n"));
@@ -1922,6 +1924,7 @@ regression_main(int argc, char *argv[], init_function ifunc, test_function tfunc
 		{"create-role", required_argument, NULL, 18},
 		{"temp-config", required_argument, NULL, 19},
 		{"use-existing", no_argument, NULL, 20},
+		{"launcher", required_argument, NULL, 21},
 		{NULL, 0, NULL, 0}
 	};
 
@@ -2014,6 +2017,9 @@ regression_main(int argc, char *argv[], init_function ifunc, test_function tfunc
 				break;
 			case 20:
 				use_existing = true;
+				break;
+			case 21:
+				launcher = strdup(optarg);
 				break;
 			default:
 				/* getopt_long already emitted a complaint */

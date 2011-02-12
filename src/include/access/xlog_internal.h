@@ -8,7 +8,7 @@
  * needed by rmgr routines (redo support for individual record types).
  * So the XLogRecord typedef and associated stuff appear in xlog.h.
  *
- * Portions Copyright (c) 1996-2010, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2011, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/access/xlog_internal.h
@@ -71,7 +71,7 @@ typedef struct XLogContRecord
 /*
  * Each page of XLOG file has a header like this:
  */
-#define XLOG_PAGE_MAGIC 0xD065	/* can be used as WAL version indicator */
+#define XLOG_PAGE_MAGIC 0xD066	/* can be used as WAL version indicator */
 
 typedef struct XLogPageHeaderData
 {
@@ -267,12 +267,17 @@ extern XLogRecPtr RequestXLogSwitch(void);
 extern Datum pg_start_backup(PG_FUNCTION_ARGS);
 extern Datum pg_stop_backup(PG_FUNCTION_ARGS);
 extern Datum pg_switch_xlog(PG_FUNCTION_ARGS);
+extern Datum pg_create_restore_point(PG_FUNCTION_ARGS);
 extern Datum pg_current_xlog_location(PG_FUNCTION_ARGS);
 extern Datum pg_current_xlog_insert_location(PG_FUNCTION_ARGS);
 extern Datum pg_last_xlog_receive_location(PG_FUNCTION_ARGS);
 extern Datum pg_last_xlog_replay_location(PG_FUNCTION_ARGS);
+extern Datum pg_last_xact_replay_timestamp(PG_FUNCTION_ARGS);
 extern Datum pg_xlogfile_name_offset(PG_FUNCTION_ARGS);
 extern Datum pg_xlogfile_name(PG_FUNCTION_ARGS);
 extern Datum pg_is_in_recovery(PG_FUNCTION_ARGS);
+extern Datum pg_xlog_replay_pause(PG_FUNCTION_ARGS);
+extern Datum pg_xlog_replay_resume(PG_FUNCTION_ARGS);
+extern Datum pg_is_xlog_replay_paused(PG_FUNCTION_ARGS);
 
 #endif   /* XLOG_INTERNAL_H */

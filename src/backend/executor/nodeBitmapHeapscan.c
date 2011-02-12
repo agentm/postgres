@@ -16,7 +16,7 @@
  * index qual conditions.
  *
  *
- * Portions Copyright (c) 1996-2010, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2011, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -42,6 +42,7 @@
 #include "executor/nodeBitmapHeapscan.h"
 #include "pgstat.h"
 #include "storage/bufmgr.h"
+#include "storage/predicate.h"
 #include "utils/memutils.h"
 #include "utils/snapmgr.h"
 #include "utils/tqual.h"
@@ -351,7 +352,7 @@ bitgetpage(HeapScanDesc scan, TBMIterateResult *tbmres)
 			ItemPointerData tid;
 
 			ItemPointerSet(&tid, page, offnum);
-			if (heap_hot_search_buffer(&tid, buffer, snapshot, NULL))
+			if (heap_hot_search_buffer(&tid, scan->rs_rd, buffer, snapshot, NULL))
 				scan->rs_vistuples[ntup++] = ItemPointerGetOffsetNumber(&tid);
 		}
 	}

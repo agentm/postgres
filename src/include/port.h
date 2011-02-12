@@ -3,7 +3,7 @@
  * port.h
  *	  Header for src/port/ compatibility functions.
  *
- * Portions Copyright (c) 1996-2010, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2011, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/port.h
@@ -36,12 +36,13 @@ extern bool pg_set_block(pgsocket sock);
 
 extern char *first_dir_separator(const char *filename);
 extern char *last_dir_separator(const char *filename);
-extern char *first_path_separator(const char *pathlist);
+extern char *first_path_var_separator(const char *pathlist);
 extern void join_path_components(char *ret_path,
 					 const char *head, const char *tail);
 extern void canonicalize_path(char *path);
 extern void make_native_path(char *path);
 extern bool path_contains_parent_reference(const char *path);
+extern bool path_is_relative_and_below_cwd(const char *path);
 extern bool path_is_prefix_of_path(const char *path1, const char *path2);
 extern const char *get_progname(const char *argv0);
 extern void get_share_path(const char *my_exec_path, char *ret_path);
@@ -68,17 +69,21 @@ extern void pgfnames_cleanup(char **filenames);
  *	By making this a macro we avoid needing to include path.c in libpq.
  */
 #ifndef WIN32
+#define IS_DIR_SEP(ch)	((ch) == '/')
+
 #define is_absolute_path(filename) \
 ( \
-	((filename)[0] == '/') \
+	IS_DIR_SEP((filename)[0]) \
 )
 #else
+#define IS_DIR_SEP(ch)	((ch) == '/' || (ch) == '\\')
+
+/* See path_is_relative_and_below_cwd() for how we handle 'E:abc'. */
 #define is_absolute_path(filename) \
 ( \
-	((filename)[0] == '/') || \
-	(filename)[0] == '\\' || \
+	IS_DIR_SEP((filename)[0]) || \
 	(isalpha((unsigned char) ((filename)[0])) && (filename)[1] == ':' && \
-	((filename)[2] == '\\' || (filename)[2] == '/')) \
+	 IS_DIR_SEP((filename)[2])) \
 )
 #endif
 
@@ -175,6 +180,15 @@ extern unsigned char pg_tolower(unsigned char ch);
 #endif
 #ifdef printf
 #undef printf
+#endif
+/*
+ * Versions of libintl >= 0.18? try to replace setlocale() with a macro
+ * to their own versions.  Remove the macro, if it exists, because it
+ * ends up calling the wrong version when the backend and libintl use
+ * different versions of msvcrt.
+ */
+#if defined(setlocale) && defined(WIN32)
+#undef setlocale
 #endif
 
 extern int	pg_vsnprintf(char *str, size_t count, const char *fmt, va_list args);
@@ -284,11 +298,12 @@ extern int	pgunlink(const char *path);
  */
 #if defined(WIN32) && !defined(__CYGWIN__)
 extern int	pgsymlink(const char *oldpath, const char *newpath);
+extern int	pgreadlink(const char *path, char *buf, size_t size);
+extern bool pgwin32_is_junction(char *path);
 
 #define symlink(oldpath, newpath)	pgsymlink(oldpath, newpath)
+#define readlink(path, buf, size)	pgreadlink(path, buf, size)
 #endif
-
-extern void copydir(char *fromdir, char *todir, bool recurse);
 
 extern bool rmtree(const char *path, bool rmtopdir);
 
@@ -324,8 +339,12 @@ extern FILE *pgwin32_fopen(const char *, const char *);
 #define		fopen(a,b) pgwin32_fopen(a,b)
 #endif
 
+#ifndef popen
 #define popen(a,b) _popen(a,b)
+#endif
+#ifndef pclose
 #define pclose(a) _pclose(a)
+#endif
 
 /* New versions of MingW have gettimeofday, old mingw and msvc don't */
 #ifndef HAVE_GETTIMEOFDAY
@@ -437,6 +456,16 @@ extern void qsort_arg(void *base, size_t nel, size_t elsize,
 		  qsort_arg_comparator cmp, void *arg);
 
 /* port/chklocale.c */
-extern int	pg_get_encoding_from_locale(const char *ctype);
+extern int	pg_get_encoding_from_locale(const char *ctype, bool write_message);
+
+/* port/inet_net_ntop.c */
+extern char *inet_net_ntop(int af, const void *src, int bits,
+			  char *dst, size_t size);
+
+/* port/pgcheckdir.c */
+extern int	pg_check_dir(const char *dir);
+
+/* port/pgmkdirp.c */
+extern int	pg_mkdir_p(char *path, int omode);
 
 #endif   /* PG_PORT_H */

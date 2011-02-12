@@ -4,7 +4,7 @@
  *	Routines for type coercion.
  *
  *
- * Portions Copyright (c) 1996-2010, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2011, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/parser/parse_coerce.h
@@ -86,5 +86,7 @@ extern CoercionPathType find_coercion_pathway(Oid targetTypeId,
 					  Oid *funcid);
 extern CoercionPathType find_typmod_coercion_function(Oid typeId,
 							  Oid *funcid);
+
+extern Oid select_common_collation(ParseState *pstate, List *exprs, bool none_ok);
 
 #endif   /* PARSE_COERCE_H */

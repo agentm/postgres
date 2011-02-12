@@ -9,7 +9,7 @@
 
  <para>
   <application>pg_upgrade</> (formerly called <application>pg_migrator</>) allows data
-  stored in <productname>PostgreSQL</> data files to be migrated to a later <productname>PostgreSQL</>
+  stored in <productname>PostgreSQL</> data files to be upgraded to a later <productname>PostgreSQL</>
   major version without the data dump/reload typically required for
   major version upgrades, e.g. from 8.4.7 to the current major release
   of <productname>PostgreSQL</>.  It is not required for minor version upgrades, e.g. from
@@ -17,11 +17,22 @@
  </para>
 
  <para>
-  <application>pg_upgrade</> works because, though new features are
-  regularly added to PostgreSQL major releases, the internal data storage
-  format rarely changes.  <application>pg_upgrade</> does its best to
+  Major PostgreSQL releases regularly add new features that often
+  change the layout of the system tables, but the internal data storage
+  format rarely changes.  <application>pg_upgrade</> uses this fact
+  to perform rapid upgrades by creating new system tables and simply
+  reusing the old user data files.  If a future major release ever
+  changes the data storage format in a way that makes the old data
+  format unreadable, <application>pg_upgrade</> will not be usable
+  for such upgrades.  (The community will attempt to avoid such
+  situations.)
+ </para>
+
+ <para>
+  <application>pg_upgrade</> does its best to
   make sure the old and new clusters are binary-compatible, e.g.  by
-  checking for compatible compile-time settings.  It is important that
+  checking for compatible compile-time settings, including 32/64-bit
+  binaries.  It is important that
   any external modules are also binary compatible, though this cannot
   be checked by <application>pg_upgrade</>.
  </para>
@@ -147,69 +158,69 @@
   <procedure>
    <step performance="optional">
     <title>Optionally move the old cluster</title>
- 
+
     <para>
      If you are using a version-specific installation directory, e.g.
      <filename>/opt/PostgreSQL/8.4</>, you do not need to move the old cluster. The
      one-click installers all use version-specific installation directories.
     </para>
- 
-    <para>    
+
+    <para>
      If your installation directory is not version-specific, e.g.
      <filename>/usr/local/pgsql</>, it is necessary to move the current PostgreSQL install
      directory so it does not interfere with the new <productname>PostgreSQL</> installation.
      Once the current <productname>PostgreSQL</> server is shut down, it is safe to rename the
      PostgreSQL installation directory; assuming the old directory is
      <filename>/usr/local/pgsql</>, you can do:
- 
+
 <programlisting>
 mv /usr/local/pgsql /usr/local/pgsql.old
 </programlisting>
      to rename the directory.
     </para>
    </step>
- 
+
    <step>
     <title>For source installs, build the new version</title>
- 
+
     <para>
      Build the new PostgreSQL source with <command>configure</> flags that are compatible
      with the old cluster. <application>pg_upgrade</> will check <command>pg_controldata</> to make
      sure all settings are compatible before starting the upgrade.
     </para>
    </step>
- 
+
    <step>
     <title>Install the new PostgreSQL binaries</title>
- 
+
     <para>
      Install the new server's binaries and support files. You can use the
      same port numbers for both clusters, typically 5432, because the old and
      new clusters will not be running at the same time.
     </para>
- 
+
     <para>
      For source installs, if you wish to install the new server in a custom
      location, use the <literal>prefix</literal> variable:
- 
+
 <programlisting>
 gmake prefix=/usr/local/pgsql.new install
 </programlisting>
     </para>
    </step>
- 
+
    <step>
     <title>Install pg_upgrade and pg_upgrade_support</title>
 
     <para>
-     Install <application>pg_upgrade</> and
-     <application>pg_upgrade_support</> in the new PostgreSQL cluster
+     Install the <application>pg_upgrade</> binary and
+     <application>pg_upgrade_support</> library in the new PostgreSQL cluster.
     </para>
    </step>
- 
+
    <step>
     <title>Initialize the new PostgreSQL cluster</title>
- 
+
     <para>
      Initialize the new cluster using <command>initdb</command>.
      Again, use compatible <command>initdb</command>
@@ -218,21 +229,21 @@ gmake prefix=/usr/local/pgsql.new install
      start the new cluster.
     </para>
    </step>
- 
+
    <step>
     <title>Install custom shared object files</title>
- 
+
     <para>
      Install any custom shared object files (or DLLs) used by the old cluster
      into the new cluster, e.g. <filename>pgcrypto.so</filename>, whether they are from <filename>contrib</filename>
      or some other source. Do not install the schema definitions, e.g.
-     <filename>pgcrypto.sql</>, because these will be migrated from the old cluster.
+     <filename>pgcrypto.sql</>, because these will be upgraded from the old cluster.
     </para>
    </step>
- 
+
    <step>
     <title>Adjust authentication</title>
- 
+
     <para>
      <command>pg_upgrade</> will connect to the old and new servers several times,
      so you might want to set authentication to <literal>trust</> in
@@ -241,58 +252,58 @@ gmake prefix=/usr/local/pgsql.new install
      to avoid being prompted repeatedly for a password.
     </para>
    </step>
- 
+
    <step>
     <title>Stop both servers</title>
- 
+
     <para>
      Make sure both database servers are stopped using, on Unix, e.g.:
- 
+
 <programlisting>
 pg_ctl -D /opt/PostgreSQL/8.4 stop
 pg_ctl -D /opt/PostgreSQL/9.0 stop
 </programlisting>
- 
+
      or on Windows, using the proper service names:
- 
+
 <programlisting>
 NET STOP postgresql-8.4
 NET STOP postgresql-9.0
 </programlisting>
- 
+
      or
- 
+
 <programlisting>
 NET STOP pgsql-8.3  (<productname>PostgreSQL</> 8.3 and older used a different service name)
 </programlisting>
     </para>
    </step>
- 
+
    <step>
     <title>Run <application>pg_upgrade</></title>
- 
+
     <para>
      Always run the <application>pg_upgrade</> binary of the new server, not the old one.
      <application>pg_upgrade</> requires the specification of the old and new cluster's
      data and executable (<filename>bin</>) directories. You can also specify separate
      user and port values, and whether you want the data linked instead of
-     copied (the default). If you use linking, the migration will be much
+     copied (the default). If you use linking, the upgrade will be much
      faster (no data copying), but you will no longer be able to access your
      old cluster once you start the new cluster after the upgrade. See
      <literal>pg_upgrade --help</> for a full list of options.
     </para>
- 
+
     <para>
      For Windows users, you must be logged into an administrative account, and
      then start a shell as the <literal>postgres</> user and set the proper path:
- 
+
 <programlisting>
 RUNAS /USER:postgres "CMD.EXE"
 SET PATH=%PATH%;C:\Program Files\PostgreSQL\9.0\bin;
 </programlisting>
- 
+
      and then run <application>pg_upgrade</> with quoted directories, e.g.:
- 
+
 <programlisting>
 pg_upgrade.exe
         --old-datadir "C:/Program Files/PostgreSQL/8.4/data"
@@ -300,58 +311,58 @@ pg_upgrade.exe
         --old-bindir "C:/Program Files/PostgreSQL/8.4/bin"
         --new-bindir "C:/Program Files/PostgreSQL/9.0/bin"
 </programlisting>
- 
+
      Once started, <command>pg_upgrade</> will verify the two clusters are compatible
-     and then do the migration. You can use <command>pg_upgrade --check</>
+     and then do the upgrade. You can use <command>pg_upgrade --check</>
      to perform only the checks, even if the old server is still
      running. <command>pg_upgrade --check</> will also outline any
-     manual adjustments you will need to make after the migration.
+     manual adjustments you will need to make after the upgrade.
      <command>pg_upgrade</> requires write permission in the current directory.
     </para>
- 
+
     <para>
-     Obviously, no one should be accessing the clusters during the migration.
+     Obviously, no one should be accessing the clusters during the upgrade.
     </para>
- 
+
     <para>
      If an error occurs while restoring the database schema, <command>pg_upgrade</> will
      exit and you will have to revert to the old cluster as outlined in <xref linkend="pgupgrade-step-revert">
      below. To try <command>pg_upgrade</command> again, you will need to modify the old
      cluster so the pg_upgrade schema restore succeeds. If the problem is a
      contrib module, you might need to uninstall the contrib module from
-     the old cluster and install it in the new cluster after the migration,
+     the old cluster and install it in the new cluster after the upgrade,
      assuming the module is not being used to store user data.
     </para>
    </step>
- 
+
    <step>
     <title>Restore <filename>pg_hba.conf</></title>
- 
+
     <para>
      If you modified <filename>pg_hba.conf</> to use <literal>trust</>,
      restore its original authentication settings.
     </para>
    </step>
- 
+
    <step>
-    <title>Post-migration processing</title>
- 
+    <title>Post-Upgrade processing</title>
+
     <para>
-     If any post-migration processing is required, pg_upgrade will issue
+     If any post-upgrade processing is required, pg_upgrade will issue
      warnings as it completes. It will also generate script files that must
      be run by the administrator. The script files will connect to each
-     database that needs post-migration processing. Each script should be
+     database that needs post-upgrade processing. Each script should be
      run using:
- 
+
 <programlisting>
 psql --username postgres --file script.sql postgres
 </programlisting>
- 
+
      The scripts can be run in any order and can be deleted once they have
      been run.
     </para>
 
-    <caution> 
+    <caution>
     <para>
      In general it is unsafe to access tables referenced in rebuild scripts
      until the rebuild scripts have run to completion; doing so could yield
@@ -360,20 +371,20 @@ psql --username postgres --file script.sql postgres
     </para>
     </caution>
    </step>
- 
+
    <step>
     <title>Statistics</title>
 
     <para>
      Because optimizer statistics are not transferred by <command>pg_upgrade</>, you will
      be instructed to run a command to regenerate that information at the end
-     of the migration.
+     of the upgrade.
     </para>
    </step>
- 
+
    <step>
     <title>Delete old cluster</title>
- 
+
     <para>
      Once you are satisfied with the upgrade, you can delete the old
      cluster's data directories by running the script mentioned when
@@ -382,10 +393,10 @@ psql --username postgres --file script.sql postgres
      (e.g. <filename>bin</>, <filename>share</>).
     </para>
    </step>
- 
+
    <step id="pgupgrade-step-revert" performance="optional">
     <title>Reverting to old cluster</title>
- 
+
     <para>
      If, after running <command>pg_upgrade</command>, you wish to revert to the old cluster,
      there are several options:
@@ -418,9 +429,9 @@ psql --username postgres --file script.sql postgres
         to <filename>$PGDATA/global/pg_control</> and perhaps
         tablespace directories. To reuse the old cluster, remove
         the <filename>.old</> suffix
-        from <filename>$PGDATA/global/pg_control</>. and, if migrating
+        from <filename>$PGDATA/global/pg_control</>. and, if upgrading
         to 8.4 or earlier, remove the tablespace directories created
-        by the migration and remove the <filename>.old</> suffix from
+        by the upgrade and remove the <filename>.old</> suffix from
         the tablespace directory names; then you can restart the old
         cluster.
        </para>
@@ -429,16 +440,16 @@ psql --username postgres --file script.sql postgres
     </para>
    </step>
   </procedure>
- 
+
  </sect2>
- 
+
  <sect2>
-  <title>Limitations in Migrating <emphasis>from</> PostgreSQL 8.3</title>
- 
+  <title>Limitations in Upgrading <emphasis>from</> PostgreSQL 8.3</title>
+
   <para>
    Upgrading from PostgreSQL 8.3 has additional restrictions not present
    when upgrading from later PostgreSQL releases.  For example,
-   pg_upgrade will not work for a migration from 8.3 if a user column
+   pg_upgrade will not work for upgrading from 8.3 if a user column
    is defined as:
    <itemizedlist>
     <listitem>
@@ -455,9 +466,9 @@ psql --username postgres --file script.sql postgres
   </para>
 
   <para>
-   You must drop any such columns and migrate them manually.
+   You must drop any such columns and upgrade them manually.
   </para>
- 
+
   <para>
    pg_upgrade will require a table rebuild if:
    <itemizedlist>
@@ -468,7 +479,7 @@ psql --username postgres --file script.sql postgres
     </listitem>
    </itemizedlist>
   </para>
- 
+
   <para>
    pg_upgrade will require a reindex if:
    <itemizedlist>
@@ -484,14 +495,14 @@ psql --username postgres --file script.sql postgres
     </listitem>
    </itemizedlist>
   </para>
- 
+
   <para>
    Also, the default datetime storage format changed to integer after
    <productname>PostgreSQL</> 8.3. pg_upgrade will check that the datetime storage format
    used by the old and new clusters match. Make sure your new cluster is
    built with the configure flag <option>--disable-integer-datetimes</>.
   </para>
- 
+
   <para>
    For Windows users, note that due to different integer datetimes settings
    used by the one-click installer and the MSI installer, it is only
@@ -501,40 +512,40 @@ psql --username postgres --file script.sql postgres
   </para>
 
  </sect2>
- 
+
  <sect2>
   <title>Notes</title>
- 
-  <para>  
-   <application>pg_upgrade</> does not support migration of databases
+
+  <para>
+   <application>pg_upgrade</> does not support upgrading of databases
    containing these <type>reg*</> OID-referencing system data types:
    <type>regproc</>, <type>regprocedure</>, <type>regoper</>,
    <type>regoperator</>, <type>regclass</>, <type>regconfig</>, and
-   <type>regdictionary</>.  (<type>regtype</> can be migrated.)
+   <type>regdictionary</>.  (<type>regtype</> can be upgraded.)
   </para>
- 
-  <para>  
+
+  <para>
    All failure, rebuild, and reindex cases will be reported by
    <application>pg_upgrade</> if they affect your installation;
-   post-migration scripts to rebuild tables and indexes will be
+   post-upgrade scripts to rebuild tables and indexes will be
    generated automatically.
   </para>
- 
+
   <para>
    For deployment testing, create a schema-only copy of the old cluster,
-   insert dummy data, and migrate that.
+   insert dummy data, and upgrade that.
   </para>
- 
-  <para>  
+
+  <para>
    If you want to use link mode and you don't want your old cluster
    to be modified when the new cluster is started, make a copy of the
-   old cluster and migrate that with link mode. To make a valid copy
+   old cluster and upgrade that with link mode. To make a valid copy
    of the old cluster, use <command>rsync</> to create a dirty
    copy of the old cluster while the server is running, then shut down
    the old server and run <command>rsync</> again to update the copy with any
    changes to make it consistent.
   </para>
- 
+
  </sect2>
- 
+
 </sect1>

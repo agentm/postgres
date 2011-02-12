@@ -9,7 +9,7 @@
  * in cluster.c.
  *
  *
- * Portions Copyright (c) 1996-2010, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2011, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -59,10 +59,9 @@ static BufferAccessStrategy vac_strategy;
 
 
 /* non-export function prototypes */
-static List *get_rel_oids(Oid relid, const RangeVar *vacrel,
-			 const char *stmttype);
+static List *get_rel_oids(Oid relid, const RangeVar *vacrel);
 static void vac_truncate_clog(TransactionId frozenXID);
-static void vacuum_rel(Oid relid, VacuumStmt *vacstmt, bool do_toast,
+static bool vacuum_rel(Oid relid, VacuumStmt *vacstmt, bool do_toast,
 		   bool for_wraparound, bool *scanned_all);
 
 
@@ -161,7 +160,7 @@ vacuum(VacuumStmt *vacstmt, Oid relid, bool do_toast,
 	 * Build list of relations to process, unless caller gave us one. (If we
 	 * build one, we put it in vac_context for safekeeping.)
 	 */
-	relations = get_rel_oids(relid, vacstmt->relation, stmttype);
+	relations = get_rel_oids(relid, vacstmt->relation);
 
 	/*
 	 * Decide whether we need to start/commit our own transactions.
@@ -227,8 +226,11 @@ vacuum(VacuumStmt *vacstmt, Oid relid, bool do_toast,
 			bool		scanned_all = false;
 
 			if (vacstmt->options & VACOPT_VACUUM)
-				vacuum_rel(relid, vacstmt, do_toast, for_wraparound,
-						   &scanned_all);
+			{
+				if (!vacuum_rel(relid, vacstmt, do_toast, for_wraparound,
+								&scanned_all))
+					continue;
+			}
 
 			if (vacstmt->options & VACOPT_ANALYZE)
 			{
@@ -303,7 +305,7 @@ vacuum(VacuumStmt *vacstmt, Oid relid, bool do_toast,
  * per-relation transactions.
  */
 static List *
-get_rel_oids(Oid relid, const RangeVar *vacrel, const char *stmttype)
+get_rel_oids(Oid relid, const RangeVar *vacrel)
 {
 	List	   *oid_list = NIL;
 	MemoryContext oldcontext;
@@ -525,21 +527,12 @@ vac_update_relstats(Relation relation,
 
 	/*
 	 * If we have discovered that there are no indexes, then there's no
-	 * primary key either, nor any exclusion constraints.  This could be done
-	 * more thoroughly...
+	 * primary key either.  This could be done more thoroughly...
 	 */
-	if (!hasindex)
+	if (pgcform->relhaspkey && !hasindex)
 	{
-		if (pgcform->relhaspkey)
-		{
-			pgcform->relhaspkey = false;
-			dirty = true;
-		}
-		if (pgcform->relhasexclusion && pgcform->relkind != RELKIND_INDEX)
-		{
-			pgcform->relhasexclusion = false;
-			dirty = true;
-		}
+		pgcform->relhaspkey = false;
+		dirty = true;
 	}
 
 	/* We also clear relhasrules and relhastriggers if needed */
@@ -774,7 +767,7 @@ vac_truncate_clog(TransactionId frozenXID)
  *
  *		At entry and exit, we are not inside a transaction.
  */
-static void
+static bool
 vacuum_rel(Oid relid, VacuumStmt *vacstmt, bool do_toast, bool for_wraparound,
 		   bool *scanned_all)
 {
@@ -845,14 +838,29 @@ vacuum_rel(Oid relid, VacuumStmt *vacstmt, bool do_toast, bool for_wraparound,
 	 *
 	 * There's a race condition here: the rel may have gone away since the
 	 * last time we saw it.  If so, we don't need to vacuum it.
+	 *
+	 * If we've been asked not to wait for the relation lock, acquire it
+	 * first in non-blocking mode, before calling try_relation_open().
 	 */
-	onerel = try_relation_open(relid, lmode);
+	if (!(vacstmt->options & VACOPT_NOWAIT))
+		onerel = try_relation_open(relid, lmode);
+	else if (ConditionalLockRelationOid(relid, lmode))
+		onerel = try_relation_open(relid, NoLock);
+	else
+	{
+		onerel = NULL;
+		if (IsAutoVacuumWorkerProcess() && Log_autovacuum_min_duration >= 0)
+			ereport(LOG,
+					(errcode(ERRCODE_LOCK_NOT_AVAILABLE),
+					 errmsg("skipping vacuum of \"%s\" --- lock not available",
+						vacstmt->relation->relname)));
+	}
 
 	if (!onerel)
 	{
 		PopActiveSnapshot();
 		CommitTransactionCommand();
-		return;
+		return false;
 	}
 
 	/*
@@ -883,7 +891,7 @@ vacuum_rel(Oid relid, VacuumStmt *vacstmt, bool do_toast, bool for_wraparound,
 		relation_close(onerel, lmode);
 		PopActiveSnapshot();
 		CommitTransactionCommand();
-		return;
+		return false;
 	}
 
 	/*
@@ -895,12 +903,12 @@ vacuum_rel(Oid relid, VacuumStmt *vacstmt, bool do_toast, bool for_wraparound,
 		onerel->rd_rel->relkind != RELKIND_TOASTVALUE)
 	{
 		ereport(WARNING,
-				(errmsg("skipping \"%s\" --- cannot vacuum indexes, views, or special system tables",
+				(errmsg("skipping \"%s\" --- cannot vacuum non-tables or special system tables",
 						RelationGetRelationName(onerel))));
 		relation_close(onerel, lmode);
 		PopActiveSnapshot();
 		CommitTransactionCommand();
-		return;
+		return false;
 	}
 
 	/*
@@ -915,7 +923,7 @@ vacuum_rel(Oid relid, VacuumStmt *vacstmt, bool do_toast, bool for_wraparound,
 		relation_close(onerel, lmode);
 		PopActiveSnapshot();
 		CommitTransactionCommand();
-		return;
+		return false;
 	}
 
 	/*
@@ -999,6 +1007,9 @@ vacuum_rel(Oid relid, VacuumStmt *vacstmt, bool do_toast, bool for_wraparound,
 	 * Now release the session-level lock on the master table.
 	 */
 	UnlockRelationIdForSession(&onerelid, lmode);
+
+	/* Report that we really did it. */
+	return true;
 }
 
 

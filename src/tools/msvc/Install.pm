@@ -312,6 +312,7 @@ sub CopyContribFiles
         next if ($d eq "uuid-ossp"&& !defined($config->{uuid}));
         next if ($d eq "sslinfo" && !defined($config->{openssl}));
         next if ($d eq "xml2" && !defined($config->{xml}));
+        next if ($d eq "sepgsql");
 
         my $mf = read_file("contrib/$d/Makefile");
         $mf =~ s{\\s*[\r\n]+}{}mg;
@@ -397,7 +398,7 @@ sub CopyIncludeFiles
     my $target = shift;
 
     EnsureDirectories($target, 'include', 'include/libpq','include/internal',
-        'include/internal/libpq','include/server');
+        'include/internal/libpq','include/server', 'include/server/parser');
 
     CopyFiles(
         'Public headers',
@@ -431,6 +432,8 @@ sub CopyIncludeFiles
         $target . '/include/server/',
         'src/include/', 'pg_config.h', 'pg_config_os.h'
     );
+    CopyFiles('Grammar header', $target . '/include/server/parser/',
+	      'src/backend/parser/', 'gram.h');
     CopySetOfFiles('',[ glob("src\\include\\*.h") ],$target . '/include/server/');
     my $D;
     opendir($D, 'src/include') || croak "Could not opendir on src/include!\n";

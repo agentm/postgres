@@ -32,7 +32,7 @@
  *	  clients.
  *
  *
- * Portions Copyright (c) 1996-2010, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2011, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -350,14 +350,13 @@ static int	ProcessStartupPacket(Port *port, bool SSLdone);
 static void processCancelRequest(Port *port, void *pkt);
 static int	initMasks(fd_set *rmask);
 static void report_fork_failure_to_client(Port *port, int errnum);
-static enum CAC_state canAcceptConnections(void);
+static CAC_state canAcceptConnections(void);
 static long PostmasterRandom(void);
 static void RandomSalt(char *md5Salt);
 static void signal_child(pid_t pid, int signal);
 static bool SignalSomeChildren(int signal, int targets);
 
 #define SignalChildren(sig)			   SignalSomeChildren(sig, BACKEND_TYPE_ALL)
-#define SignalAutovacWorkers(sig)  SignalSomeChildren(sig, BACKEND_TYPE_AUTOVAC)
 
 /*
  * Possible types of a backend. These are OR-able request flag bits
@@ -483,6 +482,7 @@ PostmasterMain(int argc, char *argv[])
 	int			opt;
 	int			status;
 	char	   *userDoption = NULL;
+	bool		listen_addr_saved = false;
 	int			i;
 
 	MyProcPid = PostmasterPid = getpid();
@@ -494,7 +494,7 @@ PostmasterMain(int argc, char *argv[])
 	/*
 	 * for security, no dir or file created can be group or other accessible
 	 */
-	umask((mode_t) 0077);
+	umask(S_IRWXG | S_IRWXO);
 
 	/*
 	 * Fire up essential subsystems: memory management
@@ -865,8 +865,17 @@ PostmasterMain(int argc, char *argv[])
 										  (unsigned short) PostPortNumber,
 										  UnixSocketDir,
 										  ListenSocket, MAXLISTEN);
+
 			if (status == STATUS_OK)
+			{
 				success++;
+				/* record the first successful host addr in lockfile */
+				if (!listen_addr_saved)
+				{
+					AddToDataDirLockFile(LOCK_FILE_LINE_LISTEN_ADDR, curhost);
+					listen_addr_saved = true;
+				}
+			}
 			else
 				ereport(WARNING,
 						(errmsg("could not create listen socket for \"%s\"",
@@ -935,6 +944,14 @@ PostmasterMain(int argc, char *argv[])
 	if (ListenSocket[0] == PGINVALID_SOCKET)
 		ereport(FATAL,
 				(errmsg("no socket created for listening")));
+
+	/*
+	 * If no valid TCP ports, write an empty line for listen address,
+	 * indicating the Unix socket must be used.  Note that this line is not
+	 * added to the lock file until there is a socket backing it.
+	 */
+	if (!listen_addr_saved)
+		AddToDataDirLockFile(LOCK_FILE_LINE_LISTEN_ADDR, "");
 
 	/*
 	 * Set up shared memory and semaphores.
@@ -1274,7 +1291,7 @@ pmdaemonize(void)
 					 progname, DEVNULL, strerror(errno));
 		ExitPostmaster(1);
 	}
-	pmlog = open(pmlogname, O_CREAT | O_WRONLY | O_APPEND, 0600);
+	pmlog = open(pmlogname, O_CREAT | O_WRONLY | O_APPEND, S_IRUSR | S_IWUSR);
 	if (pmlog < 0)
 	{
 		write_stderr("%s: could not open log file \"%s/%s\": %s\n",
@@ -1908,9 +1925,11 @@ processCancelRequest(Port *port, void *pkt)
 /*
  * canAcceptConnections --- check to see if database state allows connections.
  */
-static enum CAC_state
+static CAC_state
 canAcceptConnections(void)
 {
+	CAC_state	result = CAC_OK;
+
 	/*
 	 * Can't start backends when in startup/shutdown/inconsistent recovery
 	 * state.
@@ -1918,21 +1937,24 @@ canAcceptConnections(void)
 	 * In state PM_WAIT_BACKUP only superusers can connect (this must be
 	 * allowed so that a superuser can end online backup mode); we return
 	 * CAC_WAITBACKUP code to indicate that this must be checked later.
+	 * Note that neither CAC_OK nor CAC_WAITBACKUP can safely be returned
+	 * until we have checked for too many children.
 	 */
 	if (pmState != PM_RUN)
 	{
 		if (pmState == PM_WAIT_BACKUP)
-			return CAC_WAITBACKUP;		/* allow superusers only */
-		if (Shutdown > NoShutdown)
+			result = CAC_WAITBACKUP;	/* allow superusers only */
+		else if (Shutdown > NoShutdown)
 			return CAC_SHUTDOWN;	/* shutdown is pending */
-		if (!FatalError &&
-			(pmState == PM_STARTUP ||
-			 pmState == PM_RECOVERY))
-			return CAC_STARTUP; /* normal startup */
-		if (!FatalError &&
-			pmState == PM_HOT_STANDBY)
-			return CAC_OK;		/* connection OK during hot standby */
-		return CAC_RECOVERY;	/* else must be crash recovery */
+		else if (!FatalError &&
+				 (pmState == PM_STARTUP ||
+				  pmState == PM_RECOVERY))
+			return CAC_STARTUP;		/* normal startup */
+		else if (!FatalError &&
+				 pmState == PM_HOT_STANDBY)
+			result = CAC_OK;		/* connection OK during hot standby */
+		else
+			return CAC_RECOVERY;	/* else must be crash recovery */
 	}
 
 	/*
@@ -1948,14 +1970,16 @@ canAcceptConnections(void)
 	 * see comments for MaxLivePostmasterChildren().
 	 */
 	if (CountChildren(BACKEND_TYPE_ALL) >= MaxLivePostmasterChildren())
-		return CAC_TOOMANY;
+		result = CAC_TOOMANY;
 
-	return CAC_OK;
+	return result;
 }
 
 
 /*
  * ConnCreate -- create a local connection data structure
+ *
+ * Returns NULL on failure, other than out-of-memory which is fatal.
  */
 static Port *
 ConnCreate(int serverFd)
@@ -1975,19 +1999,17 @@ ConnCreate(int serverFd)
 		if (port->sock >= 0)
 			StreamClose(port->sock);
 		ConnFree(port);
-		port = NULL;
+		return NULL;
 	}
-	else
-	{
-		/*
-		 * Precompute password salt values to use for this connection. It's
-		 * slightly annoying to do this long in advance of knowing whether
-		 * we'll need 'em or not, but we must do the random() calls before we
-		 * fork, not after.  Else the postmaster's random sequence won't get
-		 * advanced, and all backends would end up using the same salt...
-		 */
-		RandomSalt(port->md5Salt);
-	}
+
+	/*
+	 * Precompute password salt values to use for this connection. It's
+	 * slightly annoying to do this long in advance of knowing whether
+	 * we'll need 'em or not, but we must do the random() calls before we
+	 * fork, not after.  Else the postmaster's random sequence won't get
+	 * advanced, and all backends would end up using the same salt...
+	 */
+	RandomSalt(port->md5Salt);
 
 	/*
 	 * Allocate GSSAPI specific state struct
@@ -2174,7 +2196,7 @@ pmdie(SIGNAL_ARGS)
 				pmState == PM_HOT_STANDBY || pmState == PM_STARTUP)
 			{
 				/* autovacuum workers are told to shut down immediately */
-				SignalAutovacWorkers(SIGTERM);
+				SignalSomeChildren(SIGTERM, BACKEND_TYPE_AUTOVAC);
 				/* and the autovac launcher too */
 				if (AutoVacPID != 0)
 					signal_child(AutoVacPID, SIGTERM);
@@ -2968,7 +2990,7 @@ PostmasterStateMachine(void)
 					pmState = PM_WAIT_DEAD_END;
 
 					/* Kill the walsenders, archiver and stats collector too */
-					SignalSomeChildren(SIGQUIT, BACKEND_TYPE_ALL);
+					SignalChildren(SIGQUIT);
 					if (PgArchPID != 0)
 						signal_child(PgArchPID, SIGQUIT);
 					if (PgStatPID != 0)
@@ -3145,13 +3167,25 @@ SignalSomeChildren(int signal, int target)
 
 		if (bp->dead_end)
 			continue;
-		if (!(target & BACKEND_TYPE_NORMAL) && !bp->is_autovacuum)
-			continue;
-		if (!(target & BACKEND_TYPE_AUTOVAC) && bp->is_autovacuum)
-			continue;
-		if (!(target & BACKEND_TYPE_WALSND) &&
-			IsPostmasterChildWalSender(bp->child_slot))
-			continue;
+
+		/*
+		 * Since target == BACKEND_TYPE_ALL is the most common case,
+		 * we test it first and avoid touching shared memory for
+		 * every child.
+		 */
+		if (target != BACKEND_TYPE_ALL)
+		{
+			int			child;
+
+			if (bp->is_autovacuum)
+				child = BACKEND_TYPE_AUTOVAC;
+			else if (IsPostmasterChildWalSender(bp->child_slot))
+				child = BACKEND_TYPE_WALSND;
+			else
+				child = BACKEND_TYPE_NORMAL;
+			if (!(target & child))
+				continue;
+		}
 
 		ereport(DEBUG4,
 				(errmsg_internal("sending signal %d to process %d",
@@ -3750,7 +3784,11 @@ internal_forkexec(int argc, char *argv[], Port *port)
 	}
 
 	/* Insert temp file name after --fork argument */
+#ifdef _WIN64
+	sprintf(paramHandleStr, "%llu", (LONG_PTR) paramHandle);
+#else
 	sprintf(paramHandleStr, "%lu", (DWORD) paramHandle);
+#endif
 	argv[2] = paramHandleStr;
 
 	/* Format the cmd line */
@@ -4354,13 +4392,25 @@ CountChildren(int target)
 
 		if (bp->dead_end)
 			continue;
-		if (!(target & BACKEND_TYPE_NORMAL) && !bp->is_autovacuum)
-			continue;
-		if (!(target & BACKEND_TYPE_AUTOVAC) && bp->is_autovacuum)
-			continue;
-		if (!(target & BACKEND_TYPE_WALSND) &&
-			IsPostmasterChildWalSender(bp->child_slot))
-			continue;
+
+		/*
+		 * Since target == BACKEND_TYPE_ALL is the most common case,
+		 * we test it first and avoid touching shared memory for
+		 * every child.
+		 */
+		if (target != BACKEND_TYPE_ALL)
+		{
+			int			child;
+
+			if (bp->is_autovacuum)
+				child = BACKEND_TYPE_AUTOVAC;
+			else if (IsPostmasterChildWalSender(bp->child_slot))
+				child = BACKEND_TYPE_WALSND;
+			else
+				child = BACKEND_TYPE_NORMAL;
+			if (!(target & child))
+				continue;
+		}
 
 		cnt++;
 	}
@@ -4820,7 +4870,11 @@ read_backend_variables(char *id, Port *port)
 	HANDLE		paramHandle;
 	BackendParameters *paramp;
 
+#ifdef _WIN64
+	paramHandle = (HANDLE) _atoi64(id);
+#else
 	paramHandle = (HANDLE) atol(id);
+#endif
 	paramp = MapViewOfFile(paramHandle, FILE_MAP_READ, 0, 0, 0);
 	if (!paramp)
 	{

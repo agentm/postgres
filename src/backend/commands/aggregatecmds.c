@@ -4,7 +4,7 @@
  *
  *	  Routines for aggregate-manipulation commands
  *
- * Portions Copyright (c) 1996-2010, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2011, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -142,7 +142,7 @@ DefineAggregate(List *name, List *args, bool oldstyle, List *parameters)
 		{
 			numArgs = 1;
 			aggArgTypes = (Oid *) palloc(sizeof(Oid));
-			aggArgTypes[0] = typenameTypeId(NULL, baseType, NULL);
+			aggArgTypes[0] = typenameTypeId(NULL, baseType);
 		}
 	}
 	else
@@ -164,7 +164,7 @@ DefineAggregate(List *name, List *args, bool oldstyle, List *parameters)
 		{
 			TypeName   *curTypeName = (TypeName *) lfirst(lc);
 
-			aggArgTypes[i++] = typenameTypeId(NULL, curTypeName, NULL);
+			aggArgTypes[i++] = typenameTypeId(NULL, curTypeName);
 		}
 	}
 
@@ -179,7 +179,7 @@ DefineAggregate(List *name, List *args, bool oldstyle, List *parameters)
 	 * worse) by connecting up incompatible internal-using functions in an
 	 * aggregate.
 	 */
-	transTypeId = typenameTypeId(NULL, transType, NULL);
+	transTypeId = typenameTypeId(NULL, transType);
 	if (get_typtype(transTypeId) == TYPTYPE_PSEUDO &&
 		!IsPolymorphicType(transTypeId))
 	{

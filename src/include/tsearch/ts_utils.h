@@ -3,7 +3,7 @@
  * ts_utils.h
  *	  helper utilities for tsearch
  *
- * Copyright (c) 1998-2010, PostgreSQL Global Development Group
+ * Copyright (c) 1998-2011, PostgreSQL Global Development Group
  *
  * src/include/tsearch/ts_utils.h
  *
@@ -104,9 +104,9 @@ extern text *generateHeadline(HeadlineParsedText *prs);
 /*
  * Common check function for tsvector @@ tsquery
  */
-
 extern bool TS_execute(QueryItem *curitem, void *checkval, bool calcnot,
 		   bool (*chkcond) (void *checkval, QueryOperand *val));
+extern bool tsquery_requires_match(QueryItem *curitem);
 
 /*
  * to_ts* - text transformation to tsvector, tsquery

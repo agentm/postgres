@@ -3,7 +3,7 @@
  * walreceiver.h
  *	  Exports from replication/walreceiverfuncs.c.
  *
- * Portions Copyright (c) 2010-2010, PostgreSQL Global Development Group
+ * Portions Copyright (c) 2010-2011, PostgreSQL Global Development Group
  *
  * src/include/replication/walreceiver.h
  *
@@ -17,6 +17,7 @@
 #include "pgtime.h"
 
 extern bool am_walreceiver;
+extern int wal_receiver_status_interval;
 
 /*
  * MAXCONNINFO: maximum size of a connection string.
@@ -83,6 +84,9 @@ extern PGDLLIMPORT walrcv_connect_type walrcv_connect;
 typedef bool (*walrcv_receive_type) (int timeout, unsigned char *type,
 												 char **buffer, int *len);
 extern PGDLLIMPORT walrcv_receive_type walrcv_receive;
+
+typedef void (*walrcv_send_type) (const char *buffer, int nbytes);
+extern PGDLLIMPORT walrcv_send_type walrcv_send;
 
 typedef void (*walrcv_disconnect_type) (void);
 extern PGDLLIMPORT walrcv_disconnect_type walrcv_disconnect;

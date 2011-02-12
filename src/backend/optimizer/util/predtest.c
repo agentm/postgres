@@ -4,7 +4,7 @@
  *	  Routines to attempt to prove logical implications between predicate
  *	  expressions.
  *
- * Portions Copyright (c) 1996-2010, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2011, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -912,6 +912,7 @@ arrayconst_startup_fn(Node *clause, PredIterInfo info)
 	state->constexpr.xpr.type = T_Const;
 	state->constexpr.consttype = ARR_ELEMTYPE(arrayval);
 	state->constexpr.consttypmod = -1;
+	state->constexpr.constcollid = arrayconst->constcollid;
 	state->constexpr.constlen = elmlen;
 	state->constexpr.constbyval = elmbyval;
 	lsecond(state->opexpr.args) = &state->constexpr;
@@ -1661,8 +1662,9 @@ get_btree_test_op(Oid pred_op, Oid clause_op, bool refute_it)
 		 * From the same opfamily, find a strategy number for the clause_op,
 		 * if possible
 		 */
-		clause_tuple = SearchSysCache2(AMOPOPID,
+		clause_tuple = SearchSysCache3(AMOPOPID,
 									   ObjectIdGetDatum(clause_op),
+									   CharGetDatum(AMOP_SEARCH),
 									   ObjectIdGetDatum(opfamily_id));
 		if (HeapTupleIsValid(clause_tuple))
 		{
@@ -1677,8 +1679,9 @@ get_btree_test_op(Oid pred_op, Oid clause_op, bool refute_it)
 		}
 		else if (OidIsValid(clause_op_negator))
 		{
-			clause_tuple = SearchSysCache2(AMOPOPID,
-										 ObjectIdGetDatum(clause_op_negator),
+			clause_tuple = SearchSysCache3(AMOPOPID,
+										   ObjectIdGetDatum(clause_op_negator),
+										   CharGetDatum(AMOP_SEARCH),
 										   ObjectIdGetDatum(opfamily_id));
 			if (HeapTupleIsValid(clause_tuple))
 			{

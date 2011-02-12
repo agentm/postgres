@@ -3,7 +3,7 @@
  * readfuncs.c
  *	  Reader functions for Postgres tree nodes.
  *
- * Portions Copyright (c) 1996-2010, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2011, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -264,6 +264,7 @@ _readSortGroupClause(void)
 	READ_OID_FIELD(eqop);
 	READ_OID_FIELD(sortop);
 	READ_BOOL_FIELD(nulls_first);
+	READ_BOOL_FIELD(hashable);
 
 	READ_DONE();
 }
@@ -322,6 +323,7 @@ _readCommonTableExpr(void)
 	READ_NODE_FIELD(ctecolnames);
 	READ_NODE_FIELD(ctecoltypes);
 	READ_NODE_FIELD(ctecoltypmods);
+	READ_NODE_FIELD(ctecolcollations);
 
 	READ_DONE();
 }
@@ -340,6 +342,7 @@ _readSetOperationStmt(void)
 	READ_NODE_FIELD(rarg);
 	READ_NODE_FIELD(colTypes);
 	READ_NODE_FIELD(colTypmods);
+	READ_NODE_FIELD(colCollations);
 	READ_NODE_FIELD(groupClauses);
 
 	READ_DONE();
@@ -372,7 +375,7 @@ _readRangeVar(void)
 	READ_STRING_FIELD(schemaname);
 	READ_STRING_FIELD(relname);
 	READ_ENUM_FIELD(inhOpt, InhOption);
-	READ_BOOL_FIELD(istemp);
+	READ_CHAR_FIELD(relpersistence);
 	READ_NODE_FIELD(alias);
 	READ_LOCATION_FIELD(location);
 
@@ -405,6 +408,7 @@ _readVar(void)
 	READ_INT_FIELD(varattno);
 	READ_OID_FIELD(vartype);
 	READ_INT_FIELD(vartypmod);
+	READ_OID_FIELD(varcollid);
 	READ_UINT_FIELD(varlevelsup);
 	READ_UINT_FIELD(varnoold);
 	READ_INT_FIELD(varoattno);
@@ -423,6 +427,7 @@ _readConst(void)
 
 	READ_OID_FIELD(consttype);
 	READ_INT_FIELD(consttypmod);
+	READ_OID_FIELD(constcollid);
 	READ_INT_FIELD(constlen);
 	READ_BOOL_FIELD(constbyval);
 	READ_BOOL_FIELD(constisnull);
@@ -449,6 +454,7 @@ _readParam(void)
 	READ_INT_FIELD(paramid);
 	READ_OID_FIELD(paramtype);
 	READ_INT_FIELD(paramtypmod);
+	READ_OID_FIELD(paramcollation);
 	READ_LOCATION_FIELD(location);
 
 	READ_DONE();
@@ -469,6 +475,7 @@ _readAggref(void)
 	READ_NODE_FIELD(aggdistinct);
 	READ_BOOL_FIELD(aggstar);
 	READ_UINT_FIELD(agglevelsup);
+	READ_OID_FIELD(collid);
 	READ_LOCATION_FIELD(location);
 
 	READ_DONE();
@@ -488,6 +495,7 @@ _readWindowFunc(void)
 	READ_UINT_FIELD(winref);
 	READ_BOOL_FIELD(winstar);
 	READ_BOOL_FIELD(winagg);
+	READ_OID_FIELD(collid);
 	READ_LOCATION_FIELD(location);
 
 	READ_DONE();
@@ -504,6 +512,7 @@ _readArrayRef(void)
 	READ_OID_FIELD(refarraytype);
 	READ_OID_FIELD(refelemtype);
 	READ_INT_FIELD(reftypmod);
+	READ_INT_FIELD(refcollid);
 	READ_NODE_FIELD(refupperindexpr);
 	READ_NODE_FIELD(reflowerindexpr);
 	READ_NODE_FIELD(refexpr);
@@ -525,6 +534,7 @@ _readFuncExpr(void)
 	READ_BOOL_FIELD(funcretset);
 	READ_ENUM_FIELD(funcformat, CoercionForm);
 	READ_NODE_FIELD(args);
+	READ_OID_FIELD(collid);
 	READ_LOCATION_FIELD(location);
 
 	READ_DONE();
@@ -570,6 +580,7 @@ _readOpExpr(void)
 	READ_OID_FIELD(opresulttype);
 	READ_BOOL_FIELD(opretset);
 	READ_NODE_FIELD(args);
+	READ_OID_FIELD(collid);
 	READ_LOCATION_FIELD(location);
 
 	READ_DONE();
@@ -599,6 +610,7 @@ _readDistinctExpr(void)
 	READ_OID_FIELD(opresulttype);
 	READ_BOOL_FIELD(opretset);
 	READ_NODE_FIELD(args);
+	READ_OID_FIELD(collid);
 	READ_LOCATION_FIELD(location);
 
 	READ_DONE();
@@ -627,6 +639,7 @@ _readScalarArrayOpExpr(void)
 
 	READ_BOOL_FIELD(useOr);
 	READ_NODE_FIELD(args);
+	READ_OID_FIELD(collid);
 	READ_LOCATION_FIELD(location);
 
 	READ_DONE();
@@ -691,6 +704,7 @@ _readFieldSelect(void)
 	READ_INT_FIELD(fieldnum);
 	READ_OID_FIELD(resulttype);
 	READ_INT_FIELD(resulttypmod);
+	READ_OID_FIELD(resultcollation);
 
 	READ_DONE();
 }
@@ -723,6 +737,22 @@ _readRelabelType(void)
 	READ_OID_FIELD(resulttype);
 	READ_INT_FIELD(resulttypmod);
 	READ_ENUM_FIELD(relabelformat, CoercionForm);
+	READ_LOCATION_FIELD(location);
+
+	READ_DONE();
+}
+
+/*
+ * _readCollateClause
+ */
+static CollateClause *
+_readCollateClause(void)
+{
+	READ_LOCALS(CollateClause);
+
+	READ_NODE_FIELD(arg);
+	READ_NODE_FIELD(collnames);
+	READ_OID_FIELD(collOid);
 	READ_LOCATION_FIELD(location);
 
 	READ_DONE();
@@ -788,6 +818,7 @@ _readCaseExpr(void)
 	READ_LOCALS(CaseExpr);
 
 	READ_OID_FIELD(casetype);
+	READ_OID_FIELD(casecollation);
 	READ_NODE_FIELD(arg);
 	READ_NODE_FIELD(args);
 	READ_NODE_FIELD(defresult);
@@ -821,6 +852,7 @@ _readCaseTestExpr(void)
 
 	READ_OID_FIELD(typeId);
 	READ_INT_FIELD(typeMod);
+	READ_OID_FIELD(collation);
 
 	READ_DONE();
 }
@@ -870,6 +902,7 @@ _readRowCompareExpr(void)
 	READ_ENUM_FIELD(rctype, RowCompareType);
 	READ_NODE_FIELD(opnos);
 	READ_NODE_FIELD(opfamilies);
+	READ_NODE_FIELD(collids);
 	READ_NODE_FIELD(largs);
 	READ_NODE_FIELD(rargs);
 
@@ -885,6 +918,7 @@ _readCoalesceExpr(void)
 	READ_LOCALS(CoalesceExpr);
 
 	READ_OID_FIELD(coalescetype);
+	READ_OID_FIELD(coalescecollation);
 	READ_NODE_FIELD(args);
 	READ_LOCATION_FIELD(location);
 
@@ -902,6 +936,7 @@ _readMinMaxExpr(void)
 	READ_OID_FIELD(minmaxtype);
 	READ_ENUM_FIELD(op, MinMaxOp);
 	READ_NODE_FIELD(args);
+	READ_OID_FIELD(collid);
 	READ_LOCATION_FIELD(location);
 
 	READ_DONE();
@@ -1028,6 +1063,7 @@ _readSetToDefault(void)
 
 	READ_OID_FIELD(typeId);
 	READ_INT_FIELD(typeMod);
+	READ_OID_FIELD(collid);
 	READ_LOCATION_FIELD(location);
 
 	READ_DONE();
@@ -1149,6 +1185,7 @@ _readRangeTblEntry(void)
 			READ_NODE_FIELD(funcexpr);
 			READ_NODE_FIELD(funccoltypes);
 			READ_NODE_FIELD(funccoltypmods);
+			READ_NODE_FIELD(funccolcollations);
 			break;
 		case RTE_VALUES:
 			READ_NODE_FIELD(values_lists);
@@ -1159,6 +1196,7 @@ _readRangeTblEntry(void)
 			READ_BOOL_FIELD(self_reference);
 			READ_NODE_FIELD(ctecoltypes);
 			READ_NODE_FIELD(ctecoltypmods);
+			READ_NODE_FIELD(ctecolcollations);
 			break;
 		default:
 			elog(ERROR, "unrecognized RTE kind: %d",
@@ -1195,7 +1233,7 @@ parseNodeString(void)
 	token = pg_strtok(&length);
 
 #define MATCH(tokname, namelen) \
-	(length == namelen && strncmp(token, tokname, namelen) == 0)
+	(length == namelen && memcmp(token, tokname, namelen) == 0)
 
 	if (MATCH("QUERY", 5))
 		return_value = _readQuery();
@@ -1247,6 +1285,8 @@ parseNodeString(void)
 		return_value = _readFieldStore();
 	else if (MATCH("RELABELTYPE", 11))
 		return_value = _readRelabelType();
+	else if (MATCH("COLLATE", 7))
+		return_value = _readCollateClause();
 	else if (MATCH("COERCEVIAIO", 11))
 		return_value = _readCoerceViaIO();
 	else if (MATCH("ARRAYCOERCEEXPR", 15))

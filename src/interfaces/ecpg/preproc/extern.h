@@ -14,21 +14,21 @@
 /* defines */
 
 #define STRUCT_DEPTH 128
-#define EMPTY make_str("")
+#define EMPTY mm_strdup("")
 
 /* variables */
 
-extern int	braces_open,
-			autocommit,
+extern bool		autocommit,
 			auto_create_c,
 			system_includes,
 			force_indicator,
 			questionmarks,
-			ret_value,
-			struct_level,
-			ecpg_internal_var,
 			regression_mode,
 			auto_prepare;
+extern int		braces_open,
+			ret_value,
+			struct_level,
+			ecpg_internal_var;
 extern char *current_function;
 extern char *descriptor_index;
 extern char *descriptor_name;
@@ -62,7 +62,6 @@ extern struct ECPGstruct_member *struct_member_list[STRUCT_DEPTH];
 
 extern const char *get_dtype(enum ECPGdtype);
 extern void lex_init(void);
-extern char *make_str(const char *);
 extern void output_line_number(void);
 extern void output_statement(char *, int, enum ECPG_statement_type);
 extern void output_prepare_statement(char *, char *);

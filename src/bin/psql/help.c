@@ -1,7 +1,7 @@
 /*
  * psql - the PostgreSQL interactive terminal
  *
- * Copyright (c) 2000-2010, PostgreSQL Global Development Group
+ * Copyright (c) 2000-2011, PostgreSQL Global Development Group
  *
  * src/bin/psql/help.c
  */
@@ -158,7 +158,7 @@ slashUsage(unsigned short int pager)
 {
 	FILE	   *output;
 
-	output = PageOutput(90, pager);
+	output = PageOutput(92, pager);
 
 	/* if you add/remove a line here, change the row count above */
 
@@ -199,6 +199,7 @@ slashUsage(unsigned short int pager)
 	fprintf(output, _("  \\dd[S]  [PATTERN]      show comments on objects\n"));
 	fprintf(output, _("  \\ddp    [PATTERN]      list default privileges\n"));
 	fprintf(output, _("  \\dD[S]  [PATTERN]      list domains\n"));
+	fprintf(output, _("  \\det[+] [PATTERN]      list foreign tables\n"));
 	fprintf(output, _("  \\des[+] [PATTERN]      list foreign servers\n"));
 	fprintf(output, _("  \\deu[+] [PATTERN]      list user mappings\n"));
 	fprintf(output, _("  \\dew[+] [PATTERN]      list foreign-data wrappers\n"));
@@ -207,18 +208,22 @@ slashUsage(unsigned short int pager)
 	fprintf(output, _("  \\dFd[+] [PATTERN]      list text search dictionaries\n"));
 	fprintf(output, _("  \\dFp[+] [PATTERN]      list text search parsers\n"));
 	fprintf(output, _("  \\dFt[+] [PATTERN]      list text search templates\n"));
-	fprintf(output, _("  \\dg[+]  [PATTERN]      list roles (groups)\n"));
+	fprintf(output, _("  \\dg[+]  [PATTERN]      list roles\n"));
 	fprintf(output, _("  \\di[S+] [PATTERN]      list indexes\n"));
 	fprintf(output, _("  \\dl                    list large objects, same as \\lo_list\n"));
-	fprintf(output, _("  \\dn[+]  [PATTERN]      list schemas\n"));
+	fprintf(output, _("  \\dL[S+] [PATTERN]      list procedural languages\n"));
+	fprintf(output, _("  \\dn[S+] [PATTERN]      list schemas\n"));
 	fprintf(output, _("  \\do[S]  [PATTERN]      list operators\n"));
+	fprintf(output, _("  \\dO[S+] [PATTERN]      list collations\n"));
 	fprintf(output, _("  \\dp     [PATTERN]      list table, view, and sequence access privileges\n"));
 	fprintf(output, _("  \\drds [PATRN1 [PATRN2]] list per-database role settings\n"));
 	fprintf(output, _("  \\ds[S+] [PATTERN]      list sequences\n"));
 	fprintf(output, _("  \\dt[S+] [PATTERN]      list tables\n"));
 	fprintf(output, _("  \\dT[S+] [PATTERN]      list data types\n"));
-	fprintf(output, _("  \\du[+]  [PATTERN]      list roles (users)\n"));
+	fprintf(output, _("  \\du[+]  [PATTERN]      list roles\n"));
 	fprintf(output, _("  \\dv[S+] [PATTERN]      list views\n"));
+	fprintf(output, _("  \\dE[S+] [PATTERN]      list foreign tables\n"));
+	fprintf(output, _("  \\dx[+]  [PATTERN]      list extensions\n"));
 	fprintf(output, _("  \\l[+]                  list all databases\n"));
 	fprintf(output, _("  \\sf[+] FUNCNAME        show a function's definition\n"));
 	fprintf(output, _("  \\z      [PATTERN]      same as \\dp\n"));
@@ -422,24 +427,23 @@ void
 print_copyright(void)
 {
 	puts(
-		 "PostgreSQL Data Base Management System\n\n"
-		 "Portions Copyright (c) 1996-2010, PostgreSQL Global Development Group\n\n"
-		 "This software is based on Postgres95, formerly known as Postgres, which\n"
-		 "contains the following notice:\n\n"
-	"Portions Copyright(c) 1994, Regents of the University of California\n\n"
+		 "PostgreSQL Database Management System\n"
+		 "(formerly known as Postgres, then as Postgres95)\n\n"
+		 "Portions Copyright (c) 1996-2011, PostgreSQL Global Development Group\n\n"
+		 "Portions Copyright (c) 1994, The Regents of the University of California\n\n"
 	"Permission to use, copy, modify, and distribute this software and its\n"
 		 "documentation for any purpose, without fee, and without a written agreement\n"
-		 "is hereby granted, provided that the above copyright notice and this paragraph\n"
-		 "and the following two paragraphs appear in all copies.\n\n"
+	 "is hereby granted, provided that the above copyright notice and this\n"
+	   "paragraph and the following two paragraphs appear in all copies.\n\n"
 		 "IN NO EVENT SHALL THE UNIVERSITY OF CALIFORNIA BE LIABLE TO ANY PARTY FOR\n"
-		 "DIRECT, INDIRECT, SPECIAL, INCIDENTAL, OR CONSEQUENTIAL DAMAGES, INCLUDING LOST\n"
-		 "PROFITS, ARISING OUT OF THE USE OF THIS SOFTWARE AND ITS DOCUMENTATION, EVEN IF\n"
-		 "THE UNIVERSITY OF CALIFORNIA HAS BEEN ADVISED OF THE POSSIBILITY OF SUCH\n"
-		 "DAMAGE.\n\n"
-		 "THE UNIVERSITY OF CALIFORNIA SPECIFICALLY DISCLAIMS ANY WARRANTIES, INCLUDING,\n"
-		 "BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A\n"
-		 "PARTICULAR PURPOSE.THE SOFTWARE PROVIDED HEREUNDER IS ON AN \"AS IS\" BASIS,\n"
-		 "AND THE UNIVERSITY OF CALIFORNIA HAS NO OBLIGATIONS TO PROVIDE MAINTENANCE,\n"
-		 "SUPPORT, UPDATES, ENHANCEMENTS, OR MODIFICATIONS."
+		 "DIRECT, INDIRECT, SPECIAL, INCIDENTAL, OR CONSEQUENTIAL DAMAGES, INCLUDING\n"
+		 "LOST PROFITS, ARISING OUT OF THE USE OF THIS SOFTWARE AND ITS\n"
+		 "DOCUMENTATION, EVEN IF THE UNIVERSITY OF CALIFORNIA HAS BEEN ADVISED OF THE\n"
+		 "POSSIBILITY OF SUCH DAMAGE.\n\n"
+	  "THE UNIVERSITY OF CALIFORNIA SPECIFICALLY DISCLAIMS ANY WARRANTIES,\n"
+		 "INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY\n"
+		 "AND FITNESS FOR A PARTICULAR PURPOSE.  THE SOFTWARE PROVIDED HEREUNDER IS\n"
+		 "ON AN \"AS IS\" BASIS, AND THE UNIVERSITY OF CALIFORNIA HAS NO OBLIGATIONS TO\n"
+	"PROVIDE MAINTENANCE, SUPPORT, UPDATES, ENHANCEMENTS, OR MODIFICATIONS.\n"
 		);
 }

@@ -34,7 +34,7 @@
   </para>
 
  <sect1 id="monitoring-ps">
-  <title>Standard Unix Tools</Title>
+  <title>Standard Unix Tools</title>
 
   <indexterm zone="monitoring-ps">
    <primary>ps</primary>
@@ -106,7 +106,7 @@ postgres: <replaceable>user</> <replaceable>database</> <replaceable>host</> <re
  </sect1>
 
  <sect1 id="monitoring-stats">
-  <title>The Statistics Collector</Title>
+  <title>The Statistics Collector</title>
 
   <indexterm zone="monitoring-stats">
    <primary>statistics</primary>
@@ -129,7 +129,7 @@ postgres: <replaceable>user</> <replaceable>database</> <replaceable>host</> <re
   </para>
 
  <sect2 id="monitoring-stats-setup">
-  <title>Statistics Collection Configuration</Title>
+  <title>Statistics Collection Configuration</title>
 
   <para>
    Since collection of statistics adds some overhead to query execution,
@@ -177,7 +177,7 @@ postgres: <replaceable>user</> <replaceable>database</> <replaceable>host</> <re
  </sect2>
 
  <sect2 id="monitoring-stats-views">
-  <title>Viewing Collected Statistics</Title>
+  <title>Viewing Collected Statistics</title>
 
   <para>
    Several predefined views, listed in <xref
@@ -264,8 +264,10 @@ postgres: <replaceable>user</> <replaceable>database</> <replaceable>host</> <re
       and the number of times the background writer stopped a cleaning scan
       because it had written too many buffers.  Also includes
       statistics about the shared buffer pool, including buffers written
-      by backends (that is, not by the background writer) and total buffers
-      allocated.
+      by backends (that is, not by the background writer), how many times
+      those backends had to execute their own fsync calls (normally the
+      background writer handles those even when the backend does its own
+      write), total buffers allocated, and time of last statistics reset.
      </entry>
      </row>
 
@@ -276,7 +278,33 @@ postgres: <replaceable>user</> <replaceable>database</> <replaceable>host</> <re
       number of transactions committed and rolled back in that database,
       total disk blocks read, total buffer hits (i.e., block
       read requests avoided by finding the block already in buffer cache),
-      number of rows returned, fetched, inserted, updated and deleted.
+      number of rows returned, fetched, inserted, updated and deleted, the
+      total number of queries cancelled due to conflict with recovery (on
+      standby servers), and time of last statistics reset.
+     </entry>
+     </row>
+
+     <row>
+      <entry><structname>pg_stat_database_conflicts</><indexterm><primary>pg_stat_database_conflicts</primary></indexterm></entry>
+      <entry>One row per database, showing database OID, database name and
+      the number of queries that have been cancelled in this database due to
+      dropped tablespaces, lock timeouts, old snapshots, pinned buffers and
+      deadlocks. Will only contain information on standby servers, since
+      conflicts do not occur on master servers.
+     </entry>
+     </row>
+
+     <row>
+      <entry><structname>pg_stat_replication</><indexterm><primary>pg_stat_replication</primary></indexterm></entry>
+      <entry>One row per WAL sender process, showing process <acronym>ID</>,
+      user OID, user name, application name, client's address and port number,
+      time at which the server process began execution, and the current WAL
+      sender state and transaction log location.  In addition, the standby
+      reports the last transaction log position it received and wrote, the last
+      position it flushed to disk, and the last position it replayed, and this
+      information is also displayed here.  The columns detailing what exactly
+      the connection is doing are only visible if the user examining the view
+      is a superuser.
      </entry>
      </row>
 
@@ -594,6 +622,59 @@ postgres: <replaceable>user</> <replaceable>database</> <replaceable>host</> <re
       <entry><type>bigint</type></entry>
       <entry>
        Number of tuples deleted in database
+      </entry>
+     </row>
+
+     <row>
+      <entry><literal><function>pg_stat_get_db_conflict_tablespace</function>(<type>oid</type>)</literal></entry>
+      <entry><type>bigint</type></entry>
+      <entry>
+       Number of queries cancelled because of recovery conflict with dropped tablespaces in database
+      </entry>
+     </row>
+
+     <row>
+      <entry><literal><function>pg_stat_get_db_conflict_lock</function>(<type>oid</type>)</literal></entry>
+      <entry><type>bigint</type></entry>
+      <entry>
+       Number of queries cancelled because of recovery conflict with locks in database
+      </entry>
+     </row>
+
+     <row>
+      <entry><literal><function>pg_stat_get_db_conflict_snapshot</function>(<type>oid</type>)</literal></entry>
+      <entry><type>bigint</type></entry>
+      <entry>
+       Number of queries cancelled because of recovery conflict with old snapshots in database
+      </entry>
+     </row>
+
+     <row>
+      <entry><literal><function>pg_stat_get_db_conflict_bufferpin</function>(<type>oid</type>)</literal></entry>
+      <entry><type>bigint</type></entry>
+      <entry>
+       Number of queries cancelled because of recovery conflict with pinned buffers in database
+      </entry>
+     </row>
+
+     <row>
+      <entry><literal><function>pg_stat_get_db_conflict_startup_deadlock</function>(<type>oid</type>)</literal></entry>
+      <entry><type>bigint</type></entry>
+      <entry>
+       Number of queries cancelled because of recovery conflict with deadlocks in database
+      </entry>
+     </row>
+
+     <row>
+      <entry><literal><function>pg_stat_get_db_stat_reset_time</function>(<type>oid</type>)</literal></entry>
+      <entry><type>timestamptz</type></entry>
+      <entry>
+       Time of the last statistics reset for the database.  Initialized to the
+       system time during the first connection to each database.  The reset time
+       is updated when you call <function>pg_stat_reset</function> on the
+       database, as well as upon execution of
+       <function>pg_stat_reset_single_table_counters</function> against any
+       table or index in it.
       </entry>
      </row>
 
@@ -1058,6 +1139,16 @@ postgres: <replaceable>user</> <replaceable>database</> <replaceable>host</> <re
        Number of times the background writer has stopped its cleaning scan because
        it has written more buffers than specified in the
        <varname>bgwriter_lru_maxpages</varname> parameter
+      </entry>
+     </row>
+
+     <row>
+      <entry><literal><function>pg_stat_get_bgwriter_stat_reset_time()</function></literal></entry>
+      <entry><type>timestamptz</type></entry>
+      <entry>
+        Time of the last statistics reset for the background writer, updated
+        when executing <function>pg_stat_reset_shared('bgwriter')</function>
+        on the database cluster.
       </entry>
      </row>
 

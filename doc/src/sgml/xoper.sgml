@@ -1,7 +1,7 @@
 <!-- doc/src/sgml/xoper.sgml -->
 
  <sect1 id="xoper">
-  <title>User-Defined Operators</title>
+  <title>User-defined Operators</title>
 
   <indexterm zone="xoper">
    <primary>operator</primary>
@@ -52,7 +52,7 @@ CREATE OPERATOR + (
 
   <para>
    Now we could execute a query like this:
-     
+
 <screen>
 SELECT (a + b) AS c FROM test_complex;
 

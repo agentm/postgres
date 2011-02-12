@@ -2,7 +2,7 @@
  * SQL Information Schema
  * as defined in ISO/IEC 9075-11:2008
  *
- * Copyright (c) 2003-2010, PostgreSQL Global Development Group
+ * Copyright (c) 2003-2011, PostgreSQL Global Development Group
  *
  * src/backend/catalog/information_schema.sql
  */
@@ -354,7 +354,23 @@ GRANT SELECT ON attributes TO PUBLIC;
  * CHARACTER_SETS view
  */
 
--- feature not supported
+CREATE VIEW character_sets AS
+    SELECT CAST(null AS sql_identifier) AS character_set_catalog,
+           CAST(null AS sql_identifier) AS character_set_schema,
+           CAST(getdatabaseencoding() AS sql_identifier) AS character_set_name,
+           CAST(CASE WHEN getdatabaseencoding() = 'UTF8' THEN 'UCS' ELSE getdatabaseencoding() END AS sql_identifier) AS character_repertoire,
+           CAST(getdatabaseencoding() AS sql_identifier) AS form_of_use,
+           CAST(current_database() AS sql_identifier) AS default_collate_catalog,
+           CAST(nc.nspname AS sql_identifier) AS default_collate_schema,
+           CAST(c.collname AS sql_identifier) AS default_collate_name
+    FROM pg_database d
+         LEFT JOIN (pg_collation c JOIN pg_namespace nc ON (c.collnamespace = nc.oid))
+             ON (datcollate = collcollate AND datctype = collctype)
+    WHERE d.datname = current_database()
+    ORDER BY char_length(c.collname) DESC, c.collname ASC -- prefer full/canonical name
+    LIMIT 1;
+
+GRANT SELECT ON character_sets TO PUBLIC;
 
 
 /*
@@ -425,14 +441,35 @@ GRANT SELECT ON check_constraints TO PUBLIC;
  * COLLATIONS view
  */
 
--- feature not supported
+CREATE VIEW collations AS
+    SELECT CAST(current_database() AS sql_identifier) AS collation_catalog,
+           CAST(nc.nspname AS sql_identifier) AS collation_schema,
+           CAST(c.collname AS sql_identifier) AS collation_name,
+           CAST('NO PAD' AS character_data) AS pad_attribute
+    FROM pg_collation c, pg_namespace nc
+    WHERE c.collnamespace = nc.oid
+          AND collencoding = (SELECT encoding FROM pg_catalog.pg_database WHERE datname = pg_catalog.current_database());
+
+GRANT SELECT ON collations TO PUBLIC;
+
 
 /*
  * 5.16
  * COLLATION_CHARACTER_SET_APPLICABILITY view
  */
 
--- feature not supported
+CREATE VIEW collation_character_set_applicability AS
+    SELECT CAST(current_database() AS sql_identifier) AS collation_catalog,
+           CAST(nc.nspname AS sql_identifier) AS collation_schema,
+           CAST(c.collname AS sql_identifier) AS collation_name,
+           CAST(null AS sql_identifier) AS character_set_catalog,
+           CAST(null AS sql_identifier) AS character_set_schema,
+           CAST(getdatabaseencoding() AS sql_identifier) AS character_set_name
+    FROM pg_collation c, pg_namespace nc
+    WHERE c.collnamespace = nc.oid
+          AND collencoding = (SELECT encoding FROM pg_catalog.pg_database WHERE datname = pg_catalog.current_database());
+
+GRANT SELECT ON collation_character_set_applicability TO PUBLIC;
 
 
 /*
@@ -465,7 +502,7 @@ CREATE VIEW column_domain_usage AS
           AND a.attrelid = c.oid
           AND a.atttypid = t.oid
           AND t.typtype = 'd'
-          AND c.relkind IN ('r', 'v')
+          AND c.relkind IN ('r', 'v', 'f')
           AND a.attnum > 0
           AND NOT a.attisdropped
           AND pg_has_role(t.typowner, 'USAGE');
@@ -504,7 +541,7 @@ CREATE VIEW column_privileges AS
                   pr_c.relowner
            FROM (SELECT oid, relname, relnamespace, relowner, (aclexplode(relacl)).*
                  FROM pg_class
-                 WHERE relkind IN ('r', 'v')
+                 WHERE relkind IN ('r', 'v', 'f')
                 ) pr_c (oid, relname, relnamespace, relowner, grantor, grantee, prtype, grantable),
                 pg_attribute a
            WHERE a.attrelid = pr_c.oid
@@ -526,7 +563,7 @@ CREATE VIEW column_privileges AS
                 ) pr_a (attrelid, attname, grantor, grantee, prtype, grantable),
                 pg_class c
            WHERE pr_a.attrelid = c.oid
-                 AND relkind IN ('r','v')
+                 AND relkind IN ('r', 'v', 'f')
          ) x,
          pg_namespace nc,
          pg_authid u_grantor,
@@ -569,7 +606,7 @@ CREATE VIEW column_udt_usage AS
     WHERE a.attrelid = c.oid
           AND a.atttypid = t.oid
           AND nc.oid = c.relnamespace
-          AND a.attnum > 0 AND NOT a.attisdropped AND c.relkind in ('r', 'v')
+          AND a.attnum > 0 AND NOT a.attisdropped AND c.relkind in ('r', 'v', 'f')
           AND pg_has_role(coalesce(bt.typowner, t.typowner), 'USAGE');
 
 GRANT SELECT ON column_udt_usage TO PUBLIC;
@@ -692,7 +729,7 @@ CREATE VIEW columns AS
           AND nc.oid = c.relnamespace
           AND (NOT pg_is_other_temp_schema(nc.oid))
 
-          AND a.attnum > 0 AND NOT a.attisdropped AND c.relkind in ('r', 'v')
+          AND a.attnum > 0 AND NOT a.attisdropped AND c.relkind in ('r', 'v', 'f')
 
           AND (pg_has_role(c.relowner, 'USAGE')
                OR has_column_privilege(c.oid, a.attnum,
@@ -1269,7 +1306,7 @@ GRANT SELECT ON role_routine_grants TO PUBLIC;
 -- not tracked by PostgreSQL
 
 
-/* 
+/*
  * 5.47
  * ROUTINE_SEQUENCE_USAGE view
  */
@@ -1385,7 +1422,7 @@ CREATE VIEW routines AS
            CAST(null AS sql_identifier) AS result_cast_scope_schema,
            CAST(null AS sql_identifier) AS result_cast_scope_name,
            CAST(null AS cardinal_number) AS result_cast_maximum_cardinality,
-           CAST(null AS sql_identifier) AS result_cast_dtd_identifier           
+           CAST(null AS sql_identifier) AS result_cast_dtd_identifier
 
     FROM pg_namespace n, pg_proc p, pg_language l,
          pg_type t, pg_namespace nt
@@ -1430,16 +1467,18 @@ CREATE VIEW sequences AS
            CAST(64 AS cardinal_number) AS numeric_precision,
            CAST(2 AS cardinal_number) AS numeric_precision_radix,
            CAST(0 AS cardinal_number) AS numeric_scale,
-           CAST(null AS cardinal_number) AS maximum_value, -- FIXME
-           CAST(null AS cardinal_number) AS minimum_value, -- FIXME
-           CAST(null AS cardinal_number) AS increment,     -- FIXME
-           CAST(null AS yes_or_no) AS cycle_option    -- FIXME
+           -- XXX: The following could be improved if we had LATERAL.
+           CAST((pg_sequence_parameters(c.oid)).start_value AS character_data) AS start_value,
+           CAST((pg_sequence_parameters(c.oid)).minimum_value AS character_data) AS minimum_value,
+           CAST((pg_sequence_parameters(c.oid)).maximum_value AS character_data) AS maximum_value,
+           CAST((pg_sequence_parameters(c.oid)).increment AS character_data) AS increment,
+           CAST(CASE WHEN (pg_sequence_parameters(c.oid)).cycle_option THEN 'YES' ELSE 'NO' END AS yes_or_no) AS cycle_option
     FROM pg_namespace nc, pg_class c
     WHERE c.relnamespace = nc.oid
           AND c.relkind = 'S'
           AND (NOT pg_is_other_temp_schema(nc.oid))
           AND (pg_has_role(c.relowner, 'USAGE')
-               OR has_table_privilege(c.oid, 'SELECT, UPDATE') );
+               OR has_sequence_privilege(c.oid, 'SELECT, UPDATE, USAGE') );
 
 GRANT SELECT ON sequences TO PUBLIC;
 
@@ -1793,6 +1832,7 @@ CREATE VIEW tables AS
              CASE WHEN nc.oid = pg_my_temp_schema() THEN 'LOCAL TEMPORARY'
                   WHEN c.relkind = 'r' THEN 'BASE TABLE'
                   WHEN c.relkind = 'v' THEN 'VIEW'
+                  WHEN c.relkind = 'f' THEN 'FOREIGN TABLE'
                   ELSE null END
              AS character_data) AS table_type,
 
@@ -1817,7 +1857,7 @@ CREATE VIEW tables AS
     FROM pg_namespace nc JOIN pg_class c ON (nc.oid = c.relnamespace)
            LEFT JOIN (pg_type t JOIN pg_namespace nt ON (t.typnamespace = nt.oid)) ON (c.reloftype = t.oid)
 
-    WHERE c.relkind IN ('r', 'v')
+    WHERE c.relkind IN ('r', 'v', 'f')
           AND (NOT pg_is_other_temp_schema(nc.oid))
           AND (pg_has_role(c.relowner, 'USAGE')
                OR has_table_privilege(c.oid, 'SELECT, INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER')
@@ -1846,9 +1886,6 @@ GRANT SELECT ON tables TO PUBLIC;
  * 5.64
  * TRIGGERED_UPDATE_COLUMNS view
  */
-
--- PostgreSQL doesn't allow the specification of individual triggered
--- update columns, so this view is empty.
 
 CREATE VIEW triggered_update_columns AS
     SELECT CAST(current_database() AS sql_identifier) AS trigger_catalog,
@@ -2132,7 +2169,7 @@ CREATE VIEW view_column_usage AS
           AND dt.refclassid = 'pg_catalog.pg_class'::regclass
           AND dt.refobjid = t.oid
           AND t.relnamespace = nt.oid
-          AND t.relkind IN ('r', 'v')
+          AND t.relkind IN ('r', 'v', 'f')
           AND t.oid = a.attrelid
           AND dt.refobjsubid = a.attnum
           AND pg_has_role(t.relowner, 'USAGE');
@@ -2202,7 +2239,7 @@ CREATE VIEW view_table_usage AS
           AND dt.refclassid = 'pg_catalog.pg_class'::regclass
           AND dt.refobjid = t.oid
           AND t.relnamespace = nt.oid
-          AND t.relkind IN ('r', 'v')
+          AND t.relkind IN ('r', 'v', 'f')
           AND pg_has_role(t.relowner, 'USAGE');
 
 GRANT SELECT ON view_table_usage TO PUBLIC;
@@ -2326,7 +2363,7 @@ CREATE VIEW element_types AS
            CAST(null AS cardinal_number) AS datetime_precision,
            CAST(null AS character_data) AS interval_type,
            CAST(null AS character_data) AS interval_precision,
-           
+
            CAST(null AS character_data) AS domain_default, -- XXX maybe a bug in the standard
 
            CAST(current_database() AS sql_identifier) AS udt_catalog,
@@ -2347,7 +2384,7 @@ CREATE VIEW element_types AS
                   'TABLE'::text, a.attnum, a.atttypid
            FROM pg_class c, pg_attribute a
            WHERE c.oid = a.attrelid
-                 AND c.relkind IN ('r', 'v')
+                 AND c.relkind IN ('r', 'v', 'f')
                  AND attnum > 0 AND NOT attisdropped
 
            UNION ALL
@@ -2482,6 +2519,60 @@ CREATE VIEW foreign_servers AS
     FROM _pg_foreign_servers;
 
 GRANT SELECT ON foreign_servers TO PUBLIC;
+
+
+/* Base view for foreign tables */
+CREATE VIEW _pg_foreign_tables AS
+    SELECT
+           CAST(current_database() AS sql_identifier) AS foreign_table_catalog,
+           n.nspname AS foreign_table_schema,
+           c.relname AS foreign_table_name,
+           t.ftoptions AS ftoptions,
+           CAST(current_database() AS sql_identifier) AS foreign_server_catalog,
+           CAST(srvname AS sql_identifier) AS foreign_server_name,
+           CAST(u.rolname AS sql_identifier) AS authorization_identifier
+    FROM pg_foreign_table t, pg_foreign_server s, pg_foreign_data_wrapper w,
+         pg_authid u, pg_namespace n, pg_class c
+    WHERE w.oid = s.srvfdw
+          AND u.oid = c.relowner
+          AND (pg_has_role(c.relowner, 'USAGE')
+               OR has_table_privilege(c.oid, 'SELECT')
+               OR has_any_column_privilege(c.oid, 'SELECT'))
+          AND n.oid = c.relnamespace
+          AND c.oid = t.ftrelid
+          AND c.relkind = 'f'
+          AND s.oid = t.ftserver;
+
+
+/*
+ * 24.8
+ * FOREIGN_TABLE_OPTIONS view
+ */
+CREATE VIEW foreign_table_options AS
+    SELECT foreign_table_catalog,
+           foreign_table_schema,
+           foreign_table_name,
+           CAST((pg_options_to_table(t.ftoptions)).option_name AS sql_identifier) AS option_name,
+           CAST((pg_options_to_table(t.ftoptions)).option_value AS character_data) AS option_value
+    FROM _pg_foreign_tables t;
+
+GRANT SELECT ON TABLE foreign_table_options TO PUBLIC;
+
+
+/*
+ * 24.9
+ * FOREIGN_TABLES view
+ */
+CREATE VIEW foreign_tables AS
+    SELECT foreign_table_catalog,
+           foreign_table_schema,
+           foreign_table_name,
+           foreign_server_catalog,
+           foreign_server_name
+    FROM _pg_foreign_tables;
+
+GRANT SELECT ON foreign_tables TO PUBLIC;
+
 
 
 /* Base view for user mappings */

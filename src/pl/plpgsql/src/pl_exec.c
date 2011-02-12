@@ -3,7 +3,7 @@
  * pl_exec.c		- Executor for the PL/pgSQL
  *			  procedural language
  *
- * Portions Copyright (c) 1996-2010, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2011, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -154,6 +154,7 @@ static void exec_assign_value(PLpgSQL_execstate *estate,
 static void exec_eval_datum(PLpgSQL_execstate *estate,
 				PLpgSQL_datum *datum,
 				Oid *typeid,
+				int32 *typetypmod,
 				Datum *value,
 				bool *isnull);
 static int exec_eval_integer(PLpgSQL_execstate *estate,
@@ -2888,6 +2889,17 @@ exec_stmt_execsql(PLpgSQL_execstate *estate,
 			exec_set_found(estate, false);
 			break;
 
+			/* Some SPI errors deserve specific error messages */
+		case SPI_ERROR_COPY:
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("cannot COPY to/from client in PL/pgSQL")));
+		case SPI_ERROR_TRANSACTION:
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("cannot begin/end transactions in PL/pgSQL"),
+			errhint("Use a BEGIN block with an EXCEPTION clause instead.")));
+
 		default:
 			elog(ERROR, "SPI_execute_plan_with_paramlist failed executing query \"%s\": %s",
 				 expr->query, SPI_result_code_string(rc));
@@ -3736,6 +3748,7 @@ exec_assign_value(PLpgSQL_execstate *estate,
 				bool		oldarrayisnull;
 				Oid			arraytypeid,
 							arrayelemtypeid;
+				int32		arraytypmod;
 				int16		arraytyplen,
 							elemtyplen;
 				bool		elemtypbyval;
@@ -3773,15 +3786,20 @@ exec_assign_value(PLpgSQL_execstate *estate,
 						ereport(ERROR,
 								(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
 								 errmsg("number of array dimensions (%d) exceeds the maximum allowed (%d)",
-										nsubscripts, MAXDIM)));
+										nsubscripts + 1, MAXDIM)));
 					subscripts[nsubscripts++] = arrayelem->subscript;
 					target = estate->datums[arrayelem->arrayparentno];
 				} while (target->dtype == PLPGSQL_DTYPE_ARRAYELEM);
 
 				/* Fetch current value of array datum */
 				exec_eval_datum(estate, target,
-							  &arraytypeid, &oldarraydatum, &oldarrayisnull);
+								&arraytypeid, &arraytypmod,
+								&oldarraydatum, &oldarrayisnull);
 
+				/* If target is domain over array, reduce to base type */
+				arraytypeid = getBaseTypeAndTypmod(arraytypeid, &arraytypmod);
+
+				/* ... and identify the element type */
 				arrayelemtypeid = get_element_type(arraytypeid);
 				if (!OidIsValid(arrayelemtypeid))
 					ereport(ERROR,
@@ -3831,7 +3849,7 @@ exec_assign_value(PLpgSQL_execstate *estate,
 				coerced_value = exec_simple_cast_value(value,
 													   valtype,
 													   arrayelemtypeid,
-													   -1,
+													   arraytypmod,
 													   *isNull);
 
 				/*
@@ -3875,7 +3893,9 @@ exec_assign_value(PLpgSQL_execstate *estate,
 
 				/*
 				 * Assign the new array to the base variable.  It's never NULL
-				 * at this point.
+				 * at this point.  Note that if the target is a domain,
+				 * coercing the base array type back up to the domain will
+				 * happen within exec_assign_value.
 				 */
 				*isNull = false;
 				exec_assign_value(estate, target,
@@ -3897,7 +3917,7 @@ exec_assign_value(PLpgSQL_execstate *estate,
 /*
  * exec_eval_datum				Get current value of a PLpgSQL_datum
  *
- * The type oid, value in Datum format, and null flag are returned.
+ * The type oid, typmod, value in Datum format, and null flag are returned.
  *
  * At present this doesn't handle PLpgSQL_expr or PLpgSQL_arrayelem datums.
  *
@@ -3910,6 +3930,7 @@ static void
 exec_eval_datum(PLpgSQL_execstate *estate,
 				PLpgSQL_datum *datum,
 				Oid *typeid,
+				int32 *typetypmod,
 				Datum *value,
 				bool *isnull)
 {
@@ -3922,6 +3943,7 @@ exec_eval_datum(PLpgSQL_execstate *estate,
 				PLpgSQL_var *var = (PLpgSQL_var *) datum;
 
 				*typeid = var->datatype->typoid;
+				*typetypmod = var->datatype->atttypmod;
 				*value = var->value;
 				*isnull = var->isnull;
 				break;
@@ -3942,6 +3964,7 @@ exec_eval_datum(PLpgSQL_execstate *estate,
 					elog(ERROR, "row not compatible with its own tupdesc");
 				MemoryContextSwitchTo(oldcontext);
 				*typeid = row->rowtupdesc->tdtypeid;
+				*typetypmod = row->rowtupdesc->tdtypmod;
 				*value = HeapTupleGetDatum(tup);
 				*isnull = false;
 				break;
@@ -3974,6 +3997,7 @@ exec_eval_datum(PLpgSQL_execstate *estate,
 				HeapTupleHeaderSetTypMod(worktup.t_data, rec->tupdesc->tdtypmod);
 				MemoryContextSwitchTo(oldcontext);
 				*typeid = rec->tupdesc->tdtypeid;
+				*typetypmod = rec->tupdesc->tdtypmod;
 				*value = HeapTupleGetDatum(&worktup);
 				*isnull = false;
 				break;
@@ -3999,6 +4023,11 @@ exec_eval_datum(PLpgSQL_execstate *estate,
 							 errmsg("record \"%s\" has no field \"%s\"",
 									rec->refname, recfield->fieldname)));
 				*typeid = SPI_gettypeid(rec->tupdesc, fno);
+				/* XXX there's no SPI_gettypmod, for some reason */
+				if (fno > 0)
+					*typetypmod = rec->tupdesc->attrs[fno - 1]->atttypmod;
+				else
+					*typetypmod = -1;
 				*value = SPI_getbinval(rec->tup, rec->tupdesc, fno, isnull);
 				break;
 			}
@@ -4473,7 +4502,18 @@ loop_exit:
  *								a Datum by directly calling ExecEvalExpr().
  *
  * If successful, store results into *result, *isNull, *rettype and return
- * TRUE.  If the expression is not simple (any more), return FALSE.
+ * TRUE.  If the expression cannot be handled by simple evaluation,
+ * return FALSE.
+ *
+ * Because we only store one execution tree for a simple expression, we
+ * can't handle recursion cases.  So, if we see the tree is already busy
+ * with an evaluation in the current xact, we just return FALSE and let the
+ * caller run the expression the hard way.  (Other alternatives such as
+ * creating a new tree for a recursive call either introduce memory leaks,
+ * or add enough bookkeeping to be doubtful wins anyway.)  Another case that
+ * is covered by the expr_simple_in_use test is where a previous execution
+ * of the tree was aborted by an error: the tree may contain bogus state
+ * so we dare not re-use it.
  *
  * It is possible though unlikely for a simple expression to become non-simple
  * (consider for example redefining a trivial view).  We must handle that for
@@ -4510,6 +4550,12 @@ exec_eval_simple_expr(PLpgSQL_execstate *estate,
 		return false;
 
 	/*
+	 * If expression is in use in current xact, don't touch it.
+	 */
+	if (expr->expr_simple_in_use && expr->expr_simple_lxid == curlxid)
+		return false;
+
+	/*
 	 * Revalidate cached plan, so that we will notice if it became stale. (We
 	 * also need to hold a refcount while using the plan.)	Note that even if
 	 * replanning occurs, the length of plancache_list can't change, since it
@@ -4542,9 +4588,11 @@ exec_eval_simple_expr(PLpgSQL_execstate *estate,
 	 */
 	if (expr->expr_simple_lxid != curlxid)
 	{
-		expr->expr_simple_state = ExecPrepareExpr(expr->expr_simple_expr,
-												  simple_eval_estate);
+		oldcontext = MemoryContextSwitchTo(simple_eval_estate->es_query_cxt);
+		expr->expr_simple_state = ExecInitExpr(expr->expr_simple_expr, NULL);
+		expr->expr_simple_in_use = false;
 		expr->expr_simple_lxid = curlxid;
+		MemoryContextSwitchTo(oldcontext);
 	}
 
 	/*
@@ -4579,6 +4627,11 @@ exec_eval_simple_expr(PLpgSQL_execstate *estate,
 	econtext->ecxt_param_list_info = paramLI;
 
 	/*
+	 * Mark expression as busy for the duration of the ExecEvalExpr call.
+	 */
+	expr->expr_simple_in_use = true;
+
+	/*
 	 * Finally we can call the executor to evaluate the expression
 	 */
 	*result = ExecEvalExpr(expr->expr_simple_state,
@@ -4587,6 +4640,8 @@ exec_eval_simple_expr(PLpgSQL_execstate *estate,
 						   NULL);
 
 	/* Assorted cleanup */
+	expr->expr_simple_in_use = false;
+
 	estate->cur_expr = save_cur_expr;
 
 	if (!estate->readonly_func)
@@ -4671,6 +4726,7 @@ plpgsql_param_fetch(ParamListInfo params, int paramid)
 	PLpgSQL_expr *expr;
 	PLpgSQL_datum *datum;
 	ParamExternData *prm;
+	int32		prmtypmod;
 
 	/* paramid's are 1-based, but dnos are 0-based */
 	dno = paramid - 1;
@@ -4693,7 +4749,8 @@ plpgsql_param_fetch(ParamListInfo params, int paramid)
 	datum = estate->datums[dno];
 	prm = &params->params[dno];
 	exec_eval_datum(estate, datum,
-					&prm->ptype, &prm->value, &prm->isnull);
+					&prm->ptype, &prmtypmod,
+					&prm->value, &prm->isnull);
 }
 
 
@@ -4870,6 +4927,7 @@ make_tuple_from_row(PLpgSQL_execstate *estate,
 	for (i = 0; i < natts; i++)
 	{
 		Oid			fieldtypeid;
+		int32		fieldtypmod;
 
 		if (tupdesc->attrs[i]->attisdropped)
 		{
@@ -4880,9 +4938,11 @@ make_tuple_from_row(PLpgSQL_execstate *estate,
 			elog(ERROR, "dropped rowtype entry for non-dropped column");
 
 		exec_eval_datum(estate, estate->datums[row->varnos[i]],
-						&fieldtypeid, &dvalues[i], &nulls[i]);
+						&fieldtypeid, &fieldtypmod,
+						&dvalues[i], &nulls[i]);
 		if (fieldtypeid != tupdesc->attrs[i]->atttypid)
 			return NULL;
+		/* XXX should we insist on typmod match, too? */
 	}
 
 	tuple = heap_form_tuple(tupdesc, dvalues, nulls);
@@ -5318,6 +5378,7 @@ exec_simple_check_plan(PLpgSQL_expr *expr)
 	 */
 	expr->expr_simple_expr = tle->expr;
 	expr->expr_simple_state = NULL;
+	expr->expr_simple_in_use = false;
 	expr->expr_simple_lxid = InvalidLocalTransactionId;
 	/* Also stash away the expression result type */
 	expr->expr_simple_type = exprType((Node *) tle->expr);

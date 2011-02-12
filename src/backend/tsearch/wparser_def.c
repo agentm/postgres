@@ -3,7 +3,7 @@
  * wparser_def.c
  *		Default text search parser
  *
- * Portions Copyright (c) 1996-2010, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2011, PostgreSQL Global Development Group
  *
  *
  * IDENTIFICATION
@@ -14,6 +14,7 @@
 
 #include "postgres.h"
 
+#include "catalog/pg_collation.h"
 #include "commands/defrem.h"
 #include "tsearch/ts_locale.h"
 #include "tsearch/ts_public.h"
@@ -47,7 +48,7 @@
 #define HWORD			17
 #define URLPATH			18
 #define FILEPATH		19
-#define DECIMAL			20
+#define DECIMAL_T		20
 #define SIGNEDINT		21
 #define UNSIGNEDINT		22
 #define XMLENTITY		23
@@ -298,8 +299,10 @@ TParserInit(char *str, int len)
 	 */
 	if (prs->charmaxlen > 1)
 	{
+		Oid			collation = DEFAULT_COLLATION_OID; /*TODO*/
+		
 		prs->usewide = true;
-		if ( lc_ctype_is_c() )
+		if ( lc_ctype_is_c(collation) )
 		{
 			/*
 			 * char2wchar doesn't work for C-locale and
@@ -311,7 +314,7 @@ TParserInit(char *str, int len)
 		else
 		{
 			prs->wstr = (wchar_t *) palloc(sizeof(wchar_t) * (prs->lenstr + 1));
-			char2wchar(prs->wstr, prs->lenstr + 1, prs->str, prs->lenstr);
+			char2wchar(prs->wstr, prs->lenstr + 1, prs->str, prs->lenstr, collation);
 		}
 	}
 	else
@@ -423,8 +426,8 @@ TParserCopyClose(TParser *prs)
  * Character-type support functions, equivalent to is* macros, but
  * working with any possible encodings and locales. Notes:
  *  - with multibyte encoding and C-locale isw* function may fail
- *    or give wrong result. 
- *  - multibyte encoding and C-locale often are used for 
+ *    or give wrong result.
+ *  - multibyte encoding and C-locale often are used for
  *    Asian languages.
  *  - if locale is C the we use pgwstr instead of wstr
  */
@@ -761,8 +764,8 @@ p_isURLPath(TParser *prs)
 /*
  * returns true if current character has zero display length or
  * it's a special sign in several languages. Such characters
- * aren't a word-breaker although they aren't an isalpha. 
- * In beginning of word they aren't a part of it. 
+ * aren't a word-breaker although they aren't an isalpha.
+ * In beginning of word they aren't a part of it.
  */
 static int
 p_isspecial(TParser *prs)
@@ -1150,12 +1153,12 @@ static const TParserStateActionItem actionTPS_InUDecimalFirst[] = {
 };
 
 static const TParserStateActionItem actionTPS_InUDecimal[] = {
-	{p_isEOF, 0, A_BINGO, TPS_Base, DECIMAL, NULL},
+	{p_isEOF, 0, A_BINGO, TPS_Base, DECIMAL_T, NULL},
 	{p_isdigit, 0, A_NEXT, TPS_InUDecimal, 0, NULL},
 	{p_iseqC, '.', A_PUSH, TPS_InVersionFirst, 0, NULL},
 	{p_iseqC, 'e', A_PUSH, TPS_InMantissaFirst, 0, NULL},
 	{p_iseqC, 'E', A_PUSH, TPS_InMantissaFirst, 0, NULL},
-	{NULL, 0, A_BINGO, TPS_Base, DECIMAL, NULL}
+	{NULL, 0, A_BINGO, TPS_Base, DECIMAL_T, NULL}
 };
 
 static const TParserStateActionItem actionTPS_InDecimalFirst[] = {
@@ -1165,12 +1168,12 @@ static const TParserStateActionItem actionTPS_InDecimalFirst[] = {
 };
 
 static const TParserStateActionItem actionTPS_InDecimal[] = {
-	{p_isEOF, 0, A_BINGO, TPS_Base, DECIMAL, NULL},
+	{p_isEOF, 0, A_BINGO, TPS_Base, DECIMAL_T, NULL},
 	{p_isdigit, 0, A_NEXT, TPS_InDecimal, 0, NULL},
 	{p_iseqC, '.', A_PUSH, TPS_InVerVersion, 0, NULL},
 	{p_iseqC, 'e', A_PUSH, TPS_InMantissaFirst, 0, NULL},
 	{p_iseqC, 'E', A_PUSH, TPS_InMantissaFirst, 0, NULL},
-	{NULL, 0, A_BINGO, TPS_Base, DECIMAL, NULL}
+	{NULL, 0, A_BINGO, TPS_Base, DECIMAL_T, NULL}
 };
 
 static const TParserStateActionItem actionTPS_InVerVersion[] = {
@@ -2006,7 +2009,7 @@ prsd_end(PG_FUNCTION_ARGS)
 #define HLIDSKIP(x)     ( (x)==URL_T || (x)==NUMHWORD || (x)==ASCIIHWORD || (x)==HWORD )
 #define XMLHLIDSKIP(x)  ( (x)==URL_T || (x)==NUMHWORD || (x)==ASCIIHWORD || (x)==HWORD )
 #define NONWORDTOKEN(x) ( (x)==SPACE || HLIDREPLACE(x) || HLIDSKIP(x) )
-#define NOENDTOKEN(x)	( NONWORDTOKEN(x) || (x)==SCIENTIFIC || (x)==VERSIONNUMBER || (x)==DECIMAL || (x)==SIGNEDINT || (x)==UNSIGNEDINT || TS_IDIGNORE(x) )
+#define NOENDTOKEN(x)	( NONWORDTOKEN(x) || (x)==SCIENTIFIC || (x)==VERSIONNUMBER || (x)==DECIMAL_T || (x)==SIGNEDINT || (x)==UNSIGNEDINT || TS_IDIGNORE(x) )
 
 typedef struct
 {
@@ -2099,7 +2102,7 @@ hlCover(HeadlineParsedText *prs, TSQuery query, int *p, int *q)
 	return false;
 }
 
-static void 
+static void
 mark_fragment(HeadlineParsedText *prs, int highlight, int startpos, int endpos)
 {
 	int   i;
@@ -2125,7 +2128,7 @@ mark_fragment(HeadlineParsedText *prs, int highlight, int startpos, int endpos)
 	}
 }
 
-typedef struct 
+typedef struct
 {
 	int4 startpos;
 	int4 endpos;
@@ -2135,16 +2138,16 @@ typedef struct
 	int2 excluded;
 } CoverPos;
 
-static void 
+static void
 get_next_fragment(HeadlineParsedText *prs, int *startpos, int *endpos,
 			int *curlen, int *poslen, int max_words)
 {
 	int i;
-	/* Objective: Generate a fragment of words between startpos and endpos 
-	 * such that it has at most max_words and both ends has query words. 
-	 * If the startpos and endpos are the endpoints of the cover and the 
-	 * cover has fewer words than max_words, then this function should 
-	 * just return the cover 
+	/* Objective: Generate a fragment of words between startpos and endpos
+	 * such that it has at most max_words and both ends has query words.
+	 * If the startpos and endpos are the endpoints of the cover and the
+	 * cover has fewer words than max_words, then this function should
+	 * just return the cover
 	 */
 	/* first move startpos to an item */
 	for(i = *startpos; i <= *endpos; i++)
@@ -2156,14 +2159,14 @@ get_next_fragment(HeadlineParsedText *prs, int *startpos, int *endpos,
 	/* cut endpos to have only max_words */
 	*curlen = 0;
 	*poslen = 0;
-	for(i = *startpos; i <= *endpos && *curlen < max_words; i++) 
+	for(i = *startpos; i <= *endpos && *curlen < max_words; i++)
 	{
 		if (!NONWORDTOKEN(prs->words[i].type))
 			*curlen += 1;
 		if (prs->words[i].item && !prs->words[i].repeated)
 			*poslen += 1;
 	}
-	/* if the cover was cut then move back endpos to a query item */ 		
+	/* if the cover was cut then move back endpos to a query item */
 	if (*endpos > i)
 	{
 		*endpos = i;
@@ -2174,31 +2177,31 @@ get_next_fragment(HeadlineParsedText *prs, int *startpos, int *endpos,
 				break;
 			if (!NONWORDTOKEN(prs->words[i].type))
 				*curlen -= 1;
-		}		
-	}	
+		}
+	}
 }
 
 static void
 mark_hl_fragments(HeadlineParsedText *prs, TSQuery query, int highlight,
-                        int shortword, int min_words, 
+                        int shortword, int min_words,
 			int max_words, int max_fragments)
 {
 	int4           	poslen, curlen, i, f, num_f = 0;
 	int4		stretch, maxstretch, posmarker;
 
-	int4           	startpos = 0, 
- 			endpos   = 0,
+	int4           	startpos = 0,
+			endpos   = 0,
 			p        = 0,
 			q        = 0;
 
-	int4		numcovers = 0, 
+	int4		numcovers = 0,
 			maxcovers = 32;
 
 	int4          	minI, minwords, maxitems;
 	CoverPos	*covers;
 
 	covers = palloc(maxcovers * sizeof(CoverPos));
- 
+
 	/* get all covers */
 	while (hlCover(prs, query, &p, &q))
 	{
@@ -2207,7 +2210,7 @@ mark_hl_fragments(HeadlineParsedText *prs, TSQuery query, int highlight,
 
 		/* Break the cover into smaller fragments such that each fragment
 		 * has at most max_words. Also ensure that each end of the fragment
-		 * is a query word. This will allow us to stretch the fragment in 
+		 * is a query word. This will allow us to stretch the fragment in
 		 * either direction
 		 */
 
@@ -2228,9 +2231,9 @@ mark_hl_fragments(HeadlineParsedText *prs, TSQuery query, int highlight,
 			numcovers ++;
 			startpos = endpos + 1;
 			endpos   = q;
-		}	
+		}
 		/* move p to generate the next cover */
- 		p++;
+		p++;
 	}
 
 	/* choose best covers */
@@ -2240,13 +2243,13 @@ mark_hl_fragments(HeadlineParsedText *prs, TSQuery query, int highlight,
 		minwords = 0x7fffffff;
 		minI = -1;
 		/* Choose the cover that contains max items.
-		 * In case of tie choose the one with smaller 
-		 * number of words. 
+		 * In case of tie choose the one with smaller
+		 * number of words.
 		 */
 		for (i = 0; i < numcovers; i ++)
 		{
-			if (!covers[i].in &&  !covers[i].excluded && 
-  				(maxitems < covers[i].poslen || (maxitems == covers[i].poslen
+			if (!covers[i].in &&  !covers[i].excluded &&
+				(maxitems < covers[i].poslen || (maxitems == covers[i].poslen
 				&& minwords > covers[i].curlen)))
 			{
 				maxitems = covers[i].poslen;
@@ -2263,15 +2266,15 @@ mark_hl_fragments(HeadlineParsedText *prs, TSQuery query, int highlight,
 			endpos   = covers[minI].endpos;
 			curlen   = covers[minI].curlen;
 			/* stretch the cover if cover size is lower than max_words */
-			if (curlen < max_words) 
+			if (curlen < max_words)
 			{
 				/* divide the stretch on both sides of cover */
 				maxstretch = (max_words - curlen)/2;
-				/* first stretch the startpos 
-				 * stop stretching if 
-				 * 	1. we hit the beginning of document
-				 * 	2. exceed maxstretch
-				 * 	3. we hit an already marked fragment 
+				/* first stretch the startpos
+				 * stop stretching if
+				 *	1. we hit the beginning of document
+				 *	2. exceed maxstretch
+				 *	3. we hit an already marked fragment
 				 */
 				stretch   = 0;
 				posmarker = startpos;
@@ -2297,7 +2300,7 @@ mark_hl_fragments(HeadlineParsedText *prs, TSQuery query, int highlight,
 				{
 					if (!NONWORDTOKEN(prs->words[i].type))
 						curlen  ++;
-					posmarker = i;	
+					posmarker = i;
 				}
 				/* cut back endpos till we find a non-short token */
 				for ( i = posmarker; i > endpos && (NOENDTOKEN(prs->words[i].type) || prs->words[i].len <= shortword); i--)
@@ -2316,7 +2319,7 @@ mark_hl_fragments(HeadlineParsedText *prs, TSQuery query, int highlight,
 			/* exclude overlapping covers */
 			for (i = 0; i < numcovers; i ++)
 			{
-				if (i != minI && ( (covers[i].startpos >= covers[minI].startpos && covers[i].startpos <= covers[minI].endpos)  || (covers[i].endpos >= covers[minI].startpos && covers[i].endpos <= covers[minI].endpos))) 
+				if (i != minI && ( (covers[i].startpos >= covers[minI].startpos && covers[i].startpos <= covers[minI].endpos)  || (covers[i].endpos >= covers[minI].startpos && covers[i].endpos <= covers[minI].endpos)))
 					covers[i].excluded = 1;
 			}
 		}
@@ -2340,7 +2343,7 @@ mark_hl_fragments(HeadlineParsedText *prs, TSQuery query, int highlight,
 }
 
 static void
-mark_hl_words(HeadlineParsedText *prs, TSQuery query, int highlight, 
+mark_hl_words(HeadlineParsedText *prs, TSQuery query, int highlight,
 		int shortword, int min_words, int max_words)
 {
 	int			p = 0,
@@ -2552,7 +2555,7 @@ prsd_headline(PG_FUNCTION_ARGS)
 			ereport(ERROR,
 					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 					 errmsg("MaxFragments should be >= 0")));
-	}				 
+	}
 
 	if (max_fragments == 0)
 		/* call the default headline generator */

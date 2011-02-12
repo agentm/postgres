@@ -4,7 +4,7 @@
  *	  prototypes for pathnode.c, relnode.c.
  *
  *
- * Portions Copyright (c) 1996-2010, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2011, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/optimizer/pathnode.h
@@ -31,6 +31,7 @@ extern Path *create_seqscan_path(PlannerInfo *root, RelOptInfo *rel);
 extern IndexPath *create_index_path(PlannerInfo *root,
 				  IndexOptInfo *index,
 				  List *clause_groups,
+				  List *indexorderbys,
 				  List *pathkeys,
 				  ScanDirection indexscandir,
 				  RelOptInfo *outer_rel);

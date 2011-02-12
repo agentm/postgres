@@ -3,7 +3,7 @@
  * postinit.c
  *	  postgres initialization utilities
  *
- * Portions Copyright (c) 1996-2010, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2011, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -218,28 +218,17 @@ PerformAuthentication(Port *port)
 	if (!disable_sig_alarm(true))
 		elog(FATAL, "could not disable timer for authorization timeout");
 
-	/*
-	 * Log connection for streaming replication even if Log_connections
-	 * disabled.
-	 */
-	if (am_walsender)
+	if (Log_connections)
 	{
-		if (port->remote_port[0])
+		if (am_walsender)
 			ereport(LOG,
-					(errmsg("replication connection authorized: user=%s host=%s port=%s",
-							port->user_name,
-							port->remote_host,
-							port->remote_port)));
+				(errmsg("replication connection authorized: user=%s",
+						port->user_name)));
 		else
 			ereport(LOG,
-				(errmsg("replication connection authorized: user=%s host=%s",
-						port->user_name,
-						port->remote_host)));
+					(errmsg("connection authorized: user=%s database=%s",
+							port->user_name, port->database_name)));
 	}
-	else if (Log_connections)
-		ereport(LOG,
-				(errmsg("connection authorized: user=%s database=%s",
-						port->user_name, port->database_name)));
 
 	set_ps_display("startup", false);
 
@@ -658,11 +647,11 @@ InitPostgres(const char *in_dbname, Oid dboid, const char *username,
 	{
 		Assert(!bootstrap);
 
-		/* must have authenticated as a superuser */
-		if (!am_superuser)
+		/* must have authenticated as a replication role */
+		if (!is_authenticated_user_replication_role())
 			ereport(FATAL,
 					(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
-					 errmsg("must be superuser to start walsender")));
+					 errmsg("must be replication role to start walsender")));
 
 		/* process any options passed in the startup packet */
 		if (MyProcPort != NULL)

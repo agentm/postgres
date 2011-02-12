@@ -3,7 +3,7 @@
  * tsrank.c
  *		rank tsvector by tsquery
  *
- * Portions Copyright (c) 1996-2010, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2011, PostgreSQL Global Development Group
  *
  *
  * IDENTIFICATION
@@ -109,7 +109,7 @@ find_wordentry(TSVector t, TSQuery q, QueryOperand *item, int32 *nitem)
 			StopHigh = StopMiddle;
 	}
 
-	if (item->prefix == true)
+	if (item->prefix)
 	{
 		if (StopLow >= StopHigh)
 			StopMiddle = StopHigh;
@@ -395,7 +395,7 @@ getWeights(ArrayType *win)
 	int			i;
 	float4	   *arrdata;
 
-	if (win == 0)
+	if (win == NULL)
 		return weights;
 
 	if (ARR_NDIM(win) != 1)
@@ -408,7 +408,7 @@ getWeights(ArrayType *win)
 				(errcode(ERRCODE_ARRAY_SUBSCRIPT_ERROR),
 				 errmsg("array of weight is too short")));
 
-	if (ARR_HASNULL(win))
+	if (array_contains_nulls(win))
 		ereport(ERROR,
 				(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
 				 errmsg("array of weight must not contain nulls")));

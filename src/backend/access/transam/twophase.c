@@ -3,7 +3,7 @@
  * twophase.c
  *		Two-phase commit support functions.
  *
- * Portions Copyright (c) 1996-2010, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2011, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -57,6 +57,7 @@
 #include "pgstat.h"
 #include "replication/walsender.h"
 #include "storage/fd.h"
+#include "storage/predicate.h"
 #include "storage/procarray.h"
 #include "storage/sinvaladt.h"
 #include "storage/smgr.h"
@@ -1356,6 +1357,8 @@ FinishPreparedTransaction(const char *gid, bool isCommit)
 		ProcessRecords(bufptr, xid, twophase_postcommit_callbacks);
 	else
 		ProcessRecords(bufptr, xid, twophase_postabort_callbacks);
+
+	PredicateLockTwoPhaseFinish(xid, isCommit);
 
 	/* Count the prepared xact as committed or aborted */
 	AtEOXact_PgStat(isCommit);

@@ -2,7 +2,7 @@
 #
 # Makefile for the postgres backend
 #
-# Portions Copyright (c) 1996-2010, PostgreSQL Global Development Group
+# Portions Copyright (c) 1996-2011, PostgreSQL Global Development Group
 # Portions Copyright (c) 1994, Regents of the University of California
 #
 # src/backend/Makefile
@@ -114,15 +114,20 @@ endif
 endif # aix
 
 # Update the commonly used headers before building the subdirectories
-$(SUBDIRS:%=%-recursive): $(top_builddir)/src/include/parser/gram.h $(top_builddir)/src/include/catalog/schemapg.h $(top_builddir)/src/include/utils/fmgroids.h $(top_builddir)/src/include/utils/probes.h
+$(SUBDIRS:%=%-recursive): $(top_builddir)/src/include/parser/gram.h $(top_builddir)/src/include/catalog/schemapg.h $(top_builddir)/src/include/utils/fmgroids.h $(top_builddir)/src/include/utils/errcodes.h $(top_builddir)/src/include/utils/probes.h
 
 # run this unconditionally to avoid needing to know its dependencies here:
 submake-schemapg:
 	$(MAKE) -C catalog schemapg.h
 
-.PHONY: submake-schemapg
+# src/port needs a convenient way to force errcodes.h to get built
+submake-errcodes: $(top_builddir)/src/include/utils/errcodes.h
 
-catalog/schemapg.h: submake-schemapg
+.PHONY: submake-schemapg submake-errcodes
+
+catalog/schemapg.h: | submake-schemapg
+
+$(top_builddir)/src/port/libpgport_srv.a: | submake-libpgport
 
 
 # The postgres.o target is needed by the rule in Makefile.global that
@@ -140,6 +145,9 @@ parser/gram.h: parser/gram.y
 
 utils/fmgroids.h: utils/Gen_fmgrtab.pl catalog/Catalog.pm $(top_srcdir)/src/include/catalog/pg_proc.h
 	$(MAKE) -C utils fmgroids.h
+
+utils/errcodes.h: utils/generate-errcodes.pl utils/errcodes.txt
+	$(MAKE) -C utils errcodes.h
 
 utils/probes.h: utils/probes.d
 	$(MAKE) -C utils probes.h
@@ -165,6 +173,10 @@ $(top_builddir)/src/include/catalog/schemapg.h: catalog/schemapg.h
 	  cd $(dir $@) && rm -f $(notdir $@) && \
 	  $(LN_S) "$$prereqdir/$(notdir $<)" .
 
+$(top_builddir)/src/include/utils/errcodes.h: utils/errcodes.h
+	cd $(dir $@) && rm -f $(notdir $@) && \
+	    $(LN_S) ../../../$(subdir)/utils/errcodes.h .
+
 $(top_builddir)/src/include/utils/fmgroids.h: utils/fmgroids.h
 	prereqdir=`cd $(dir $<) >/dev/null && pwd` && \
 	  cd $(dir $@) && rm -f $(notdir $@) && \
@@ -185,7 +197,7 @@ distprep:
 	$(MAKE) -C parser	gram.c gram.h scan.c
 	$(MAKE) -C bootstrap	bootparse.c bootscanner.c
 	$(MAKE) -C catalog	schemapg.h postgres.bki postgres.description postgres.shdescription
-	$(MAKE) -C utils	fmgrtab.c fmgroids.h 
+	$(MAKE) -C utils	fmgrtab.c fmgroids.h errcodes.h
 	$(MAKE) -C utils/misc	guc-file.c
 
 
@@ -296,6 +308,7 @@ maintainer-clean: distclean
 	      catalog/postgres.shdescription \
 	      utils/fmgroids.h \
 	      utils/fmgrtab.c \
+	      utils/errcodes.h \
 	      utils/misc/guc-file.c
 
 
@@ -303,7 +316,7 @@ maintainer-clean: distclean
 #
 # Support for code development.
 #
-# Use target "quick" to build "postgres" when you know all the subsystems 
+# Use target "quick" to build "postgres" when you know all the subsystems
 # are up to date.  It saves the time of doing all the submakes.
 .PHONY: quick
 quick: $(OBJS)

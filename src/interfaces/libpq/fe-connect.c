@@ -3,7 +3,7 @@
  * fe-connect.c
  *	  functions related to setting up a connection to the backend
  *
- * Portions Copyright (c) 1996-2010, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2011, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -99,6 +99,8 @@ static int ldapServiceLookup(const char *purl, PQconninfoOption *options,
 
 /* This is part of the protocol so just define it */
 #define ERRCODE_INVALID_PASSWORD "28P01"
+/* This too */
+#define ERRCODE_CANNOT_CONNECT_NOW "57P03"
 
 /*
  * fall back options if they are not specified by arguments or defined
@@ -285,6 +287,7 @@ static bool connectOptions1(PGconn *conn, const char *conninfo);
 static bool connectOptions2(PGconn *conn);
 static int	connectDBStart(PGconn *conn);
 static int	connectDBComplete(PGconn *conn);
+static PGPing internal_ping(PGconn *conn);
 static PGconn *makeEmptyPGconn(void);
 static void fillPGconn(PGconn *conn, PQconninfoOption *connOptions);
 static void freePGconn(PGconn *conn);
@@ -376,6 +379,25 @@ PQconnectdbParams(const char **keywords,
 }
 
 /*
+ *		PQpingParams
+ *
+ * check server status, accepting parameters identical to PQconnectdbParams
+ */
+PGPing
+PQpingParams(const char **keywords,
+			 const char **values,
+			 int expand_dbname)
+{
+	PGconn	   *conn = PQconnectStartParams(keywords, values, expand_dbname);
+	PGPing		ret;
+
+	ret = internal_ping(conn);
+	PQfinish(conn);
+
+	return ret;
+}
+
+/*
  *		PQconnectdb
  *
  * establishes a connection to a postgres backend through the postmaster
@@ -406,6 +428,23 @@ PQconnectdb(const char *conninfo)
 		(void) connectDBComplete(conn);
 
 	return conn;
+}
+
+/*
+ *		PQping
+ *
+ * check server status, accepting parameters identical to PQconnectdb
+ */
+PGPing
+PQping(const char *conninfo)
+{
+	PGconn	   *conn = PQconnectStart(conninfo);
+	PGPing		ret;
+
+	ret = internal_ping(conn);
+	PQfinish(conn);
+
+	return ret;
 }
 
 /*
@@ -960,16 +999,60 @@ connectFailureMessage(PGconn *conn, int errorno)
 	else
 #endif   /* HAVE_UNIX_SOCKETS */
 	{
+		char	host_addr[NI_MAXHOST];
+		bool 	display_host_addr;
+		struct sockaddr_storage *addr = &conn->raddr.addr;
+
+		/*
+		 *	Optionally display the network address with the hostname.
+		 *	This is useful to distinguish between IPv4 and IPv6 connections.
+		 */
+		if (conn->pghostaddr != NULL)
+			strlcpy(host_addr, conn->pghostaddr, NI_MAXHOST);
+		else if (addr->ss_family == AF_INET)
+		{
+			if (inet_net_ntop(AF_INET,
+							  &((struct sockaddr_in *) addr)->sin_addr.s_addr,
+							  32,
+							  host_addr, sizeof(host_addr)) == NULL)
+				strcpy(host_addr, "???");
+		}
+#ifdef HAVE_IPV6
+		else if (addr->ss_family == AF_INET6)
+		{
+			if (inet_net_ntop(AF_INET6,
+							  &((struct sockaddr_in6 *) addr)->sin6_addr.s6_addr,
+							  128,
+							  host_addr, sizeof(host_addr)) == NULL)
+				strcpy(host_addr, "???");
+		}
+#endif
+		else
+			strcpy(host_addr, "???");
+
+		/*
+		 *	If the user did not supply an IP address using 'hostaddr', and
+		 *	'host' was missing or does not match our lookup, display the
+		 *	looked-up IP address.
+		 */
+		display_host_addr = (conn->pghostaddr == NULL) &&
+							((conn->pghost == NULL) ||
+							 (strcmp(conn->pghost, host_addr) != 0));
+
 		appendPQExpBuffer(&conn->errorMessage,
 						  libpq_gettext("could not connect to server: %s\n"
-					 "\tIs the server running on host \"%s\" and accepting\n"
+					 "\tIs the server running on host \"%s\"%s%s%s and accepting\n"
 										"\tTCP/IP connections on port %s?\n"),
 						  SOCK_STRERROR(errorno, sebuf, sizeof(sebuf)),
-						  conn->pghostaddr
+						  (conn->pghostaddr && conn->pghostaddr[0] != '\0')
 						  ? conn->pghostaddr
-						  : (conn->pghost
+						  : (conn->pghost && conn->pghost[0] != '\0')
 							 ? conn->pghost
-							 : "???"),
+							 : DefaultHost,
+						  /* display the IP address only if not already output */
+						  display_host_addr ? " (" : "",
+						  display_host_addr ? host_addr : "",
+						  display_host_addr ? ")" : "",
 						  conn->pgport);
 	}
 }
@@ -1196,6 +1279,7 @@ connectDBStart(PGconn *conn)
 			appendPQExpBuffer(&conn->errorMessage,
 							  libpq_gettext("invalid port number: \"%s\"\n"),
 							  conn->pgport);
+			conn->options_valid = false;
 			goto connect_errReturn;
 		}
 	}
@@ -1225,7 +1309,7 @@ connectDBStart(PGconn *conn)
 		UNIXSOCK_PATH(portstr, portnum, conn->pgunixsocket);
 #else
 		/* Without Unix sockets, default to localhost instead */
-		node = "localhost";
+		node = DefaultHost;
 		hint.ai_family = AF_UNSPEC;
 #endif   /* HAVE_UNIX_SOCKETS */
 	}
@@ -1244,6 +1328,7 @@ connectDBStart(PGconn *conn)
 							  portstr, gai_strerror(ret));
 		if (addrs)
 			pg_freeaddrinfo_all(hint.ai_family, addrs);
+		conn->options_valid = false;
 		goto connect_errReturn;
 	}
 
@@ -1465,9 +1550,7 @@ keep_going:						/* We will come back to here until there is
 				/*
 				 * Try to initiate a connection to one of the addresses
 				 * returned by pg_getaddrinfo_all().  conn->addr_cur is the
-				 * next one to try. We fail when we run out of addresses
-				 * (reporting the error returned for the *last* alternative,
-				 * which may not be what users expect :-().
+				 * next one to try. We fail when we run out of addresses.
 				 */
 				while (conn->addr_cur != NULL)
 				{
@@ -2244,6 +2327,8 @@ keep_going:						/* We will come back to here until there is
 				}
 
 				/* It is an authentication request. */
+				conn->auth_req_received = true;
+
 				/* Get the type of request. */
 				if (pqGetInt((int *) &areq, 4, conn))
 				{
@@ -2491,6 +2576,73 @@ error_return:
 
 
 /*
+ * internal_ping
+ *		Determine if a server is running and if we can connect to it.
+ *
+ * The argument is a connection that's been started, but not completed.
+ */
+PGPing
+internal_ping(PGconn *conn)
+{
+	/* Say "no attempt" if we never got to PQconnectPoll */
+	if (!conn || !conn->options_valid)
+		return PQPING_NO_ATTEMPT;
+
+	/* Attempt to complete the connection */
+	if (conn->status != CONNECTION_BAD)
+		(void) connectDBComplete(conn);
+
+	/* Definitely OK if we succeeded */
+	if (conn->status != CONNECTION_BAD)
+		return PQPING_OK;
+
+	/*
+	 * Here begins the interesting part of "ping": determine the cause of the
+	 * failure in sufficient detail to decide what to return.  We do not want
+	 * to report that the server is not up just because we didn't have a valid
+	 * password, for example.  In fact, any sort of authentication request
+	 * implies the server is up.  (We need this check since the libpq side
+	 * of things might have pulled the plug on the connection before getting
+	 * an error as such from the postmaster.)
+	 */
+	if (conn->auth_req_received)
+		return PQPING_OK;
+
+	/*
+	 * If we failed to get any ERROR response from the postmaster, report
+	 * PQPING_NO_RESPONSE.  This result could be somewhat misleading for a
+	 * pre-7.4 server, since it won't send back a SQLSTATE, but those are long
+	 * out of support.  Another corner case where the server could return a
+	 * failure without a SQLSTATE is fork failure, but NO_RESPONSE isn't
+	 * totally unreasonable for that anyway.  We expect that every other
+	 * failure case in a modern server will produce a report with a SQLSTATE.
+	 *
+	 * NOTE: whenever we get around to making libpq generate SQLSTATEs for
+	 * client-side errors, we should either not store those into
+	 * last_sqlstate, or add an extra flag so we can tell client-side errors
+	 * apart from server-side ones.
+	 */
+	if (strlen(conn->last_sqlstate) != 5)
+		return PQPING_NO_RESPONSE;
+
+	/*
+	 * Report PQPING_REJECT if server says it's not accepting connections.
+	 * (We distinguish this case mainly for the convenience of pg_ctl.)
+	 */
+	if (strcmp(conn->last_sqlstate, ERRCODE_CANNOT_CONNECT_NOW) == 0)
+		return PQPING_REJECT;
+
+	/*
+	 * Any other SQLSTATE can be taken to indicate that the server is up.
+	 * Presumably it didn't like our username, password, or database name; or
+	 * perhaps it had some transient failure, but that should not be taken as
+	 * meaning "it's down".
+	 */
+	return PQPING_OK;
+}
+
+
+/*
  * makeEmptyPGconn
  *	 - create a PGconn data structure with (as yet) no interesting data
  */
@@ -2535,6 +2687,7 @@ makeEmptyPGconn(void)
 	conn->std_strings = false;	/* unless server says differently */
 	conn->verbosity = PQERRORS_DEFAULT;
 	conn->sock = -1;
+	conn->auth_req_received = false;
 	conn->password_needed = false;
 	conn->dot_pgpass_used = false;
 #ifdef USE_SSL
@@ -3240,7 +3393,7 @@ ldapServiceLookup(const char *purl, PQconninfoOption *options,
 	/* hostname */
 	hostname = url + strlen(LDAP_URL);
 	if (*hostname == '/')		/* no hostname? */
-		hostname = "localhost"; /* the default */
+		hostname = DefaultHost; /* the default */
 
 	/* dn, "distinguished name" */
 	p = strchr(url + strlen(LDAP_URL), '/');

@@ -4,7 +4,7 @@
  * External declarations pertaining to backend/utils/misc/guc.c and
  * backend/utils/misc/guc-file.l
  *
- * Copyright (c) 2000-2010, PostgreSQL Global Development Group
+ * Copyright (c) 2000-2011, PostgreSQL Global Development Group
  * Written by Peter Eisentraut <peter_e@gmx.net>.
  *
  * src/include/utils/guc.h
@@ -97,6 +97,26 @@ typedef enum
 } GucSource;
 
 /*
+ * Parsing the configuation file will return a list of name-value pairs
+ */
+typedef struct ConfigVariable
+{
+	char       *name;
+	char       *value;
+	char	   *filename;
+	int			sourceline;
+	struct ConfigVariable  *next;
+} ConfigVariable;
+
+extern bool ParseConfigFile(const char *config_file, const char *calling_file,
+				int depth, int elevel,
+				ConfigVariable **head_p, ConfigVariable **tail_p);
+extern bool ParseConfigFp(FILE *fp, const char *config_file,
+			  int depth, int elevel,
+			  ConfigVariable **head_p, ConfigVariable **tail_p);
+extern void FreeConfigVariables(ConfigVariable *list);
+
+/*
  * Enum values are made up of an array of name-value pairs
  */
 struct config_enum_entry
@@ -176,10 +196,12 @@ extern int	log_temp_files;
 
 extern int	num_temp_buffers;
 
+extern char *data_directory;
 extern char *ConfigFileName;
 extern char *HbaFileName;
 extern char *IdentFileName;
 extern char *external_pid_file;
+extern char *XactIsoLevel_string;
 
 extern char *application_name;
 

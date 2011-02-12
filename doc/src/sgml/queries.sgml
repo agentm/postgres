@@ -686,8 +686,9 @@ SELECT *
       AS t1(proname name, prosrc text)
     WHERE proname LIKE 'bytea%';
 </programlisting>
-     The <literal>dblink</> function executes a remote query (see
-     <filename>contrib/dblink</>).  It is declared to return
+     The <xref linkend="CONTRIB-DBLINK-FUNCTION"> function
+     (part of the <xref linkend="dblink"> module>) executes
+     a remote query.  It is declared to return
      <type>record</> since it might be used for any kind of query.
      The actual column set must be specified in the calling query so
      that the parser knows, for example, what <literal>*</> should
@@ -979,7 +980,7 @@ SELECT product_id, p.name, (sum(s.units) * (p.price - p.cost)) AS profit
   </sect2>
 
   <sect2 id="queries-window">
-   <title>Window Function Processing</>
+   <title>Window Function Processing</title>
 
    <indexterm zone="queries-window">
     <primary>window function</primary>
@@ -1525,7 +1526,7 @@ SELECT <replaceable>select_list</replaceable> FROM <replaceable>table_expression
 
 
  <sect1 id="queries-with">
-  <title><literal>WITH</literal> Queries</title>
+  <title><literal>WITH</literal> Queries (Common Table Expressions)</title>
 
   <indexterm zone="queries-with">
    <primary>WITH</primary>
@@ -1539,7 +1540,8 @@ SELECT <replaceable>select_list</replaceable> FROM <replaceable>table_expression
 
   <para>
    <literal>WITH</> provides a way to write subqueries for use in a larger
-   query.  The subqueries can be thought of as defining
+   query.  The subqueries, which are often referred to as Common Table
+   Expressions or <acronym>CTE</acronym>s, can be thought of as defining
    temporary tables that exist just for this query.  One use of this feature
    is to break down complicated queries into simpler parts.  An example is:
 

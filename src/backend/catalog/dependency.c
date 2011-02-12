@@ -4,7 +4,7 @@
  *	  Routines to support inter-object dependencies.
  *
  *
- * Portions Copyright (c) 1996-2010, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2011, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -28,14 +28,18 @@
 #include "catalog/pg_attrdef.h"
 #include "catalog/pg_authid.h"
 #include "catalog/pg_cast.h"
+#include "catalog/pg_collation.h"
+#include "catalog/pg_collation_fn.h"
 #include "catalog/pg_constraint.h"
 #include "catalog/pg_conversion.h"
 #include "catalog/pg_conversion_fn.h"
 #include "catalog/pg_database.h"
 #include "catalog/pg_default_acl.h"
 #include "catalog/pg_depend.h"
+#include "catalog/pg_extension.h"
 #include "catalog/pg_foreign_data_wrapper.h"
 #include "catalog/pg_foreign_server.h"
+#include "catalog/pg_foreign_table.h"
 #include "catalog/pg_language.h"
 #include "catalog/pg_largeobject.h"
 #include "catalog/pg_namespace.h"
@@ -55,6 +59,7 @@
 #include "commands/comment.h"
 #include "commands/dbcommands.h"
 #include "commands/defrem.h"
+#include "commands/extension.h"
 #include "commands/proclang.h"
 #include "commands/schemacmds.h"
 #include "commands/seclabel.h"
@@ -92,6 +97,7 @@ typedef struct
 #define DEPFLAG_NORMAL		0x0002		/* reached via normal dependency */
 #define DEPFLAG_AUTO		0x0004		/* reached via auto dependency */
 #define DEPFLAG_INTERNAL	0x0008		/* reached via internal dependency */
+#define DEPFLAG_EXTENSION	0x0010		/* reached via extension dependency */
 
 
 /* expansible list of ObjectAddresses */
@@ -129,6 +135,7 @@ static const Oid object_classes[MAX_OCLASS] = {
 	ProcedureRelationId,		/* OCLASS_PROC */
 	TypeRelationId,				/* OCLASS_TYPE */
 	CastRelationId,				/* OCLASS_CAST */
+	CollationRelationId,		/* OCLASS_COLLATION */
 	ConstraintRelationId,		/* OCLASS_CONSTRAINT */
 	ConversionRelationId,		/* OCLASS_CONVERSION */
 	AttrDefaultRelationId,		/* OCLASS_DEFAULT */
@@ -152,7 +159,8 @@ static const Oid object_classes[MAX_OCLASS] = {
 	ForeignDataWrapperRelationId,		/* OCLASS_FDW */
 	ForeignServerRelationId,	/* OCLASS_FOREIGN_SERVER */
 	UserMappingRelationId,		/* OCLASS_USER_MAPPING */
-	DefaultAclRelationId		/* OCLASS_DEFACL */
+	DefaultAclRelationId,		/* OCLASS_DEFACL */
+	ExtensionRelationId 		/* OCLASS_EXTENSION */
 };
 
 
@@ -549,10 +557,12 @@ findDependentObjects(const ObjectAddress *object,
 				/* no problem */
 				break;
 			case DEPENDENCY_INTERNAL:
+			case DEPENDENCY_EXTENSION:
 
 				/*
 				 * This object is part of the internal implementation of
-				 * another object.	We have three cases:
+				 * another object, or is part of the extension that is the
+				 * other object.  We have three cases:
 				 *
 				 * 1. At the outermost recursion level, disallow the DROP. (We
 				 * just ereport here, rather than proceeding, since no other
@@ -724,6 +734,9 @@ findDependentObjects(const ObjectAddress *object,
 			case DEPENDENCY_INTERNAL:
 				subflags = DEPFLAG_INTERNAL;
 				break;
+			case DEPENDENCY_EXTENSION:
+				subflags = DEPFLAG_EXTENSION;
+				break;
 			case DEPENDENCY_PIN:
 
 				/*
@@ -834,10 +847,12 @@ reportDependentObjects(const ObjectAddresses *targetObjects,
 
 		/*
 		 * If, at any stage of the recursive search, we reached the object via
-		 * an AUTO or INTERNAL dependency, then it's okay to delete it even in
-		 * RESTRICT mode.
+		 * an AUTO, INTERNAL, or EXTENSION dependency, then it's okay to
+		 * delete it even in RESTRICT mode.
 		 */
-		if (extra->flags & (DEPFLAG_AUTO | DEPFLAG_INTERNAL))
+		if (extra->flags & (DEPFLAG_AUTO |
+							DEPFLAG_INTERNAL |
+							DEPFLAG_EXTENSION))
 		{
 			/*
 			 * auto-cascades are reported at DEBUG2, not msglevel.	We don't
@@ -1063,6 +1078,10 @@ doDeletion(const ObjectAddress *object)
 			DropCastById(object->objectId);
 			break;
 
+		case OCLASS_COLLATION:
+			RemoveCollationById(object->objectId);
+			break;
+
 		case OCLASS_CONSTRAINT:
 			RemoveConstraintById(object->objectId);
 			break;
@@ -1152,6 +1171,10 @@ doDeletion(const ObjectAddress *object)
 			RemoveDefaultACLById(object->objectId);
 			break;
 
+		case OCLASS_EXTENSION:
+			RemoveExtensionById(object->objectId);
+			break;
+
 		default:
 			elog(ERROR, "unrecognized object class: %u",
 				 object->classId);
@@ -1238,6 +1261,12 @@ recordDependencyOnExpr(const ObjectAddress *depender,
  * range table.  An additional frammish is that dependencies on that
  * relation (or its component columns) will be marked with 'self_behavior',
  * whereas 'behavior' is used for everything else.
+ *
+ * NOTE: the caller should ensure that a whole-table dependency on the
+ * specified relation is created separately, if one is needed.  In particular,
+ * a whole-row Var "relation.*" will not cause this routine to emit any
+ * dependency item.  This is appropriate behavior for subexpressions of an
+ * ordinary query, so other cases need to cope as necessary.
  */
 void
 recordDependencyOnSingleRelExpr(const ObjectAddress *depender,
@@ -1350,7 +1379,14 @@ find_expr_references_walker(Node *node,
 
 		/*
 		 * A whole-row Var references no specific columns, so adds no new
-		 * dependency.
+		 * dependency.  (We assume that there is a whole-table dependency
+		 * arising from each underlying rangetable entry.  While we could
+		 * record such a dependency when finding a whole-row Var that
+		 * references a relation directly, it's quite unclear how to extend
+		 * that to whole-row Vars for JOINs, so it seems better to leave the
+		 * responsibility with the range table.  Note that this poses some
+		 * risks for identifying dependencies of stand-alone expressions:
+		 * whole-table references may need to be created separately.)
 		 */
 		if (var->varattno == InvalidAttrNumber)
 			return false;
@@ -1388,6 +1424,9 @@ find_expr_references_walker(Node *node,
 		/* A constant must depend on the constant's datatype */
 		add_object_address(OCLASS_TYPE, con->consttype, 0,
 						   context->addrs);
+		if (OidIsValid(con->constcollid))
+			add_object_address(OCLASS_COLLATION, con->constcollid, 0,
+							   context->addrs);
 
 		/*
 		 * If it's a regclass or similar literal referring to an existing
@@ -1454,6 +1493,9 @@ find_expr_references_walker(Node *node,
 		/* A parameter must depend on the parameter's datatype */
 		add_object_address(OCLASS_TYPE, param->paramtype, 0,
 						   context->addrs);
+		if (OidIsValid(param->paramcollation))
+			add_object_address(OCLASS_COLLATION, param->paramcollation, 0,
+							   context->addrs);
 	}
 	else if (IsA(node, FuncExpr))
 	{
@@ -1522,6 +1564,13 @@ find_expr_references_walker(Node *node,
 
 		/* since there is no function dependency, need to depend on type */
 		add_object_address(OCLASS_TYPE, relab->resulttype, 0,
+						   context->addrs);
+	}
+	else if (IsA(node, CollateClause))
+	{
+		CollateClause *coll = (CollateClause *) node;
+
+		add_object_address(OCLASS_COLLATION, coll->collOid, 0,
 						   context->addrs);
 	}
 	else if (IsA(node, CoerceViaIO))
@@ -1623,6 +1672,14 @@ find_expr_references_walker(Node *node,
 					{
 						add_object_address(OCLASS_TYPE, lfirst_oid(ct), 0,
 										   context->addrs);
+					}
+					foreach(ct, rte->funccolcollations)
+					{
+						Oid collid = lfirst_oid(ct);
+
+						if (OidIsValid(collid))
+							add_object_address(OCLASS_COLLATION, collid, 0,
+											   context->addrs);
 					}
 					break;
 				default:
@@ -1969,6 +2026,12 @@ free_object_addresses(ObjectAddresses *addrs)
 ObjectClass
 getObjectClass(const ObjectAddress *object)
 {
+	/* only pg_class entries can have nonzero objectSubId */
+	if (object->classId != RelationRelationId &&
+		object->objectSubId != 0)
+		elog(ERROR, "invalid objectSubId 0 for object class %u",
+			 object->classId);
+
 	switch (object->classId)
 	{
 		case RelationRelationId:
@@ -1976,112 +2039,91 @@ getObjectClass(const ObjectAddress *object)
 			return OCLASS_CLASS;
 
 		case ProcedureRelationId:
-			Assert(object->objectSubId == 0);
 			return OCLASS_PROC;
 
 		case TypeRelationId:
-			Assert(object->objectSubId == 0);
 			return OCLASS_TYPE;
 
 		case CastRelationId:
-			Assert(object->objectSubId == 0);
 			return OCLASS_CAST;
 
+		case CollationRelationId:
+			return OCLASS_COLLATION;
+
 		case ConstraintRelationId:
-			Assert(object->objectSubId == 0);
 			return OCLASS_CONSTRAINT;
 
 		case ConversionRelationId:
-			Assert(object->objectSubId == 0);
 			return OCLASS_CONVERSION;
 
 		case AttrDefaultRelationId:
-			Assert(object->objectSubId == 0);
 			return OCLASS_DEFAULT;
 
 		case LanguageRelationId:
-			Assert(object->objectSubId == 0);
 			return OCLASS_LANGUAGE;
 
 		case LargeObjectRelationId:
-			Assert(object->objectSubId == 0);
 			return OCLASS_LARGEOBJECT;
 
 		case OperatorRelationId:
-			Assert(object->objectSubId == 0);
 			return OCLASS_OPERATOR;
 
 		case OperatorClassRelationId:
-			Assert(object->objectSubId == 0);
 			return OCLASS_OPCLASS;
 
 		case OperatorFamilyRelationId:
-			Assert(object->objectSubId == 0);
 			return OCLASS_OPFAMILY;
 
 		case AccessMethodOperatorRelationId:
-			Assert(object->objectSubId == 0);
 			return OCLASS_AMOP;
 
 		case AccessMethodProcedureRelationId:
-			Assert(object->objectSubId == 0);
 			return OCLASS_AMPROC;
 
 		case RewriteRelationId:
-			Assert(object->objectSubId == 0);
 			return OCLASS_REWRITE;
 
 		case TriggerRelationId:
-			Assert(object->objectSubId == 0);
 			return OCLASS_TRIGGER;
 
 		case NamespaceRelationId:
-			Assert(object->objectSubId == 0);
 			return OCLASS_SCHEMA;
 
 		case TSParserRelationId:
-			Assert(object->objectSubId == 0);
 			return OCLASS_TSPARSER;
 
 		case TSDictionaryRelationId:
-			Assert(object->objectSubId == 0);
 			return OCLASS_TSDICT;
 
 		case TSTemplateRelationId:
-			Assert(object->objectSubId == 0);
 			return OCLASS_TSTEMPLATE;
 
 		case TSConfigRelationId:
-			Assert(object->objectSubId == 0);
 			return OCLASS_TSCONFIG;
 
 		case AuthIdRelationId:
-			Assert(object->objectSubId == 0);
 			return OCLASS_ROLE;
 
 		case DatabaseRelationId:
-			Assert(object->objectSubId == 0);
 			return OCLASS_DATABASE;
 
 		case TableSpaceRelationId:
-			Assert(object->objectSubId == 0);
 			return OCLASS_TBLSPACE;
 
 		case ForeignDataWrapperRelationId:
-			Assert(object->objectSubId == 0);
 			return OCLASS_FDW;
 
 		case ForeignServerRelationId:
-			Assert(object->objectSubId == 0);
 			return OCLASS_FOREIGN_SERVER;
 
 		case UserMappingRelationId:
-			Assert(object->objectSubId == 0);
 			return OCLASS_USER_MAPPING;
 
 		case DefaultAclRelationId:
-			Assert(object->objectSubId == 0);
 			return OCLASS_DEFACL;
+
+		case ExtensionRelationId:
+			return OCLASS_EXTENSION;
 	}
 
 	/* shouldn't get here */
@@ -2153,6 +2195,21 @@ getObjectDescription(const ObjectAddress *object)
 
 				systable_endscan(rcscan);
 				heap_close(castDesc, AccessShareLock);
+				break;
+			}
+
+		case OCLASS_COLLATION:
+			{
+				HeapTuple	collTup;
+
+				collTup = SearchSysCache1(COLLOID,
+										 ObjectIdGetDatum(object->objectId));
+				if (!HeapTupleIsValid(collTup))
+					elog(ERROR, "cache lookup failed for collation %u",
+						 object->objectId);
+				appendStringInfo(&buffer, _("collation %s"),
+				 NameStr(((Form_pg_collation) GETSTRUCT(collTup))->collname));
+				ReleaseSysCache(collTup);
 				break;
 			}
 
@@ -2341,13 +2398,17 @@ getObjectDescription(const ObjectAddress *object)
 
 				/*
 				 * translator: %d is the operator strategy (a number), the
-				 * first %s is the textual form of the operator, and the
-				 * second %s is the description of the operator family.
+				 * first two %s's are data type names, the third %s is the
+				 * description of the operator family, and the last %s is the
+				 * textual form of the operator with arguments.
 				 */
-				appendStringInfo(&buffer, _("operator %d %s of %s"),
+				appendStringInfo(&buffer, _("operator %d (%s, %s) of %s: %s"),
 								 amopForm->amopstrategy,
-								 format_operator(amopForm->amopopr),
-								 opfam.data);
+								 format_type_be(amopForm->amoplefttype),
+								 format_type_be(amopForm->amoprighttype),
+								 opfam.data,
+								 format_operator(amopForm->amopopr));
+
 				pfree(opfam.data);
 
 				systable_endscan(amscan);
@@ -2387,14 +2448,18 @@ getObjectDescription(const ObjectAddress *object)
 				getOpFamilyDescription(&opfam, amprocForm->amprocfamily);
 
 				/*
-				 * translator: %d is the function number, the first %s is the
-				 * textual form of the function with arguments, and the second
-				 * %s is the description of the operator family.
+				 * translator: %d is the function number, the first two %s's
+				 * are data type names, the third %s is the description of the
+				 * operator family, and the last %s is the textual form of the
+				 * function with arguments.
 				 */
-				appendStringInfo(&buffer, _("function %d %s of %s"),
+				appendStringInfo(&buffer, _("function %d (%s, %s) of %s: %s"),
 								 amprocForm->amprocnum,
-								 format_procedure(amprocForm->amproc),
-								 opfam.data);
+								 format_type_be(amprocForm->amproclefttype),
+								 format_type_be(amprocForm->amprocrighttype),
+								 opfam.data,
+								 format_procedure(amprocForm->amproc));
+
 				pfree(opfam.data);
 
 				systable_endscan(amscan);
@@ -2681,6 +2746,18 @@ getObjectDescription(const ObjectAddress *object)
 				break;
 			}
 
+		case OCLASS_EXTENSION:
+			{
+				char	   *extname;
+
+				extname = get_extension_name(object->objectId);
+				if (!extname)
+					elog(ERROR, "cache lookup failed for extension %u",
+						 object->objectId);
+				appendStringInfo(&buffer, _("extension %s"), extname);
+				break;
+			}
+
 		default:
 			appendStringInfo(&buffer, "unrecognized object %u %u %d",
 							 object->classId,
@@ -2690,6 +2767,21 @@ getObjectDescription(const ObjectAddress *object)
 	}
 
 	return buffer.data;
+}
+
+/*
+ * getObjectDescriptionOids: as above, except the object is specified by Oids
+ */
+char *
+getObjectDescriptionOids(Oid classid, Oid objid)
+{
+	ObjectAddress	address;
+
+	address.classId = classid;
+	address.objectId = objid;
+	address.objectSubId = 0;
+
+	return getObjectDescription(&address);
 }
 
 /*
@@ -2747,6 +2839,10 @@ getRelationDescription(StringInfo buffer, Oid relid)
 			appendStringInfo(buffer, _("composite type %s"),
 							 relname);
 			break;
+		case RELKIND_FOREIGN_TABLE:
+			appendStringInfo(buffer, _("foreign table %s"),
+							 relname);
+			break;
 		default:
 			/* shouldn't get here */
 			appendStringInfo(buffer, _("relation %s"),
@@ -2793,4 +2889,28 @@ getOpFamilyDescription(StringInfo buffer, Oid opfid)
 
 	ReleaseSysCache(amTup);
 	ReleaseSysCache(opfTup);
+}
+
+/*
+ * SQL-level callable version of getObjectDescription
+ */
+Datum
+pg_describe_object(PG_FUNCTION_ARGS)
+{
+	Oid			classid = PG_GETARG_OID(0);
+	Oid			objid = PG_GETARG_OID(1);
+	int32		subobjid = PG_GETARG_INT32(2);
+	char	   *description = NULL;
+	ObjectAddress address;
+
+	/* for "pinned" items in pg_depend, return null */
+	if (!OidIsValid(classid) && !OidIsValid(objid))
+		PG_RETURN_NULL();
+
+	address.classId = classid;
+	address.objectId = objid;
+	address.objectSubId = subobjid;
+
+	description = getObjectDescription(&address);
+	PG_RETURN_TEXT_P(cstring_to_text(description));
 }

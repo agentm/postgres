@@ -6,7 +6,7 @@
 dnl @synopsis AC_FUNC_ACCEPT_ARGTYPES
 dnl
 dnl Checks the data types of the three arguments to accept(). Results are
-dnl placed into the symbols ACCEPT_TYPE_RETURN and ACCEPT_TYPE_ARG[123], 
+dnl placed into the symbols ACCEPT_TYPE_RETURN and ACCEPT_TYPE_ARG[123],
 dnl consistent with the following example:
 dnl
 dnl       #define ACCEPT_TYPE_RETURN int
@@ -37,7 +37,8 @@ dnl
 # which is *not* 'socklen_t *').  If we detect that, then we assume
 # 'int' as the result, because that ought to work best.
 #
-# On Win32, accept() returns 'unsigned int PASCAL' 
+# On Win32, accept() returns 'unsigned int PASCAL'
+# Win64 uses SOCKET for return and arg1
 
 AC_DEFUN([AC_FUNC_ACCEPT_ARGTYPES],
 [AC_MSG_CHECKING([types of arguments for accept()])
@@ -45,8 +46,8 @@ AC_DEFUN([AC_FUNC_ACCEPT_ARGTYPES],
  [AC_CACHE_VAL(ac_cv_func_accept_arg1,dnl
   [AC_CACHE_VAL(ac_cv_func_accept_arg2,dnl
    [AC_CACHE_VAL(ac_cv_func_accept_arg3,dnl
-    [for ac_cv_func_accept_return in 'int' 'unsigned int PASCAL'; do
-      for ac_cv_func_accept_arg1 in 'int' 'unsigned int'; do
+    [for ac_cv_func_accept_return in 'int' 'unsigned int PASCAL' 'SOCKET'; do
+      for ac_cv_func_accept_arg1 in 'int' 'unsigned int' 'SOCKET'; do
        for ac_cv_func_accept_arg2 in 'struct sockaddr *' 'const struct sockaddr *' 'void *'; do
         for ac_cv_func_accept_arg3 in 'int' 'size_t' 'socklen_t' 'unsigned int' 'void'; do
          AC_TRY_COMPILE(

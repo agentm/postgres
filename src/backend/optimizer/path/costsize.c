@@ -55,7 +55,7 @@
  * the non-cost fields of the passed XXXPath to be filled in.
  *
  *
- * Portions Copyright (c) 1996-2010, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2011, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -76,6 +76,7 @@
 #include "optimizer/cost.h"
 #include "optimizer/pathnode.h"
 #include "optimizer/placeholder.h"
+#include "optimizer/plancat.h"
 #include "optimizer/planmain.h"
 #include "optimizer/restrictinfo.h"
 #include "parser/parsetree.h"
@@ -208,6 +209,7 @@ cost_seqscan(Path *path, PlannerInfo *root,
  *
  * 'index' is the index to be used
  * 'indexQuals' is the list of applicable qual clauses (implicit AND semantics)
+ * 'indexOrderBys' is the list of ORDER BY operators for amcanorderbyop indexes
  * 'outer_rel' is the outer relation when we are considering using the index
  *		scan as the inside of a nestloop join (hence, some of the indexQuals
  *		are join clauses, and we should expect repeated scans of the index);
@@ -217,18 +219,19 @@ cost_seqscan(Path *path, PlannerInfo *root,
  * additional fields of the IndexPath besides startup_cost and total_cost.
  * These fields are needed if the IndexPath is used in a BitmapIndexScan.
  *
+ * indexQuals is a list of RestrictInfo nodes, but indexOrderBys is a list of
+ * bare expressions.
+ *
  * NOTE: 'indexQuals' must contain only clauses usable as index restrictions.
  * Any additional quals evaluated as qpquals may reduce the number of returned
  * tuples, but they won't reduce the number of tuples we have to fetch from
  * the table, so they don't reduce the scan cost.
- *
- * NOTE: as of 8.0, indexQuals is a list of RestrictInfo nodes, where formerly
- * it was a list of bare clause expressions.
  */
 void
 cost_index(IndexPath *path, PlannerInfo *root,
 		   IndexOptInfo *index,
 		   List *indexQuals,
+		   List *indexOrderBys,
 		   RelOptInfo *outer_rel)
 {
 	RelOptInfo *baserel = index->rel;
@@ -262,10 +265,11 @@ cost_index(IndexPath *path, PlannerInfo *root,
 	 * the fraction of main-table tuples we will have to retrieve) and its
 	 * correlation to the main-table tuple order.
 	 */
-	OidFunctionCall8(index->amcostestimate,
+	OidFunctionCall9(index->amcostestimate,
 					 PointerGetDatum(root),
 					 PointerGetDatum(index),
 					 PointerGetDatum(indexQuals),
+					 PointerGetDatum(indexOrderBys),
 					 PointerGetDatum(outer_rel),
 					 PointerGetDatum(&indexStartupCost),
 					 PointerGetDatum(&indexTotalCost),
@@ -1791,6 +1795,7 @@ cost_mergejoin(MergePath *path, PlannerInfo *root, SpecialJoinInfo *sjinfo)
 		ipathkey = (PathKey *) linitial(ipathkeys);
 		/* debugging check */
 		if (opathkey->pk_opfamily != ipathkey->pk_opfamily ||
+			opathkey->pk_collation != ipathkey->pk_collation ||
 			opathkey->pk_strategy != ipathkey->pk_strategy ||
 			opathkey->pk_nulls_first != ipathkey->pk_nulls_first)
 			elog(ERROR, "left and right pathkeys do not match in mergejoin");
@@ -2041,6 +2046,7 @@ cached_scansel(PlannerInfo *root, RestrictInfo *rinfo, PathKey *pathkey)
 	{
 		cache = (MergeScanSelCache *) lfirst(lc);
 		if (cache->opfamily == pathkey->pk_opfamily &&
+			cache->collation == pathkey->pk_collation &&
 			cache->strategy == pathkey->pk_strategy &&
 			cache->nulls_first == pathkey->pk_nulls_first)
 			return cache;
@@ -2050,6 +2056,7 @@ cached_scansel(PlannerInfo *root, RestrictInfo *rinfo, PathKey *pathkey)
 	mergejoinscansel(root,
 					 (Node *) rinfo->clause,
 					 pathkey->pk_opfamily,
+					 pathkey->pk_collation,
 					 pathkey->pk_strategy,
 					 pathkey->pk_nulls_first,
 					 &leftstartsel,
@@ -2062,6 +2069,7 @@ cached_scansel(PlannerInfo *root, RestrictInfo *rinfo, PathKey *pathkey)
 
 	cache = (MergeScanSelCache *) palloc(sizeof(MergeScanSelCache));
 	cache->opfamily = pathkey->pk_opfamily;
+	cache->collation = pathkey->pk_collation;
 	cache->strategy = pathkey->pk_strategy;
 	cache->nulls_first = pathkey->pk_nulls_first;
 	cache->leftstartsel = leftstartsel;
@@ -2897,12 +2905,20 @@ adjust_semi_join(PlannerInfo *root, JoinPath *path, SpecialJoinInfo *sjinfo,
 	 */
 	if (indexed_join_quals)
 	{
-		List	   *nrclauses;
+		if (path->joinrestrictinfo != NIL)
+		{
+			List	   *nrclauses;
 
-		nrclauses = select_nonredundant_join_clauses(root,
-													 path->joinrestrictinfo,
-													 path->innerjoinpath);
-		*indexed_join_quals = (nrclauses == NIL);
+			nrclauses = select_nonredundant_join_clauses(root,
+														 path->joinrestrictinfo,
+														 path->innerjoinpath);
+			*indexed_join_quals = (nrclauses == NIL);
+		}
+		else
+		{
+			/* a clauseless join does NOT qualify */
+			*indexed_join_quals = false;
+		}
 	}
 
 	return true;
@@ -2978,7 +2994,7 @@ approx_tuple_count(PlannerInfo *root, JoinPath *path, List *quals)
  *		Set the size estimates for the given base relation.
  *
  * The rel's targetlist and restrictinfo list must have been constructed
- * already.
+ * already, and rel->tuples must be set.
  *
  * We set the following fields of the rel node:
  *	rows: the estimated number of output tuples (after applying
@@ -3144,6 +3160,76 @@ set_joinrel_size_estimates(PlannerInfo *root, RelOptInfo *rel,
 }
 
 /*
+ * set_subquery_size_estimates
+ *		Set the size estimates for a base relation that is a subquery.
+ *
+ * The rel's targetlist and restrictinfo list must have been constructed
+ * already, and the plan for the subquery must have been completed.
+ * We look at the subquery's plan and PlannerInfo to extract data.
+ *
+ * We set the same fields as set_baserel_size_estimates.
+ */
+void
+set_subquery_size_estimates(PlannerInfo *root, RelOptInfo *rel,
+							PlannerInfo *subroot)
+{
+	RangeTblEntry *rte;
+	ListCell   *lc;
+
+	/* Should only be applied to base relations that are subqueries */
+	Assert(rel->relid > 0);
+	rte = planner_rt_fetch(rel->relid, root);
+	Assert(rte->rtekind == RTE_SUBQUERY);
+
+	/* Copy raw number of output rows from subplan */
+	rel->tuples = rel->subplan->plan_rows;
+
+	/*
+	 * Compute per-output-column width estimates by examining the subquery's
+	 * targetlist.  For any output that is a plain Var, get the width estimate
+	 * that was made while planning the subquery.  Otherwise, fall back on a
+	 * datatype-based estimate.
+	 */
+	foreach(lc, subroot->parse->targetList)
+	{
+		TargetEntry *te = (TargetEntry *) lfirst(lc);
+		Node	   *texpr = (Node *) te->expr;
+		int32		item_width;
+
+		Assert(IsA(te, TargetEntry));
+		/* junk columns aren't visible to upper query */
+		if (te->resjunk)
+			continue;
+
+		/*
+		 * XXX This currently doesn't work for subqueries containing set
+		 * operations, because the Vars in their tlists are bogus references
+		 * to the first leaf subquery, which wouldn't give the right answer
+		 * even if we could still get to its PlannerInfo.  So fall back on
+		 * datatype in that case.
+		 */
+		if (IsA(texpr, Var) &&
+			subroot->parse->setOperations == NULL)
+		{
+			Var	   *var = (Var *) texpr;
+			RelOptInfo *subrel = find_base_rel(subroot, var->varno);
+
+			item_width = subrel->attr_widths[var->varattno - subrel->min_attr];
+		}
+		else
+		{
+			item_width = get_typavgwidth(exprType(texpr), exprTypmod(texpr));
+		}
+		Assert(item_width > 0);
+		Assert(te->resno >= rel->min_attr && te->resno <= rel->max_attr);
+		rel->attr_widths[te->resno - rel->min_attr] = item_width;
+	}
+
+	/* Now estimate number of output rows, etc */
+	set_baserel_size_estimates(root, rel);
+}
+
+/*
  * set_function_size_estimates
  *		Set the size estimates for a base relation that is a function call.
  *
@@ -3243,11 +3329,17 @@ set_cte_size_estimates(PlannerInfo *root, RelOptInfo *rel, Plan *cteplan)
  * set_rel_width
  *		Set the estimated output width of a base relation.
  *
+ * The estimated output width is the sum of the per-attribute width estimates
+ * for the actually-referenced columns, plus any PHVs or other expressions
+ * that have to be calculated at this relation.  This is the amount of data
+ * we'd need to pass upwards in case of a sort, hash, etc.
+ *
  * NB: this works best on plain relations because it prefers to look at
- * real Vars.  It will fail to make use of pg_statistic info when applied
- * to a subquery relation, even if the subquery outputs are simple vars
- * that we could have gotten info for.	Is it worth trying to be smarter
- * about subqueries?
+ * real Vars.  For subqueries, set_subquery_size_estimates will already have
+ * copied up whatever per-column estimates were made within the subquery,
+ * and for other types of rels there isn't much we can do anyway.  We fall
+ * back on (fairly stupid) datatype-based width estimates if we can't get
+ * any better number.
  *
  * The per-attribute width estimates are cached for possible re-use while
  * building join relations.
@@ -3257,6 +3349,7 @@ set_rel_width(PlannerInfo *root, RelOptInfo *rel)
 {
 	Oid			reloid = planner_rt_fetch(rel->relid, root)->relid;
 	int32		tuple_width = 0;
+	bool		have_wholerow_var = false;
 	ListCell   *lc;
 
 	foreach(lc, rel->reltargetlist)
@@ -3276,8 +3369,18 @@ set_rel_width(PlannerInfo *root, RelOptInfo *rel)
 			ndx = var->varattno - rel->min_attr;
 
 			/*
-			 * The width probably hasn't been cached yet, but may as well
-			 * check
+			 * If it's a whole-row Var, we'll deal with it below after we
+			 * have already cached as many attr widths as possible.
+			 */
+			if (var->varattno == 0)
+			{
+				have_wholerow_var = true;
+				continue;
+			}
+
+			/*
+			 * The width may have been cached already (especially if it's
+			 * a subquery), so don't duplicate effort.
 			 */
 			if (rel->attr_widths[ndx] > 0)
 			{
@@ -3286,7 +3389,7 @@ set_rel_width(PlannerInfo *root, RelOptInfo *rel)
 			}
 
 			/* Try to get column width from statistics */
-			if (reloid != InvalidOid)
+			if (reloid != InvalidOid && var->varattno > 0)
 			{
 				item_width = get_attavgwidth(reloid, var->varattno);
 				if (item_width > 0)
@@ -3327,6 +3430,39 @@ set_rel_width(PlannerInfo *root, RelOptInfo *rel)
 			tuple_width += item_width;
 		}
 	}
+
+	/*
+	 * If we have a whole-row reference, estimate its width as the sum of
+	 * per-column widths plus sizeof(HeapTupleHeaderData).
+	 */
+	if (have_wholerow_var)
+	{
+		int32	wholerow_width = sizeof(HeapTupleHeaderData);
+
+		if (reloid != InvalidOid)
+		{
+			/* Real relation, so estimate true tuple width */
+			wholerow_width += get_relation_data_width(reloid,
+													  rel->attr_widths - rel->min_attr);
+		}
+		else
+		{
+			/* Do what we can with info for a phony rel */
+			AttrNumber	i;
+
+			for (i = 1; i <= rel->max_attr; i++)
+				wholerow_width += rel->attr_widths[i - rel->min_attr];
+		}
+
+		rel->attr_widths[0 - rel->min_attr] = wholerow_width;
+
+		/*
+		 * Include the whole-row Var as part of the output tuple.  Yes,
+		 * that really is what happens at runtime.
+		 */
+		tuple_width += wholerow_width;
+	}
+
 	Assert(tuple_width >= 0);
 	rel->width = tuple_width;
 }

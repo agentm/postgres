@@ -3,7 +3,7 @@
  * analyze.c
  *	  the Postgres statistics generator
  *
- * Portions Copyright (c) 1996-2010, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2011, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -36,6 +36,7 @@
 #include "pgstat.h"
 #include "postmaster/autovacuum.h"
 #include "storage/bufmgr.h"
+#include "storage/lmgr.h"
 #include "storage/proc.h"
 #include "storage/procarray.h"
 #include "utils/acl.h"
@@ -148,7 +149,19 @@ analyze_rel(Oid relid, VacuumStmt *vacstmt,
 	 * matter if we ever try to accumulate stats on dead tuples.) If the rel
 	 * has been dropped since we last saw it, we don't need to process it.
 	 */
-	onerel = try_relation_open(relid, ShareUpdateExclusiveLock);
+	if (!(vacstmt->options & VACOPT_NOWAIT))
+		onerel = try_relation_open(relid, ShareUpdateExclusiveLock);
+	else if (ConditionalLockRelationOid(relid, ShareUpdateExclusiveLock))
+		onerel = try_relation_open(relid, NoLock);
+	else
+	{
+		onerel = NULL;
+		if (IsAutoVacuumWorkerProcess() && Log_autovacuum_min_duration >= 0)
+			ereport(LOG,
+					(errcode(ERRCODE_LOCK_NOT_AVAILABLE),
+					 errmsg("skipping analyze of \"%s\" --- lock not available",
+						vacstmt->relation->relname)));
+	}
 	if (!onerel)
 		return;
 
@@ -187,7 +200,7 @@ analyze_rel(Oid relid, VacuumStmt *vacstmt,
 		/* No need for a WARNING if we already complained during VACUUM */
 		if (!(vacstmt->options & VACOPT_VACUUM))
 			ereport(WARNING,
-					(errmsg("skipping \"%s\" --- cannot analyze indexes, views, or special system tables",
+					(errmsg("skipping \"%s\" --- cannot analyze non-tables or special system tables",
 							RelationGetRelationName(onerel))));
 		relation_close(onerel, ShareUpdateExclusiveLock);
 		return;
@@ -695,6 +708,12 @@ compute_index_stats(Relation onerel, double totalrows,
 		{
 			HeapTuple	heapTuple = rows[rowno];
 
+			/*
+			 * Reset the per-tuple context each time, to reclaim any cruft
+			 * left behind by evaluating the predicate or index expressions.
+			 */
+			ResetExprContext(econtext);
+
 			/* Set up for predicate or expression evaluation */
 			ExecStoreTuple(heapTuple, slot, InvalidBuffer, false);
 
@@ -719,15 +738,26 @@ compute_index_stats(Relation onerel, double totalrows,
 							   isnull);
 
 				/*
-				 * Save just the columns we care about.
+				 * Save just the columns we care about.  We copy the values
+				 * into ind_context from the estate's per-tuple context.
 				 */
 				for (i = 0; i < attr_cnt; i++)
 				{
 					VacAttrStats *stats = thisdata->vacattrstats[i];
 					int			attnum = stats->attr->attnum;
 
-					exprvals[tcnt] = values[attnum - 1];
-					exprnulls[tcnt] = isnull[attnum - 1];
+					if (isnull[attnum - 1])
+					{
+						exprvals[tcnt] = (Datum) 0;
+						exprnulls[tcnt] = true;
+					}
+					else
+					{
+						exprvals[tcnt] = datumCopy(values[attnum - 1],
+												   stats->attrtype->typbyval,
+												   stats->attrtype->typlen);
+						exprnulls[tcnt] = false;
+					}
 					tcnt++;
 				}
 			}
@@ -832,11 +862,13 @@ examine_attribute(Relation onerel, int attnum, Node *index_expr)
 	{
 		stats->attrtypid = exprType(index_expr);
 		stats->attrtypmod = exprTypmod(index_expr);
+		stats->attrcollation = exprCollation(index_expr);
 	}
 	else
 	{
 		stats->attrtypid = attr->atttypid;
 		stats->attrtypmod = attr->atttypmod;
+		stats->attrcollation = attr->attcollation;
 	}
 
 	typtuple = SearchSysCache1(TYPEOID, ObjectIdGetDatum(stats->attrtypid));
@@ -1794,7 +1826,8 @@ std_typanalyze(VacAttrStats *stats)
 	/* Look for default "<" and "=" operators for column's type */
 	get_sort_group_operators(stats->attrtypid,
 							 false, false, false,
-							 &ltopr, &eqopr, NULL);
+							 &ltopr, &eqopr, NULL,
+							 NULL);
 
 	/* If column has no "=" operator, we can't do much of anything */
 	if (!OidIsValid(eqopr))
@@ -1898,6 +1931,7 @@ compute_minimal_stats(VacAttrStatsP stats,
 	track_cnt = 0;
 
 	fmgr_info(mystats->eqfunc, &f_cmpeq);
+	fmgr_info_collation(stats->attrcollation, &f_cmpeq);
 
 	for (i = 0; i < samplerows; i++)
 	{
@@ -2219,6 +2253,7 @@ compute_scalar_stats(VacAttrStatsP stats,
 
 	SelectSortFunction(mystats->ltopr, false, &cmpFn, &cmpFlags);
 	fmgr_info(cmpFn, &f_cmpfn);
+	fmgr_info_collation(stats->attrcollation, &f_cmpfn);
 
 	/* Initial scan to find sortable values */
 	for (i = 0; i < samplerows; i++)

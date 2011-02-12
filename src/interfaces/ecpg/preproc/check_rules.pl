@@ -3,7 +3,7 @@
 # test parser generater for ecpg
 # call with backend parser as stdin
 #
-# Copyright (c) 2009-2010, PostgreSQL Global Development Group
+# Copyright (c) 2009-2011, PostgreSQL Global Development Group
 #
 # Written by Michael Meskes <meskes@postgresql.org>
 #
@@ -102,7 +102,7 @@ while (<GRAM>) {
 			$block = $block . $arr[$fieldIndexer];
 		}
 	}
-} 
+}
 
 close GRAM;
 
@@ -113,7 +113,7 @@ line: while (<ECPG>) {
     @Fld = split(' ', $_, -1);
 
     if (!/^ECPG:/) {
-	next line; 
+	next line;
     }
 
     if ($found{$Fld[2]} ne 'found') {

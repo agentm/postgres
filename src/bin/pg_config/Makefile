@@ -2,7 +2,7 @@
 #
 # Makefile for src/bin/pg_config
 #
-# Copyright (c) 1998-2010, PostgreSQL Global Development Group
+# Copyright (c) 1998-2011, PostgreSQL Global Development Group
 #
 # src/bin/pg_config/Makefile
 #
@@ -31,9 +31,9 @@ override CPPFLAGS += -DVAL_LDFLAGS_EX="\"$(LDFLAGS_EX)\""
 override CPPFLAGS += -DVAL_LDFLAGS_SL="\"$(LDFLAGS_SL)\""
 override CPPFLAGS += -DVAL_LIBS="\"$(LIBS)\""
 
-all: submake-libpgport pg_config
+all: pg_config
 
-pg_config: $(OBJS)
+pg_config: $(OBJS) | submake-libpgport
 	$(CC) $(CFLAGS) $(OBJS) $(LDFLAGS) $(LDFLAGS_EX) $(LIBS) -o $@$(X)
 
 install: all installdirs

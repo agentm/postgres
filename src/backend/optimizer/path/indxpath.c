@@ -4,7 +4,7 @@
  *	  Routines to determine which indexes are usable for scanning a
  *	  given relation, and create Paths accordingly.
  *
- * Portions Copyright (c) 1996-2010, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2011, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -23,6 +23,7 @@
 #include "catalog/pg_opfamily.h"
 #include "catalog/pg_type.h"
 #include "nodes/makefuncs.h"
+#include "nodes/nodeFuncs.h"
 #include "optimizer/clauses.h"
 #include "optimizer/cost.h"
 #include "optimizer/pathnode.h"
@@ -36,11 +37,6 @@
 #include "utils/pg_locale.h"
 #include "utils/selfuncs.h"
 
-
-/*
- * DoneMatchingIndexKeys() - MACRO
- */
-#define DoneMatchingIndexKeys(families) (families[0] == InvalidOid)
 
 #define IsBooleanOpfamily(opfamily) \
 	((opfamily) == BOOL_BTREE_FAM_OID || (opfamily) == BOOL_HASH_FAM_OID)
@@ -83,7 +79,7 @@ static PathClauseUsage *classify_index_clause_usage(Path *path,
 static void find_indexpath_quals(Path *bitmapqual, List **quals, List **preds);
 static int	find_list_position(Node *node, List **nodelist);
 static bool match_clause_to_indexcol(IndexOptInfo *index,
-						 int indexcol, Oid opfamily,
+						 int indexcol,
 						 RestrictInfo *rinfo,
 						 Relids outer_relids,
 						 SaOpControl saop_control);
@@ -94,6 +90,9 @@ static bool match_rowcompare_to_indexcol(IndexOptInfo *index,
 							 Oid opfamily,
 							 RowCompareExpr *clause,
 							 Relids outer_relids);
+static List *match_index_to_pathkeys(IndexOptInfo *index, List *pathkeys);
+static Expr *match_clause_to_ordering_op(IndexOptInfo *index,
+							int indexcol, Expr *clause, Oid pk_opfamily);
 static Relids indexable_outerrelids(PlannerInfo *root, RelOptInfo *rel);
 static bool matches_any_index(RestrictInfo *rinfo, RelOptInfo *rel,
 				  Relids outer_relids);
@@ -101,15 +100,15 @@ static List *find_clauses_for_join(PlannerInfo *root, RelOptInfo *rel,
 					  Relids outer_relids, bool isouterjoin);
 static bool match_boolean_index_clause(Node *clause, int indexcol,
 						   IndexOptInfo *index);
-static bool match_special_index_operator(Expr *clause, Oid opfamily,
+static bool match_special_index_operator(Expr *clause, Oid idxcolcollation, Oid opfamily,
 							 bool indexkey_on_left);
 static Expr *expand_boolean_index_clause(Node *clause, int indexcol,
 							IndexOptInfo *index);
-static List *expand_indexqual_opclause(RestrictInfo *rinfo, Oid opfamily);
+static List *expand_indexqual_opclause(RestrictInfo *rinfo, Oid opfamily, Oid collation);
 static RestrictInfo *expand_indexqual_rowcompare(RestrictInfo *rinfo,
 							IndexOptInfo *index,
 							int indexcol);
-static List *prefix_quals(Node *leftop, Oid opfamily,
+static List *prefix_quals(Node *leftop, Oid opfamily, Oid collation,
 			 Const *prefix, Pattern_Prefix_Status pstatus);
 static List *network_prefix_quals(Node *leftop, Oid expr_op, Oid opfamily,
 					 Datum rightop);
@@ -198,8 +197,8 @@ create_index_paths(PlannerInfo *root, RelOptInfo *rel)
 			add_path(rel, (Path *) ipath);
 
 		if (ipath->indexinfo->amhasgetbitmap &&
-			ipath->indexselectivity < 1.0 &&
-			!ScanDirectionIsBackward(ipath->indexscandir))
+			(ipath->path.pathkeys == NIL ||
+			 ipath->indexselectivity < 1.0))
 			bitindexpaths = lappend(bitindexpaths, ipath);
 	}
 
@@ -291,6 +290,7 @@ find_usable_indexes(PlannerInfo *root, RelOptInfo *rel,
 		IndexOptInfo *index = (IndexOptInfo *) lfirst(ilist);
 		IndexPath  *ipath;
 		List	   *restrictclauses;
+		List	   *orderbyclauses;
 		List	   *index_pathkeys;
 		List	   *useful_pathkeys;
 		bool		useful_predicate;
@@ -385,7 +385,7 @@ find_usable_indexes(PlannerInfo *root, RelOptInfo *rel,
 		 * how many of them are actually useful for this query.  This is not
 		 * relevant unless we are at top level.
 		 */
-		index_is_ordered = OidIsValid(index->fwdsortop[0]);
+		index_is_ordered = (index->sortopfamily != NULL);
 		if (index_is_ordered && possibly_useful_pathkeys &&
 			istoplevel && outer_rel == NULL)
 		{
@@ -393,9 +393,24 @@ find_usable_indexes(PlannerInfo *root, RelOptInfo *rel,
 												  ForwardScanDirection);
 			useful_pathkeys = truncate_useless_pathkeys(root, rel,
 														index_pathkeys);
+			orderbyclauses = NIL;
+		}
+		else if (index->amcanorderbyop && possibly_useful_pathkeys &&
+				 istoplevel && outer_rel == NULL && scantype != ST_BITMAPSCAN)
+		{
+			/* see if we can generate ordering operators for query_pathkeys */
+			orderbyclauses = match_index_to_pathkeys(index,
+													 root->query_pathkeys);
+			if (orderbyclauses)
+				useful_pathkeys = root->query_pathkeys;
+			else
+				useful_pathkeys = NIL;
 		}
 		else
+		{
 			useful_pathkeys = NIL;
+			orderbyclauses = NIL;
+		}
 
 		/*
 		 * 3. Generate an indexscan path if there are relevant restriction
@@ -407,6 +422,7 @@ find_usable_indexes(PlannerInfo *root, RelOptInfo *rel,
 		{
 			ipath = create_index_path(root, index,
 									  restrictclauses,
+									  orderbyclauses,
 									  useful_pathkeys,
 									  index_is_ordered ?
 									  ForwardScanDirection :
@@ -430,6 +446,7 @@ find_usable_indexes(PlannerInfo *root, RelOptInfo *rel,
 			{
 				ipath = create_index_path(root, index,
 										  restrictclauses,
+										  NIL,
 										  useful_pathkeys,
 										  BackwardScanDirection,
 										  outer_rel);
@@ -1052,17 +1069,15 @@ group_clauses_by_indexkey(IndexOptInfo *index,
 {
 	List	   *clausegroup_list = NIL;
 	bool		found_outer_clause = false;
-	int			indexcol = 0;
-	Oid		   *families = index->opfamily;
+	int			indexcol;
 
 	*found_clause = false;		/* default result */
 
 	if (clauses == NIL && outer_clauses == NIL)
 		return NIL;				/* cannot succeed */
 
-	do
+	for (indexcol = 0; indexcol < index->ncolumns; indexcol++)
 	{
-		Oid			curFamily = families[0];
 		List	   *clausegroup = NIL;
 		ListCell   *l;
 
@@ -1074,7 +1089,6 @@ group_clauses_by_indexkey(IndexOptInfo *index,
 			Assert(IsA(rinfo, RestrictInfo));
 			if (match_clause_to_indexcol(index,
 										 indexcol,
-										 curFamily,
 										 rinfo,
 										 outer_relids,
 										 saop_control))
@@ -1094,7 +1108,6 @@ group_clauses_by_indexkey(IndexOptInfo *index,
 			Assert(IsA(rinfo, RestrictInfo));
 			if (match_clause_to_indexcol(index,
 										 indexcol,
-										 curFamily,
 										 rinfo,
 										 outer_relids,
 										 saop_control))
@@ -1111,11 +1124,7 @@ group_clauses_by_indexkey(IndexOptInfo *index,
 			return NIL;
 
 		clausegroup_list = lappend(clausegroup_list, clausegroup);
-
-		indexcol++;
-		families++;
-
-	} while (!DoneMatchingIndexKeys(families));
+	}
 
 	if (!*found_clause && !found_outer_clause)
 		return NIL;				/* no indexable clauses anywhere */
@@ -1134,7 +1143,9 @@ group_clauses_by_indexkey(IndexOptInfo *index,
  *		   and
  *	  (2)  must contain an operator which is in the same family as the index
  *		   operator for this column, or is a "special" operator as recognized
- *		   by match_special_index_operator().
+ *		   by match_special_index_operator();
+ *         and
+ *    (3)  must match the collation of the index.
  *
  *	  Our definition of "const" is pretty liberal: we allow Vars belonging
  *	  to the caller-specified outer_relids relations (which had better not
@@ -1173,8 +1184,8 @@ group_clauses_by_indexkey(IndexOptInfo *index,
  *
  * 'index' is the index of interest.
  * 'indexcol' is a column number of 'index' (counting from 0).
- * 'opfamily' is the corresponding operator family.
  * 'rinfo' is the clause to be tested (as a RestrictInfo node).
+ * 'outer_relids' lists rels whose Vars can be considered pseudoconstant.
  * 'saop_control' indicates whether ScalarArrayOpExpr clauses can be used.
  *
  * Returns true if the clause can be used with this index key.
@@ -1185,12 +1196,13 @@ group_clauses_by_indexkey(IndexOptInfo *index,
 static bool
 match_clause_to_indexcol(IndexOptInfo *index,
 						 int indexcol,
-						 Oid opfamily,
 						 RestrictInfo *rinfo,
 						 Relids outer_relids,
 						 SaOpControl saop_control)
 {
 	Expr	   *clause = rinfo->clause;
+	Oid			collation = index->indexcollations[indexcol];
+	Oid			opfamily = index->opfamily[indexcol];
 	Node	   *leftop,
 			   *rightop;
 	Relids		left_relids;
@@ -1272,7 +1284,8 @@ match_clause_to_indexcol(IndexOptInfo *index,
 		bms_is_subset(right_relids, outer_relids) &&
 		!contain_volatile_functions(rightop))
 	{
-		if (is_indexable_operator(expr_op, opfamily, true))
+		if (is_indexable_operator(expr_op, opfamily, true) &&
+			(!collation || collation == exprCollation((Node *) clause)))
 			return true;
 
 		/*
@@ -1280,7 +1293,7 @@ match_clause_to_indexcol(IndexOptInfo *index,
 		 * is a "special" indexable operator.
 		 */
 		if (plain_op &&
-			match_special_index_operator(clause, opfamily, true))
+			match_special_index_operator(clause, collation, opfamily, true))
 			return true;
 		return false;
 	}
@@ -1290,14 +1303,15 @@ match_clause_to_indexcol(IndexOptInfo *index,
 		bms_is_subset(left_relids, outer_relids) &&
 		!contain_volatile_functions(leftop))
 	{
-		if (is_indexable_operator(expr_op, opfamily, false))
+		if (is_indexable_operator(expr_op, opfamily, false) &&
+			(!collation || collation == exprCollation((Node *) clause)))
 			return true;
 
 		/*
 		 * If we didn't find a member of the index's opfamily, see whether it
 		 * is a "special" indexable operator.
 		 */
-		if (match_special_index_operator(clause, opfamily, false))
+		if (match_special_index_operator(clause, collation, opfamily, false))
 			return true;
 		return false;
 	}
@@ -1383,6 +1397,9 @@ match_rowcompare_to_indexcol(IndexOptInfo *index,
 	else
 		return false;
 
+	if (index->indexcollations[indexcol] != linitial_oid(clause->collids))
+		return false;
+
 	/* We're good if the operator is the right type of opfamily member */
 	switch (get_op_opfamily_strategy(expr_op, opfamily))
 	{
@@ -1394,6 +1411,179 @@ match_rowcompare_to_indexcol(IndexOptInfo *index,
 	}
 
 	return false;
+}
+
+
+/****************************************************************************
+ *				----  ROUTINES TO CHECK ORDERING OPERATORS  ----
+ ****************************************************************************/
+
+/*
+ * match_index_to_pathkeys
+ *		Test whether an index can produce output ordered according to the
+ *		given pathkeys using "ordering operators".
+ *
+ * If it can, return a list of suitable ORDER BY expressions, each of the form
+ * "indexedcol operator pseudoconstant".  If not, return NIL.
+ */
+static List *
+match_index_to_pathkeys(IndexOptInfo *index, List *pathkeys)
+{
+	List	   *orderbyexprs = NIL;
+	ListCell   *lc1;
+
+	/* Only indexes with the amcanorderbyop property are interesting here */
+	if (!index->amcanorderbyop)
+		return NIL;
+
+	foreach(lc1, pathkeys)
+	{
+		PathKey	   *pathkey = (PathKey *) lfirst(lc1);
+		bool		found = false;
+		ListCell   *lc2;
+
+		/*
+		 * Note: for any failure to match, we just return NIL immediately.
+		 * There is no value in matching just some of the pathkeys.
+		 */
+
+		/* Pathkey must request default sort order for the target opfamily */
+		if (pathkey->pk_strategy != BTLessStrategyNumber ||
+			pathkey->pk_nulls_first)
+			return NIL;
+
+		/* If eclass is volatile, no hope of using an indexscan */
+		if (pathkey->pk_eclass->ec_has_volatile)
+			return NIL;
+
+		/* Try to match eclass member expression(s) to index */
+		foreach(lc2, pathkey->pk_eclass->ec_members)
+		{
+			EquivalenceMember *member = (EquivalenceMember *) lfirst(lc2);
+			int		indexcol;
+
+			/* No possibility of match if it references other relations */
+			if (!bms_equal(member->em_relids, index->rel->relids))
+				continue;
+
+			for (indexcol = 0; indexcol < index->ncolumns; indexcol++)
+			{
+				Expr   *expr;
+
+				expr = match_clause_to_ordering_op(index,
+												   indexcol,
+												   member->em_expr,
+												   pathkey->pk_opfamily);
+				if (expr)
+				{
+					orderbyexprs = lappend(orderbyexprs, expr);
+					found = true;
+					break;
+				}
+			}
+
+			if (found)			/* don't want to look at remaining members */
+				break;
+		}
+
+		if (!found)				/* fail if no match for this pathkey */
+			return NIL;
+	}
+
+	return orderbyexprs;		/* success! */
+}
+
+/*
+ * match_clause_to_ordering_op
+ *	  Determines whether an ordering operator expression matches an
+ *	  index column.
+ *
+ *	  This is similar to, but simpler than, match_clause_to_indexcol.
+ *	  We only care about simple OpExpr cases.  The input is a bare
+ *	  expression that is being ordered by, which must be of the form
+ *	  (indexkey op const) or (const op indexkey) where op is an ordering
+ *	  operator for the column's opfamily.
+ *
+ * 'index' is the index of interest.
+ * 'indexcol' is a column number of 'index' (counting from 0).
+ * 'clause' is the ordering expression to be tested.
+ * 'pk_opfamily' is the btree opfamily describing the required sort order.
+ *
+ * If successful, return 'clause' as-is if the indexkey is on the left,
+ * otherwise a commuted copy of 'clause'.  If no match, return NULL.
+ */
+static Expr *
+match_clause_to_ordering_op(IndexOptInfo *index,
+							int indexcol,
+							Expr *clause,
+							Oid pk_opfamily)
+{
+	Oid			opfamily = index->opfamily[indexcol];
+	Node	   *leftop,
+			   *rightop;
+	Oid			expr_op;
+	Oid			sortfamily;
+	bool		commuted;
+
+	/*
+	 * Clause must be a binary opclause.
+	 */
+	if (!is_opclause(clause))
+		return NULL;
+	leftop = get_leftop(clause);
+	rightop = get_rightop(clause);
+	if (!leftop || !rightop)
+		return NULL;
+	expr_op = ((OpExpr *) clause)->opno;
+
+	/*
+	 * Check for clauses of the form: (indexkey operator constant) or
+	 * (constant operator indexkey).
+	 */
+	if (match_index_to_operand(leftop, indexcol, index) &&
+		!contain_var_clause(rightop) &&
+		!contain_volatile_functions(rightop))
+	{
+		commuted = false;
+	}
+	else if (match_index_to_operand(rightop, indexcol, index) &&
+			 !contain_var_clause(leftop) &&
+			 !contain_volatile_functions(leftop))
+	{
+		/* Might match, but we need a commuted operator */
+		expr_op = get_commutator(expr_op);
+		if (expr_op == InvalidOid)
+			return NULL;
+		commuted = true;
+	}
+	else
+		return NULL;
+
+	/*
+	 * Is the (commuted) operator an ordering operator for the opfamily?
+	 * And if so, does it yield the right sorting semantics?
+	 */
+	sortfamily = get_op_opfamily_sortfamily(expr_op, opfamily);
+	if (sortfamily != pk_opfamily)
+		return NULL;
+
+	/* We have a match.  Return clause or a commuted version thereof. */
+	if (commuted)
+	{
+		OpExpr	   *newclause = makeNode(OpExpr);
+
+		/* flat-copy all the fields of clause */
+		memcpy(newclause, clause, sizeof(OpExpr));
+
+		/* commute it */
+		newclause->opno = expr_op;
+		newclause->opfuncid = InvalidOid;
+		newclause->args = list_make2(rightop, leftop);
+
+		clause = (Expr *) newclause;
+	}
+
+	return clause;
 }
 
 
@@ -1581,24 +1771,17 @@ matches_any_index(RestrictInfo *rinfo, RelOptInfo *rel, Relids outer_relids)
 	foreach(l, rel->indexlist)
 	{
 		IndexOptInfo *index = (IndexOptInfo *) lfirst(l);
-		int			indexcol = 0;
-		Oid		   *families = index->opfamily;
+		int			indexcol;
 
-		do
+		for (indexcol = 0; indexcol < index->ncolumns; indexcol++)
 		{
-			Oid			curFamily = families[0];
-
 			if (match_clause_to_indexcol(index,
 										 indexcol,
-										 curFamily,
 										 rinfo,
 										 outer_relids,
 										 SAOP_ALLOW))
 				return true;
-
-			indexcol++;
-			families++;
-		} while (!DoneMatchingIndexKeys(families));
+		}
 	}
 
 	return false;
@@ -1620,12 +1803,11 @@ eclass_matches_any_index(EquivalenceClass *ec, EquivalenceMember *em,
 	foreach(l, rel->indexlist)
 	{
 		IndexOptInfo *index = (IndexOptInfo *) lfirst(l);
-		int			indexcol = 0;
-		Oid		   *families = index->opfamily;
+		int			indexcol;
 
-		do
+		for (indexcol = 0; indexcol < index->ncolumns; indexcol++)
 		{
-			Oid			curFamily = families[0];
+			Oid			curFamily = index->opfamily[indexcol];
 
 			/*
 			 * If it's a btree index, we can reject it if its opfamily isn't
@@ -1641,10 +1823,7 @@ eclass_matches_any_index(EquivalenceClass *ec, EquivalenceMember *em,
 				 list_member_oid(ec->ec_opfamilies, curFamily)) &&
 				match_index_to_operand((Node *) em->em_expr, indexcol, index))
 				return true;
-
-			indexcol++;
-			families++;
-		} while (!DoneMatchingIndexKeys(families));
+		}
 	}
 
 	return false;
@@ -2210,7 +2389,7 @@ match_boolean_index_clause(Node *clause,
  * Return 'true' if we can do something with it anyway.
  */
 static bool
-match_special_index_operator(Expr *clause, Oid opfamily,
+match_special_index_operator(Expr *clause, Oid idxcolcollation, Oid opfamily,
 							 bool indexkey_on_left)
 {
 	bool		isIndexable = false;
@@ -2325,7 +2504,7 @@ match_special_index_operator(Expr *clause, Oid opfamily,
 			isIndexable =
 				(opfamily == TEXT_PATTERN_BTREE_FAM_OID) ||
 				(opfamily == TEXT_BTREE_FAM_OID &&
-				 (pstatus == Pattern_Prefix_Exact || lc_collate_is_c()));
+				 (pstatus == Pattern_Prefix_Exact || lc_collate_is_c(idxcolcollation)));
 			break;
 
 		case OID_BPCHAR_LIKE_OP:
@@ -2335,7 +2514,7 @@ match_special_index_operator(Expr *clause, Oid opfamily,
 			isIndexable =
 				(opfamily == BPCHAR_PATTERN_BTREE_FAM_OID) ||
 				(opfamily == BPCHAR_BTREE_FAM_OID &&
-				 (pstatus == Pattern_Prefix_Exact || lc_collate_is_c()));
+				 (pstatus == Pattern_Prefix_Exact || lc_collate_is_c(idxcolcollation)));
 			break;
 
 		case OID_NAME_LIKE_OP:
@@ -2353,6 +2532,25 @@ match_special_index_operator(Expr *clause, Oid opfamily,
 		case OID_INET_SUB_OP:
 		case OID_INET_SUBEQ_OP:
 			isIndexable = (opfamily == NETWORK_BTREE_FAM_OID);
+			break;
+	}
+
+	if (!isIndexable)
+		return false;
+
+	/*
+	 * For case-insensitive matching, we also need to check that the
+	 * collations match.
+	 */
+	switch (expr_op)
+	{
+		case OID_TEXT_ICLIKE_OP:
+		case OID_TEXT_ICREGEXEQ_OP:
+		case OID_BPCHAR_ICLIKE_OP:
+		case OID_BPCHAR_ICREGEXEQ_OP:
+		case OID_NAME_ICLIKE_OP:
+		case OID_NAME_ICREGEXEQ_OP:
+			isIndexable = (idxcolcollation == exprCollation((Node *) clause));
 			break;
 	}
 
@@ -2377,22 +2575,26 @@ List *
 expand_indexqual_conditions(IndexOptInfo *index, List *clausegroups)
 {
 	List	   *resultquals = NIL;
-	ListCell   *clausegroup_item;
-	int			indexcol = 0;
-	Oid		   *families = index->opfamily;
+	ListCell   *lc;
+	int			indexcol;
 
 	if (clausegroups == NIL)
 		return NIL;
 
-	clausegroup_item = list_head(clausegroups);
-	do
-	{
-		Oid			curFamily = families[0];
-		ListCell   *l;
+	/* clausegroups must correspond to index columns */
+	Assert(list_length(clausegroups) <= index->ncolumns);
 
-		foreach(l, (List *) lfirst(clausegroup_item))
+	indexcol = 0;
+	foreach(lc, clausegroups)
+	{
+		List	   *clausegroup = (List *) lfirst(lc);
+		Oid			curFamily = index->opfamily[indexcol];
+		Oid			curCollation = index->indexcollations[indexcol];
+		ListCell   *lc2;
+
+		foreach(lc2, clausegroup)
 		{
-			RestrictInfo *rinfo = (RestrictInfo *) lfirst(l);
+			RestrictInfo *rinfo = (RestrictInfo *) lfirst(lc2);
 			Expr	   *clause = rinfo->clause;
 
 			/* First check for boolean cases */
@@ -2419,7 +2621,8 @@ expand_indexqual_conditions(IndexOptInfo *index, List *clausegroups)
 			{
 				resultquals = list_concat(resultquals,
 										  expand_indexqual_opclause(rinfo,
-																 curFamily));
+																	curFamily,
+																	curCollation));
 			}
 			else if (IsA(clause, ScalarArrayOpExpr))
 			{
@@ -2444,13 +2647,8 @@ expand_indexqual_conditions(IndexOptInfo *index, List *clausegroups)
 					 (int) nodeTag(clause));
 		}
 
-		clausegroup_item = lnext(clausegroup_item);
-
 		indexcol++;
-		families++;
-	} while (clausegroup_item != NULL && !DoneMatchingIndexKeys(families));
-
-	Assert(clausegroup_item == NULL);	/* else more groups than indexkeys */
+	}
 
 	return resultquals;
 }
@@ -2525,7 +2723,7 @@ expand_boolean_index_clause(Node *clause,
  * expand special cases that were accepted by match_special_index_operator().
  */
 static List *
-expand_indexqual_opclause(RestrictInfo *rinfo, Oid opfamily)
+expand_indexqual_opclause(RestrictInfo *rinfo, Oid opfamily, Oid collation)
 {
 	Expr	   *clause = rinfo->clause;
 
@@ -2556,7 +2754,7 @@ expand_indexqual_opclause(RestrictInfo *rinfo, Oid opfamily)
 			{
 				pstatus = pattern_fixed_prefix(patt, Pattern_Type_Like,
 											   &prefix, &rest);
-				return prefix_quals(leftop, opfamily, prefix, pstatus);
+				return prefix_quals(leftop, opfamily, collation, prefix, pstatus);
 			}
 			break;
 
@@ -2568,7 +2766,7 @@ expand_indexqual_opclause(RestrictInfo *rinfo, Oid opfamily)
 				/* the right-hand const is type text for all of these */
 				pstatus = pattern_fixed_prefix(patt, Pattern_Type_Like_IC,
 											   &prefix, &rest);
-				return prefix_quals(leftop, opfamily, prefix, pstatus);
+				return prefix_quals(leftop, opfamily, collation, prefix, pstatus);
 			}
 			break;
 
@@ -2580,7 +2778,7 @@ expand_indexqual_opclause(RestrictInfo *rinfo, Oid opfamily)
 				/* the right-hand const is type text for all of these */
 				pstatus = pattern_fixed_prefix(patt, Pattern_Type_Regex,
 											   &prefix, &rest);
-				return prefix_quals(leftop, opfamily, prefix, pstatus);
+				return prefix_quals(leftop, opfamily, collation, prefix, pstatus);
 			}
 			break;
 
@@ -2592,7 +2790,7 @@ expand_indexqual_opclause(RestrictInfo *rinfo, Oid opfamily)
 				/* the right-hand const is type text for all of these */
 				pstatus = pattern_fixed_prefix(patt, Pattern_Type_Regex_IC,
 											   &prefix, &rest);
-				return prefix_quals(leftop, opfamily, prefix, pstatus);
+				return prefix_quals(leftop, opfamily, collation, prefix, pstatus);
 			}
 			break;
 
@@ -2646,6 +2844,7 @@ expand_indexqual_rowcompare(RestrictInfo *rinfo,
 	ListCell   *largs_cell;
 	ListCell   *rargs_cell;
 	ListCell   *opnos_cell;
+	ListCell   *collids_cell;
 
 	/* We have to figure out (again) how the first col matches */
 	var_on_left = match_index_to_operand((Node *) linitial(clause->largs),
@@ -2656,7 +2855,7 @@ expand_indexqual_rowcompare(RestrictInfo *rinfo,
 	expr_op = linitial_oid(clause->opnos);
 	if (!var_on_left)
 		expr_op = get_commutator(expr_op);
-	get_op_opfamily_properties(expr_op, index->opfamily[indexcol],
+	get_op_opfamily_properties(expr_op, index->opfamily[indexcol], false,
 							   &op_strategy,
 							   &op_lefttype,
 							   &op_righttype);
@@ -2677,6 +2876,7 @@ expand_indexqual_rowcompare(RestrictInfo *rinfo,
 	largs_cell = lnext(list_head(clause->largs));
 	rargs_cell = lnext(list_head(clause->rargs));
 	opnos_cell = lnext(list_head(clause->opnos));
+	collids_cell = lnext(list_head(clause->collids));
 
 	while (largs_cell != NULL)
 	{
@@ -2723,8 +2923,12 @@ expand_indexqual_rowcompare(RestrictInfo *rinfo,
 			!= op_strategy)
 			break;
 
+		/* Does collation match? */
+		if (lfirst_oid(collids_cell) != index->indexcollations[i])
+			break;
+
 		/* Add opfamily and datatypes to lists */
-		get_op_opfamily_properties(expr_op, index->opfamily[i],
+		get_op_opfamily_properties(expr_op, index->opfamily[i], false,
 								   &op_strategy,
 								   &op_lefttype,
 								   &op_righttype);
@@ -2806,6 +3010,8 @@ expand_indexqual_rowcompare(RestrictInfo *rinfo,
 		rc->opnos = new_ops;
 		rc->opfamilies = list_truncate(list_copy(clause->opfamilies),
 									   matching_cols);
+		rc->collids = list_truncate(list_copy(clause->collids),
+									matching_cols);
 		rc->largs = list_truncate((List *) copyObject(clause->largs),
 								  matching_cols);
 		rc->rargs = list_truncate((List *) copyObject(clause->rargs),
@@ -2830,7 +3036,7 @@ expand_indexqual_rowcompare(RestrictInfo *rinfo,
  * operators and operand datatypes.
  */
 static List *
-prefix_quals(Node *leftop, Oid opfamily,
+prefix_quals(Node *leftop, Oid opfamily, Oid collation,
 			 Const *prefix_const, Pattern_Prefix_Status pstatus)
 {
 	List	   *result;
@@ -2932,6 +3138,7 @@ prefix_quals(Node *leftop, Oid opfamily,
 	if (oproid == InvalidOid)
 		elog(ERROR, "no < operator for opfamily %u", opfamily);
 	fmgr_info(get_opcode(oproid), &ltproc);
+	fmgr_info_collation(collation, &ltproc);
 	greaterstr = make_greater_string(prefix_const, &ltproc);
 	if (greaterstr)
 	{

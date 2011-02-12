@@ -5,7 +5,7 @@
  *		bits of hard-wired knowledge
  *
  *
- * Portions Copyright (c) 1996-2010, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2011, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -55,7 +55,8 @@
 const char *forkNames[] = {
 	"main",						/* MAIN_FORKNUM */
 	"fsm",						/* FSM_FORKNUM */
-	"vm"						/* VISIBILITYMAP_FORKNUM */
+	"vm",						/* VISIBILITYMAP_FORKNUM */
+	"init"						/* INIT_FORKNUM */
 };
 
 /*
@@ -82,14 +83,14 @@ forkname_to_number(char *forkName)
  * 		We use this to figure out whether a filename could be a relation
  * 		fork (as opposed to an oddly named stray file that somehow ended
  * 		up in the database directory).  If the passed string begins with
- * 		a fork name (other than the main fork name), we return its length.
- * 		If not, we return 0.
+ * 		a fork name (other than the main fork name), we return its length,
+ *	    and set *fork (if not NULL) to the fork number.  If not, we return 0.
  *
  * Note that the present coding assumes that there are no fork names which
  * are prefixes of other fork names.
  */
 int
-forkname_chars(const char *str)
+forkname_chars(const char *str, ForkNumber *fork)
 {
 	ForkNumber	forkNum;
 
@@ -97,7 +98,11 @@ forkname_chars(const char *str)
 	{
 		int len = strlen(forkNames[forkNum]);
 		if (strncmp(forkNames[forkNum], str, len) == 0)
+		{
+			if (fork)
+				*fork = forkNum;
 			return len;
+		}
 	}
 	return 0;
 }
@@ -524,12 +529,27 @@ GetNewOidWithIndex(Relation relation, Oid indexId, AttrNumber oidcolumn)
  * created by bootstrap have preassigned OIDs, so there's no need.
  */
 Oid
-GetNewRelFileNode(Oid reltablespace, Relation pg_class, BackendId backend)
+GetNewRelFileNode(Oid reltablespace, Relation pg_class, char relpersistence)
 {
 	RelFileNodeBackend rnode;
 	char	   *rpath;
 	int			fd;
 	bool		collides;
+	BackendId	backend;
+
+	switch (relpersistence)
+	{
+		case RELPERSISTENCE_TEMP:
+			backend = MyBackendId;
+			break;
+		case RELPERSISTENCE_UNLOGGED:
+		case RELPERSISTENCE_PERMANENT:
+			backend = InvalidBackendId;
+			break;
+		default:
+			elog(ERROR, "invalid relpersistence: %c", relpersistence);
+			return InvalidOid;	/* placate compiler */
+	}
 
 	/* This logic should match RelationInitPhysicalAddr */
 	rnode.node.spcNode = reltablespace ? reltablespace : MyDatabaseTableSpace;

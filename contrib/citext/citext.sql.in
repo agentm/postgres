@@ -52,7 +52,8 @@ CREATE TYPE citext (
     STORAGE        = extended,
     -- make it a non-preferred member of string type category
     CATEGORY       = 'S',
-    PREFERRED      = false
+    PREFERRED      = false,
+    COLLATABLE     = true
 );
 
 --
@@ -343,7 +344,7 @@ CREATE OPERATOR !~~* (
 );
 
 --
--- Matching citext to text. 
+-- Matching citext to text.
 --
 
 CREATE OR REPLACE FUNCTION texticlike(citext, text)

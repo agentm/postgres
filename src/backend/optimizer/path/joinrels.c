@@ -3,7 +3,7 @@
  * joinrels.c
  *	  Routines to determine which relations should be joined
  *
- * Portions Copyright (c) 1996-2010, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2011, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -658,6 +658,18 @@ make_join_rel(PlannerInfo *root, RelOptInfo *rel1, RelOptInfo *rel2)
 			add_paths_to_joinrel(root, joinrel, rel2, rel1,
 								 JOIN_FULL, sjinfo,
 								 restrictlist);
+
+			/*
+			 * If there are join quals that aren't mergeable or hashable, we
+			 * may not be able to build any valid plan.  Complain here so that
+			 * we can give a somewhat-useful error message.  (Since we have no
+			 * flexibility of planning for a full join, there's no chance of
+			 * succeeding later with another pair of input rels.)
+			 */
+			if (joinrel->pathlist == NIL)
+				ereport(ERROR,
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("FULL JOIN is only supported with merge-joinable or hash-joinable join conditions")));
 			break;
 		case JOIN_SEMI:
 

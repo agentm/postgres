@@ -62,8 +62,8 @@ ALTER TABLE tmp ADD COLUMN z int2[];
 
 INSERT INTO tmp (a, b, c, d, e, f, g, h, i, j, k, l, m, n, p, q, r, s, t, u,
 	v, w, x, y, z)
-   VALUES (4, 'name', 'text', 4.1, 4.1, 2, '(4.1,4.1,3.1,3.1)', 
-        'Mon May  1 00:30:30 1995', 'c', '{Mon May  1 00:30:30 1995, Monday Aug 24 14:43:07 1992, epoch}', 
+   VALUES (4, 'name', 'text', 4.1, 4.1, 2, '(4.1,4.1,3.1,3.1)',
+        'Mon May  1 00:30:30 1995', 'c', '{Mon May  1 00:30:30 1995, Monday Aug 24 14:43:07 1992, epoch}',
 	314159, '(1,1)', '512',
 	'1 2 3 4 5 6 7 8', 'magnetic disk', '(1.1,1.1)', '(4.1,4.1,3.1,3.1)',
 	'(0,2,4.1,4.1,3.1,3.1)', '(4.1,4.1,3.1,3.1)', '["epoch" "infinity"]',
@@ -73,7 +73,7 @@ SELECT * FROM tmp;
 
 DROP TABLE tmp;
 
--- the wolf bug - schema mods caused inconsistent row descriptors 
+-- the wolf bug - schema mods caused inconsistent row descriptors
 CREATE TABLE tmp (
 	initial 	int4
 );
@@ -131,8 +131,8 @@ ALTER TABLE tmp ADD COLUMN z int2[];
 
 INSERT INTO tmp (a, b, c, d, e, f, g, h, i, j, k, l, m, n, p, q, r, s, t, u,
 	v, w, x, y, z)
-   VALUES (4, 'name', 'text', 4.1, 4.1, 2, '(4.1,4.1,3.1,3.1)', 
-        'Mon May  1 00:30:30 1995', 'c', '{Mon May  1 00:30:30 1995, Monday Aug 24 14:43:07 1992, epoch}', 
+   VALUES (4, 'name', 'text', 4.1, 4.1, 2, '(4.1,4.1,3.1,3.1)',
+        'Mon May  1 00:30:30 1995', 'c', '{Mon May  1 00:30:30 1995, Monday Aug 24 14:43:07 1992, epoch}',
 	314159, '(1,1)', '512',
 	'1 2 3 4 5 6 7 8', 'magnetic disk', '(1.1,1.1)', '(4.1,4.1,3.1,3.1)',
 	'(0,2,4.1,4.1,3.1,3.1)', '(4.1,4.1,3.1,3.1)', '["epoch" "infinity"]',
@@ -176,7 +176,7 @@ ALTER TABLE tmp_view RENAME TO tmp_view_new;
 ANALYZE tenk1;
 set enable_seqscan to off;
 set enable_bitmapscan to off;
--- 5 values, sorted 
+-- 5 values, sorted
 SELECT unique1 FROM tenk1 WHERE unique1 < 5;
 reset enable_seqscan;
 reset enable_bitmapscan;
@@ -221,6 +221,21 @@ DELETE FROM tmp3 where a=5;
 
 -- Try (and succeed)
 ALTER TABLE tmp3 add constraint tmpconstr foreign key (a) references tmp2 match full;
+ALTER TABLE tmp3 drop constraint tmpconstr;
+
+INSERT INTO tmp3 values (5,50);
+
+-- Try NOT VALID and then VALIDATE CONSTRAINT, but fails. Delete failure then re-validate
+ALTER TABLE tmp3 add constraint tmpconstr foreign key (a) references tmp2 match full NOT VALID;
+ALTER TABLE tmp3 validate constraint tmpconstr;
+
+-- Delete failing row
+DELETE FROM tmp3 where a=5;
+
+-- Try (and succeed) and repeat to show it works on already valid constraint
+ALTER TABLE tmp3 validate constraint tmpconstr;
+ALTER TABLE tmp3 validate constraint tmpconstr;
+
 
 -- Try (and fail) to create constraint from tmp5(a) to tmp4(a) - unique constraint on
 -- tmp4 is a,b
@@ -419,6 +434,8 @@ insert into atacc1 (test) values (2);
 insert into atacc1 (test) values (4);
 -- try adding a unique oid constraint
 alter table atacc1 add constraint atacc_oid1 unique(oid);
+-- try to create duplicates via alter table using - should fail
+alter table atacc1 alter column test type integer using 0;
 drop table atacc1;
 
 -- let's do one where the unique constraint fails when added
@@ -1053,7 +1070,7 @@ insert into anothertab (atcol1, atcol2) values (default, null);
 select * from anothertab;
 
 alter table anothertab alter column atcol2 type text
-      using case when atcol2 is true then 'IT WAS TRUE' 
+      using case when atcol2 is true then 'IT WAS TRUE'
                  when atcol2 is false then 'IT WAS FALSE'
                  else 'IT WAS NULL!' end;
 
@@ -1206,6 +1223,21 @@ create domain alter1.posint integer check (value > 0);
 
 create type alter1.ctype as (f1 int, f2 text);
 
+create function alter1.same(alter1.ctype, alter1.ctype) returns boolean language sql 
+as 'select $1.f1 is not distinct from $2.f1 and $1.f2 is not distinct from $2.f2';
+
+create operator alter1.=(procedure = alter1.same, leftarg  = alter1.ctype, rightarg = alter1.ctype);
+
+create operator class alter1.ctype_hash_ops default for type alter1.ctype using hash as
+  operator 1 alter1.=(alter1.ctype, alter1.ctype);
+
+create conversion alter1.ascii_to_utf8 for 'sql_ascii' to 'utf8' from ascii_to_utf8;
+
+create text search parser alter1.prs(start = prsd_start, gettoken = prsd_nexttoken, end = prsd_end, lextypes = prsd_lextype);
+create text search configuration alter1.cfg(parser = alter1.prs);
+create text search template alter1.tmpl(init = dsimple_init, lexize = dsimple_lexize);
+create text search dictionary alter1.dict(template = alter1.tmpl);
+
 insert into alter1.t1(f2) values(11);
 insert into alter1.t1(f2) values(12);
 
@@ -1213,7 +1245,16 @@ alter table alter1.t1 set schema alter2;
 alter table alter1.v1 set schema alter2;
 alter function alter1.plus1(int) set schema alter2;
 alter domain alter1.posint set schema alter2;
+alter operator class alter1.ctype_hash_ops using hash set schema alter2;
+alter operator family alter1.ctype_hash_ops using hash set schema alter2;
+alter operator alter1.=(alter1.ctype, alter1.ctype) set schema alter2;
+alter function alter1.same(alter1.ctype, alter1.ctype) set schema alter2;
 alter type alter1.ctype set schema alter2;
+alter conversion alter1.ascii_to_utf8 set schema alter2;
+alter text search parser alter1.prs set schema alter2;
+alter text search configuration alter1.cfg set schema alter2;
+alter text search template alter1.tmpl set schema alter2;
+alter text search dictionary alter1.dict set schema alter2;
 
 -- this should succeed because nothing is left in alter1
 drop schema alter1;
@@ -1272,10 +1313,28 @@ ALTER TYPE test_type1 ALTER ATTRIBUTE b TYPE varchar; -- fails
 
 CREATE TYPE test_type2 AS (a int, b text);
 CREATE TABLE test_tbl2 OF test_type2;
+\d test_type2
+\d test_tbl2
+
 ALTER TYPE test_type2 ADD ATTRIBUTE c text; -- fails
+ALTER TYPE test_type2 ADD ATTRIBUTE c text CASCADE;
+\d test_type2
+\d test_tbl2
+
 ALTER TYPE test_type2 ALTER ATTRIBUTE b TYPE varchar; -- fails
+ALTER TYPE test_type2 ALTER ATTRIBUTE b TYPE varchar CASCADE;
+\d test_type2
+\d test_tbl2
+
 ALTER TYPE test_type2 DROP ATTRIBUTE b; -- fails
-ALTER TYPE test_type2 RENAME ATTRIBUTE b TO bb; -- fails
+ALTER TYPE test_type2 DROP ATTRIBUTE b CASCADE;
+\d test_type2
+\d test_tbl2
+
+ALTER TYPE test_type2 RENAME ATTRIBUTE a TO aa; -- fails
+ALTER TYPE test_type2 RENAME ATTRIBUTE a TO aa CASCADE;
+\d test_type2
+\d test_tbl2
 
 CREATE TYPE test_type_empty AS ();
 DROP TYPE test_type_empty;

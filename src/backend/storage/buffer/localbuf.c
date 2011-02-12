@@ -4,7 +4,7 @@
  *	  local buffer manager. Fast buffer manager for temporary tables,
  *	  which never need to be WAL-logged or checkpointed, etc.
  *
- * Portions Copyright (c) 1996-2010, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2011, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994-5, Regents of the University of California
  *
  *
@@ -468,14 +468,23 @@ AtEOXact_LocalBuffers(bool isCommit)
 /*
  * AtProcExit_LocalBuffers - ensure we have dropped pins during backend exit.
  *
- * This is just like AtProcExit_Buffers, but for local buffers.  We have
- * to drop pins to ensure that any attempt to drop temp files doesn't
- * fail in DropRelFileNodeBuffers.
+ * This is just like AtProcExit_Buffers, but for local buffers.  We shouldn't
+ * be holding any remaining pins; if we are, and assertions aren't enabled,
+ * we'll fail later in DropRelFileNodeBuffers while trying to drop the temp
+ * rels.
  */
 void
 AtProcExit_LocalBuffers(void)
 {
-	/* just zero the refcounts ... */
-	if (LocalRefCount)
-		MemSet(LocalRefCount, 0, NLocBuffer * sizeof(*LocalRefCount));
+#ifdef USE_ASSERT_CHECKING
+	if (assert_enabled && LocalRefCount)
+	{
+		int			i;
+
+		for (i = 0; i < NLocBuffer; i++)
+		{
+			Assert(LocalRefCount[i] == 0);
+		}
+	}
+#endif
 }

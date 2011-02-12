@@ -2,7 +2,7 @@
 #
 # Makefile for src/interfaces/ecpg/preproc
 #
-# Copyright (c) 1998-2010, PostgreSQL Global Development Group
+# Copyright (c) 1998-2011, PostgreSQL Global Development Group
 #
 # src/interfaces/ecpg/preproc/Makefile
 #
@@ -30,10 +30,13 @@ OBJS=	preproc.o type.o ecpg.o output.o parser.o \
 	keywords.o c_keywords.o ecpg_keywords.o kwlookup.o ../ecpglib/typename.o descriptor.o variable.o \
 	$(WIN32RES)
 
-all: submake-libpgport ecpg
+all: ecpg
 
-ecpg: $(OBJS)
+ecpg: $(OBJS) | submake-libpgport
 	$(CC) $(CFLAGS) $(LDFLAGS) $(LDFLAGS_EX) $^ $(LIBS) $(PTHREAD_LIBS) -o $@$(X)
+
+../ecpglib/typename.o: ../ecpglib/typename.c
+	$(MAKE) -C $(dir $@) $(notdir $@)
 
 # pgc is compiled as part of preproc
 preproc.o: pgc.c
@@ -55,7 +58,7 @@ else
 endif
 
 preproc.y: ../../../backend/parser/gram.y parse.pl ecpg.addons ecpg.header ecpg.tokens ecpg.trailer ecpg.type
-	$(PERL) $(srcdir)/parse.pl $(srcdir) < $< > $@ 
+	$(PERL) $(srcdir)/parse.pl $(srcdir) < $< > $@
 	$(PERL) $(srcdir)/check_rules.pl $(srcdir) $<
 
 ecpg_keywords.o c_keywords.o keywords.o preproc.o parser.o: preproc.h

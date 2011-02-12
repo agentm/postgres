@@ -93,6 +93,7 @@
 <!-- contrib information -->
 <!entity contrib         SYSTEM "contrib.sgml">
 <!entity adminpack       SYSTEM "adminpack.sgml">
+<!entity auth-delay      SYSTEM "auth-delay.sgml">
 <!entity auto-explain    SYSTEM "auto-explain.sgml">
 <!entity btree-gin       SYSTEM "btree-gin.sgml">
 <!entity btree-gist      SYSTEM "btree-gist.sgml">
@@ -102,6 +103,7 @@
 <!entity dblink          SYSTEM "dblink.sgml">
 <!entity dict-int        SYSTEM "dict-int.sgml">
 <!entity dict-xsyn       SYSTEM "dict-xsyn.sgml">
+<!entity dummy-seclabel  SYSTEM "dummy-seclabel.sgml">
 <!entity earthdistance   SYSTEM "earthdistance.sgml">
 <!entity fuzzystrmatch   SYSTEM "fuzzystrmatch.sgml">
 <!entity hstore          SYSTEM "hstore.sgml">
@@ -122,10 +124,12 @@
 <!entity pgstandby       SYSTEM "pgstandby.sgml">
 <!entity pgstatstatements SYSTEM "pgstatstatements.sgml">
 <!entity pgstattuple     SYSTEM "pgstattuple.sgml">
+<!entity pgtestfsync     SYSTEM "pgtestfsync.sgml">
 <!entity pgtrgm          SYSTEM "pgtrgm.sgml">
 <!entity pgupgrade       SYSTEM "pgupgrade.sgml">
 <!entity seg             SYSTEM "seg.sgml">
 <!entity contrib-spi     SYSTEM "contrib-spi.sgml">
+<!entity sepgsql         SYSTEM "sepgsql.sgml">
 <!entity sslinfo         SYSTEM "sslinfo.sgml">
 <!entity tablefunc       SYSTEM "tablefunc.sgml">
 <!entity test-parser     SYSTEM "test-parser.sgml">
@@ -133,7 +137,7 @@
 <!entity unaccent      SYSTEM "unaccent.sgml">
 <!entity uuid-ossp       SYSTEM "uuid-ossp.sgml">
 <!entity vacuumlo        SYSTEM "vacuumlo.sgml">
-<!entity xml2            SYSTEM "xml2.sgml"> 
+<!entity xml2            SYSTEM "xml2.sgml">
 
 <!-- appendixes -->
 <!entity contacts   SYSTEM "contacts.sgml">
@@ -159,6 +163,8 @@
 
 <!entity features-supported   SYSTEM "features-supported.sgml">
 <!entity features-unsupported SYSTEM "features-unsupported.sgml">
+
+<!entity errcodes-table SYSTEM "errcodes-table.sgml">
 
 <!-- back matter -->
 <!entity biblio     SYSTEM "biblio.sgml">

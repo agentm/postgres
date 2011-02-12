@@ -4,7 +4,16 @@
 #define WIN32_ONLY_COMPILER
 #endif
 
+/* 
+ * Make sure _WIN32_WINNT has the minumum required value. 
+ * Leave a higher value in place.
+*/
+#if defined(_WIN32_WINNT) && _WIN32_WINNT < 0x0501
+#undef _WIN32_WINNT
+#endif
+#ifndef _WIN32_WINNT
 #define _WIN32_WINNT 0x0501
+#endif
 /*
  * Always build with SSPI support. Keep it as a #define in case
  * we want a switch to disable it sometime in the future.
@@ -17,10 +26,17 @@
 #undef mkdir
 
 #undef ERROR
+
+/* 
+ * The Mingw64 headers choke if this is already defined - they
+ * define it themselves.
+ */
+#if !defined(WIN64) || defined(WIN32_ONLY_COMPILER)
 #define _WINSOCKAPI_
-#include <windows.h>
+#endif
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#include <windows.h>
 #undef small
 #include <process.h>
 #include <signal.h>
@@ -34,14 +50,18 @@
 /* Must be here to avoid conflicting with prototype in windows.h */
 #define mkdir(a,b)	mkdir(a)
 
-#define HAVE_FSYNC_WRITETHROUGH
-#define HAVE_FSYNC_WRITETHROUGH_ONLY
 #define ftruncate(a,b)	chsize(a,b)
-/*
- *	Even though we don't support 'fsync' as a wal_sync_method,
- *	we do fsync() a few other places where _commit() is just fine.
- */
+
+/* Windows doesn't have fsync() as such, use _commit() */
 #define fsync(fd) _commit(fd)
+
+/*
+ * For historical reasons, we allow setting wal_sync_method to
+ * fsync_writethrough on Windows, even though it's really identical to fsync
+ * (both code paths wind up at _commit()).
+ */
+#define HAVE_FSYNC_WRITETHROUGH
+#define FSYNC_WRITETHROUGH_IS_FSYNC
 
 #define USES_WINSOCK
 
@@ -61,7 +81,7 @@
 #ifdef _MSC_VER
 #define PGDLLEXPORT __declspec (dllexport)
 #else
-#define PGDLLEXPORT __declspec (dllimport)
+#define PGDLLEXPORT
 #endif
 #else							/* not CYGWIN, not MSVC, not MingW */
 #define PGDLLIMPORT
@@ -299,6 +319,9 @@ extern int	pgwin32_is_service(void);
 /* in backend/port/win32_shmem.c */
 extern int	pgwin32_ReserveSharedMemoryRegion(HANDLE);
 
+/* in backend/port/win32/crashdump.c */
+extern void pgwin32_install_crashdump_handler(void);
+
 /* in port/win32error.c */
 extern void _dosmaperr(unsigned long);
 
@@ -311,6 +334,7 @@ extern void pgwin32_unsetenv(const char *);
 
 /* Things that exist in MingW headers, but need to be added to MSVC & BCC */
 #ifdef WIN32_ONLY_COMPILER
+
 #ifndef _WIN64
 typedef long ssize_t;
 #else
@@ -319,19 +343,15 @@ typedef __int64 ssize_t;
 
 #ifndef __BORLANDC__
 typedef unsigned short mode_t;
-#endif
 
-#ifndef __BORLANDC__
-#define _S_IRWXU	(_S_IREAD | _S_IWRITE | _S_IEXEC)
-#define _S_IXUSR	_S_IEXEC
-#define _S_IWUSR	_S_IWRITE
-#define _S_IRUSR	_S_IREAD
-#define S_IRUSR		_S_IRUSR
-#define S_IWUSR		_S_IWUSR
-#define S_IXUSR		_S_IXUSR
+#define S_IRUSR _S_IREAD
+#define S_IWUSR _S_IWRITE
+#define S_IXUSR _S_IEXEC
+#define S_IRWXU (S_IRUSR | S_IWUSR | S_IXUSR)
+/* see also S_IRGRP etc below */
 #define S_ISDIR(m) (((m) & S_IFMT) == S_IFDIR)
 #define S_ISREG(m) (((m) & S_IFMT) == S_IFREG)
-#endif
+#endif /* __BORLANDC__ */
 
 #define F_OK 0
 #define W_OK 2
@@ -354,10 +374,22 @@ typedef unsigned short mode_t;
 #ifndef O_RANDOM
 #define O_RANDOM		0x0010	/* File access is primarily random */
 #define O_SEQUENTIAL	0x0020	/* File access is primarily sequential */
-#define O_TEMPORARY 0x0040		/* Temporary file bit */
+#define O_TEMPORARY		0x0040	/* Temporary file bit */
 #define O_SHORT_LIVED	0x1000	/* Temporary storage file, try not to flush */
 #define _O_SHORT_LIVED	O_SHORT_LIVED
 #endif   /* ifndef O_RANDOM */
 #endif   /* __BORLANDC__ */
 
-#endif
+#endif /* WIN32_ONLY_COMPILER */
+
+/* These aren't provided by either MingW or MSVC */
+#ifndef __BORLANDC__
+#define S_IRGRP 0
+#define S_IWGRP 0
+#define S_IXGRP 0
+#define S_IRWXG 0
+#define S_IROTH 0
+#define S_IWOTH 0
+#define S_IXOTH 0
+#define S_IRWXO 0
+#endif /* __BORLANDC__ */

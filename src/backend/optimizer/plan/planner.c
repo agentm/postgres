@@ -3,7 +3,7 @@
  * planner.c
  *	  The query optimizer external interface.
  *
- * Portions Copyright (c) 1996-2010, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2011, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -166,6 +166,7 @@ standard_planner(Query *parse, int cursorOptions, ParamListInfo boundParams)
 	glob->relationOids = NIL;
 	glob->invalItems = NIL;
 	glob->lastPHId = 0;
+	glob->lastRowMarkId = 0;
 	glob->transientPlan = false;
 
 	/* Determine what fraction of the plan is likely to be scanned */
@@ -341,11 +342,20 @@ subquery_planner(PlannerGlobal *glob, Query *parse,
 	inline_set_returning_functions(root);
 
 	/*
-	 * Check to see if any subqueries in the rangetable can be merged into
+	 * Check to see if any subqueries in the jointree can be merged into
 	 * this query.
 	 */
 	parse->jointree = (FromExpr *)
 		pull_up_subqueries(root, (Node *) parse->jointree, NULL, NULL);
+
+	/*
+	 * If this is a simple UNION ALL query, flatten it into an appendrel.
+	 * We do this now because it requires applying pull_up_subqueries to the
+	 * leaf queries of the UNION ALL, which weren't touched above because they
+	 * weren't referenced by the jointree (they will be after we do this).
+	 */
+	if (parse->setOperations)
+		flatten_simple_union_all(root);
 
 	/*
 	 * Detect whether any rangetable entries are RTE_JOIN kind; if not, we can
@@ -959,6 +969,7 @@ grouping_planner(PlannerInfo *root, double tuple_fraction)
 	{
 		/* No set operations, do regular planning */
 		List	   *sub_tlist;
+		double		sub_limit_tuples;
 		AttrNumber *groupColIdx = NULL;
 		bool		need_tlist_eval = true;
 		QualCost	tlist_cost;
@@ -1011,6 +1022,30 @@ grouping_planner(PlannerInfo *root, double tuple_fraction)
 										   &groupColIdx, &need_tlist_eval);
 
 		/*
+		 * Do aggregate preprocessing, if the query has any aggs.
+		 *
+		 * Note: think not that we can turn off hasAggs if we find no aggs. It
+		 * is possible for constant-expression simplification to remove all
+		 * explicit references to aggs, but we still have to follow the
+		 * aggregate semantics (eg, producing only one output row).
+		 */
+		if (parse->hasAggs)
+		{
+			/*
+			 * Will need actual number of aggregates for estimating costs.
+			 * Note: we do not attempt to detect duplicate aggregates here; a
+			 * somewhat-overestimated count is okay for our present purposes.
+			 */
+			count_agg_clauses((Node *) tlist, &agg_counts);
+			count_agg_clauses(parse->havingQual, &agg_counts);
+
+			/*
+			 * Preprocess MIN/MAX aggregates, if any.
+			 */
+			preprocess_minmax_aggregates(root, tlist);
+		}
+
+		/*
 		 * Calculate pathkeys that represent grouping/ordering requirements.
 		 * Stash them in PlannerInfo so that query_planner can canonicalize
 		 * them after EquivalenceClasses have been formed.	The sortClause is
@@ -1057,23 +1092,6 @@ grouping_planner(PlannerInfo *root, double tuple_fraction)
 										  false);
 
 		/*
-		 * Will need actual number of aggregates for estimating costs.
-		 *
-		 * Note: we do not attempt to detect duplicate aggregates here; a
-		 * somewhat-overestimated count is okay for our present purposes.
-		 *
-		 * Note: think not that we can turn off hasAggs if we find no aggs. It
-		 * is possible for constant-expression simplification to remove all
-		 * explicit references to aggs, but we still have to follow the
-		 * aggregate semantics (eg, producing only one output row).
-		 */
-		if (parse->hasAggs)
-		{
-			count_agg_clauses((Node *) tlist, &agg_counts);
-			count_agg_clauses(parse->havingQual, &agg_counts);
-		}
-
-		/*
 		 * Figure out whether we want a sorted result from query_planner.
 		 *
 		 * If we have a sortable GROUP BY clause, then we want a result sorted
@@ -1104,12 +1122,27 @@ grouping_planner(PlannerInfo *root, double tuple_fraction)
 			root->query_pathkeys = NIL;
 
 		/*
+		 * Figure out whether there's a hard limit on the number of rows that
+		 * query_planner's result subplan needs to return.  Even if we know a
+		 * hard limit overall, it doesn't apply if the query has any
+		 * grouping/aggregation operations.
+		 */
+		if (parse->groupClause ||
+			parse->distinctClause ||
+			parse->hasAggs ||
+			parse->hasWindowFuncs ||
+			root->hasHavingQual)
+			sub_limit_tuples = -1.0;
+		else
+			sub_limit_tuples = limit_tuples;
+
+		/*
 		 * Generate the best unsorted and presorted paths for this Query (but
 		 * note there may not be any presorted path).  query_planner will also
 		 * estimate the number of groups in the query, and canonicalize all
 		 * the pathkeys.
 		 */
-		query_planner(root, sub_tlist, tuple_fraction, limit_tuples,
+		query_planner(root, sub_tlist, tuple_fraction, sub_limit_tuples,
 					  &cheapest_path, &sorted_path, &dNumGroups);
 
 		/*
@@ -1853,16 +1886,13 @@ preprocess_rowmarks(PlannerInfo *root)
 
 		newrc = makeNode(PlanRowMark);
 		newrc->rti = newrc->prti = rc->rti;
+		newrc->rowmarkId = ++(root->glob->lastRowMarkId);
 		if (rc->forUpdate)
 			newrc->markType = ROW_MARK_EXCLUSIVE;
 		else
 			newrc->markType = ROW_MARK_SHARE;
 		newrc->noWait = rc->noWait;
 		newrc->isParent = false;
-		/* attnos will be assigned in preprocess_targetlist */
-		newrc->ctidAttNo = InvalidAttrNumber;
-		newrc->toidAttNo = InvalidAttrNumber;
-		newrc->wholeAttNo = InvalidAttrNumber;
 
 		prowmarks = lappend(prowmarks, newrc);
 	}
@@ -1882,6 +1912,7 @@ preprocess_rowmarks(PlannerInfo *root)
 
 		newrc = makeNode(PlanRowMark);
 		newrc->rti = newrc->prti = i;
+		newrc->rowmarkId = ++(root->glob->lastRowMarkId);
 		/* real tables support REFERENCE, anything else needs COPY */
 		if (rte->rtekind == RTE_RELATION)
 			newrc->markType = ROW_MARK_REFERENCE;
@@ -1889,10 +1920,6 @@ preprocess_rowmarks(PlannerInfo *root)
 			newrc->markType = ROW_MARK_COPY;
 		newrc->noWait = false;	/* doesn't matter */
 		newrc->isParent = false;
-		/* attnos will be assigned in preprocess_targetlist */
-		newrc->ctidAttNo = InvalidAttrNumber;
-		newrc->toidAttNo = InvalidAttrNumber;
-		newrc->wholeAttNo = InvalidAttrNumber;
 
 		prowmarks = lappend(prowmarks, newrc);
 	}
@@ -3070,7 +3097,7 @@ plan_cluster_use_sort(Oid tableOid, Oid indexOid)
 	 * set_baserel_size_estimates, just do a quick hack for rows and width.
 	 */
 	rel->rows = rel->tuples;
-	rel->width = get_relation_data_width(tableOid);
+	rel->width = get_relation_data_width(tableOid, NULL);
 
 	root->total_table_pages = rel->pages;
 
@@ -3103,7 +3130,7 @@ plan_cluster_use_sort(Oid tableOid, Oid indexOid)
 
 	/* Estimate the cost of index scan */
 	indexScanPath = create_index_path(root, indexInfo,
-									  NIL, NIL,
+									  NIL, NIL, NIL,
 									  ForwardScanDirection, NULL);
 
 	return (seqScanAndSortPath.total_cost < indexScanPath->path.total_cost);

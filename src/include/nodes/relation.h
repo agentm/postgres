@@ -4,7 +4,7 @@
  *	  Definitions for planner's internal data structures.
  *
  *
- * Portions Copyright (c) 1996-2010, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2011, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/nodes/relation.h
@@ -81,6 +81,8 @@ typedef struct PlannerGlobal
 	List	   *invalItems;		/* other dependencies, as PlanInvalItems */
 
 	Index		lastPHId;		/* highest PlaceHolderVar ID assigned */
+
+	Index		lastRowMarkId;	/* highest PlanRowMark ID assigned */
 
 	bool		transientPlan;	/* redo plan when TransactionXmin changes? */
 } PlannerGlobal;
@@ -189,6 +191,8 @@ typedef struct PlannerInfo
 	List	   *distinct_pathkeys;		/* distinctClause pathkeys, if any */
 	List	   *sort_pathkeys;	/* sortClause pathkeys, if any */
 
+	List	   *minmax_aggs;	/* List of MinMaxAggInfos */
+
 	List	   *initial_rels;	/* RelOptInfos we are now trying to join */
 
 	MemoryContext planner_cxt;	/* context holding PlannerInfo */
@@ -196,6 +200,7 @@ typedef struct PlannerInfo
 	double		total_table_pages;		/* # of pages in all tables of query */
 
 	double		tuple_fraction; /* tuple_fraction passed to query_planner */
+	double		limit_tuples;	/* limit_tuples passed to query_planner */
 
 	bool		hasInheritedTarget;		/* true if parse->resultRelation is an
 										 * inheritance child rel */
@@ -418,23 +423,17 @@ typedef struct RelOptInfo
  * IndexOptInfo
  *		Per-index information for planning/optimization
  *
- *		Prior to Postgres 7.0, RelOptInfo was used to describe both relations
- *		and indexes, but that created confusion without actually doing anything
- *		useful.  So now we have a separate IndexOptInfo struct for indexes.
- *
- *		opfamily[], indexkeys[], opcintype[], fwdsortop[], revsortop[],
- *		and nulls_first[] each have ncolumns entries.
- *		Note: for historical reasons, the opfamily array has an extra entry
- *		that is always zero.  Some code scans until it sees a zero entry,
- *		rather than looking at ncolumns.
+ *		opfamily[], indexkeys[], and opcintype[] each have ncolumns entries.
+ *		sortopfamily[], reverse_sort[], and nulls_first[] likewise have
+ *		ncolumns entries, if the index is ordered; but if it is unordered,
+ *		those pointers are NULL.
  *
  *		Zeroes in the indexkeys[] array indicate index columns that are
  *		expressions; there is one element in indexprs for each such column.
  *
- *		For an unordered index, the sortop arrays contains zeroes.	Note that
- *		fwdsortop[] and nulls_first[] describe the sort ordering of a forward
- *		indexscan; we can also consider a backward indexscan, which will
- *		generate sort order described by revsortop/!nulls_first.
+ *		For an ordered index, reverse_sort[] and nulls_first[] describe the
+ *		sort ordering of a forward indexscan; we can also consider a backward
+ *		indexscan, which will generate the reverse ordering.
  *
  *		The indexprs and indpred expressions have been run through
  *		prepqual.c and eval_const_expressions() for ease of matching to
@@ -456,9 +455,10 @@ typedef struct IndexOptInfo
 	int			ncolumns;		/* number of columns in index */
 	Oid		   *opfamily;		/* OIDs of operator families for columns */
 	int		   *indexkeys;		/* column numbers of index's keys, or 0 */
+	Oid		   *indexcollations;/* OIDs of the collations of the index columns */
 	Oid		   *opcintype;		/* OIDs of opclass declared input data types */
-	Oid		   *fwdsortop;		/* OIDs of sort operators for each column */
-	Oid		   *revsortop;		/* OIDs of sort operators for backward scan */
+	Oid		   *sortopfamily;	/* OIDs of btree opfamilies, if orderable */
+	bool	   *reverse_sort;	/* is sort order descending? */
 	bool	   *nulls_first;	/* do NULLs come first in the sort order? */
 	Oid			relam;			/* OID of the access method (in pg_am) */
 
@@ -469,6 +469,7 @@ typedef struct IndexOptInfo
 
 	bool		predOK;			/* true if predicate matches query */
 	bool		unique;			/* true if a unique index */
+	bool		amcanorderbyop;	/* does AM support order by operator result? */
 	bool		amoptionalkey;	/* can query omit key for the first column? */
 	bool		amsearchnulls;	/* can AM search for NULL/NOT NULL entries? */
 	bool		amhasgettuple;	/* does AM have amgettuple interface? */
@@ -587,6 +588,7 @@ typedef struct PathKey
 
 	EquivalenceClass *pk_eclass;	/* the value that is ordered */
 	Oid			pk_opfamily;	/* btree opfamily defining the ordering */
+	Oid			pk_collation;	/* collation */
 	int			pk_strategy;	/* sort direction (ASC or DESC) */
 	bool		pk_nulls_first; /* do NULLs come before normal values? */
 } PathKey;
@@ -633,6 +635,13 @@ typedef struct Path
  * indexable operators appear in 'indexclauses', they are replaced by the
  * derived indexscannable conditions in 'indexquals'.
  *
+ * 'indexorderbys', if not NIL, is a list of ORDER BY expressions that have
+ * been found to be usable as ordering operators for an amcanorderbyop index.
+ * Note that these are not RestrictInfos, just bare expressions, since they
+ * generally won't yield booleans.  The list will match the path's pathkeys.
+ * Also, unlike the case for quals, it's guaranteed that each expression has
+ * the index key on the left side of the operator.
+ *
  * 'isjoininner' is TRUE if the path is a nestloop inner scan (that is,
  * some of the index conditions are join rather than restriction clauses).
  * Note that the path costs will be calculated differently from a plain
@@ -665,6 +674,7 @@ typedef struct IndexPath
 	IndexOptInfo *indexinfo;
 	List	   *indexclauses;
 	List	   *indexquals;
+	List	   *indexorderbys;
 	bool		isjoininner;
 	ScanDirection indexscandir;
 	Cost		indextotalcost;
@@ -764,6 +774,7 @@ typedef struct MergeAppendPath
 {
 	Path		path;
 	List	   *subpaths;		/* list of component Paths */
+	double		limit_tuples;	/* hard limit on output tuples, or -1 */
 } MergeAppendPath;
 
 /*
@@ -1095,6 +1106,7 @@ typedef struct MergeScanSelCache
 {
 	/* Ordering details (cache lookup key) */
 	Oid			opfamily;		/* btree opfamily defining the ordering */
+	Oid			collation;
 	int			strategy;		/* sort direction (ASC or DESC) */
 	bool		nulls_first;	/* do NULLs come before normal values? */
 	/* Results */
@@ -1356,6 +1368,23 @@ typedef struct PlaceHolderInfo
 	Relids		ph_may_need;	/* highest level it might be needed at */
 	int32		ph_width;		/* estimated attribute width */
 } PlaceHolderInfo;
+
+/*
+ * For each potentially index-optimizable MIN/MAX aggregate function,
+ * root->minmax_aggs stores a MinMaxAggInfo describing it.
+ *
+ * Note: a MIN/MAX agg doesn't really care about the nulls_first property,
+ * so the pathkey's nulls_first flag should be ignored.
+ */
+typedef struct MinMaxAggInfo
+{
+	NodeTag		type;
+
+	Oid			aggfnoid;		/* pg_proc Oid of the aggregate */
+	Oid			aggsortop;		/* Oid of its sort operator */
+	Expr	   *target;			/* expression we are aggregating on */
+	List	   *pathkeys;		/* pathkeys representing needed sort order */
+} MinMaxAggInfo;
 
 /*
  * glob->paramlist keeps track of the PARAM_EXEC slots that we have decided

@@ -9,7 +9,7 @@
  * and implementing search-path-controlled searches.
  *
  *
- * Portions Copyright (c) 1996-2010, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2011, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -23,6 +23,7 @@
 #include "catalog/dependency.h"
 #include "catalog/namespace.h"
 #include "catalog/pg_authid.h"
+#include "catalog/pg_collation.h"
 #include "catalog/pg_conversion.h"
 #include "catalog/pg_conversion_fn.h"
 #include "catalog/pg_namespace.h"
@@ -37,6 +38,7 @@
 #include "catalog/pg_type.h"
 #include "commands/dbcommands.h"
 #include "funcapi.h"
+#include "mb/pg_wchar.h"
 #include "miscadmin.h"
 #include "nodes/makefuncs.h"
 #include "parser/parse_func.h"
@@ -198,6 +200,7 @@ Datum		pg_type_is_visible(PG_FUNCTION_ARGS);
 Datum		pg_function_is_visible(PG_FUNCTION_ARGS);
 Datum		pg_operator_is_visible(PG_FUNCTION_ARGS);
 Datum		pg_opclass_is_visible(PG_FUNCTION_ARGS);
+Datum		pg_collation_is_visible(PG_FUNCTION_ARGS);
 Datum		pg_conversion_is_visible(PG_FUNCTION_ARGS);
 Datum		pg_ts_parser_is_visible(PG_FUNCTION_ARGS);
 Datum		pg_ts_dict_is_visible(PG_FUNCTION_ARGS);
@@ -235,14 +238,14 @@ RangeVarGetRelid(const RangeVar *relation, bool failOK)
 	}
 
 	/*
-	 * If istemp is set, this is a reference to a temp relation.  The parser
-	 * never generates such a RangeVar in simple DML, but it can happen in
-	 * contexts such as "CREATE TEMP TABLE foo (f1 int PRIMARY KEY)".  Such a
-	 * command will generate an added CREATE INDEX operation, which must be
+	 * Some non-default relpersistence value may have been specified.  The
+	 * parser never generates such a RangeVar in simple DML, but it can happen
+	 * in contexts such as "CREATE TEMP TABLE foo (f1 int PRIMARY KEY)".  Such
+	 * a command will generate an added CREATE INDEX operation, which must be
 	 * careful to find the temp table, even when pg_temp is not first in the
 	 * search path.
 	 */
-	if (relation->istemp)
+	if (relation->relpersistence == RELPERSISTENCE_TEMP)
 	{
 		if (relation->schemaname)
 			ereport(ERROR,
@@ -308,7 +311,7 @@ RangeVarGetCreationNamespace(const RangeVar *newRelation)
 							newRelation->relname)));
 	}
 
-	if (newRelation->istemp)
+	if (newRelation->relpersistence == RELPERSISTENCE_TEMP)
 	{
 		/* TEMP tables are created in our backend-local temp namespace */
 		if (newRelation->schemaname)
@@ -1611,6 +1614,89 @@ OpfamilyIsVisible(Oid opfid)
 }
 
 /*
+ * CollationGetCollid
+ *		Try to resolve an unqualified collation name.
+ *		Returns OID if collation found in search path, else InvalidOid.
+ *
+ * This is essentially the same as RelnameGetRelid.
+ */
+Oid
+CollationGetCollid(const char *collname)
+{
+	Oid			collid;
+	ListCell   *l;
+
+	recomputeNamespacePath();
+
+	foreach(l, activeSearchPath)
+	{
+		Oid			namespaceId = lfirst_oid(l);
+
+		if (namespaceId == myTempNamespace)
+			continue;			/* do not look in temp namespace */
+
+		collid = GetSysCacheOid3(COLLNAMEENCNSP,
+								 PointerGetDatum(collname),
+								 Int32GetDatum(GetDatabaseEncoding()),
+								 ObjectIdGetDatum(namespaceId));
+		if (OidIsValid(collid))
+			return collid;
+	}
+
+	/* Not found in path */
+	return InvalidOid;
+}
+
+/*
+ * CollationIsVisible
+ *		Determine whether a collation (identified by OID) is visible in the
+ *		current search path.  Visible means "would be found by searching
+ *		for the unqualified collation name".
+ */
+bool
+CollationIsVisible(Oid collid)
+{
+	HeapTuple	colltup;
+	Form_pg_collation collform;
+	Oid			collnamespace;
+	bool		visible;
+
+	colltup = SearchSysCache1(COLLOID, ObjectIdGetDatum(collid));
+	if (!HeapTupleIsValid(colltup))
+		elog(ERROR, "cache lookup failed for collation %u", collid);
+	collform = (Form_pg_collation) GETSTRUCT(colltup);
+
+	recomputeNamespacePath();
+
+	/*
+	 * Quick check: if it ain't in the path at all, it ain't visible. Items in
+	 * the system namespace are surely in the path and so we needn't even do
+	 * list_member_oid() for them.
+	 */
+	collnamespace = collform->collnamespace;
+	if (collnamespace != PG_CATALOG_NAMESPACE &&
+		!list_member_oid(activeSearchPath, collnamespace))
+		visible = false;
+	else
+	{
+		/*
+		 * If it is in the path, it might still not be visible; it could be
+		 * hidden by another conversion of the same name earlier in the path.
+		 * So we must do a slow check to see if this conversion would be found
+		 * by CollationGetCollid.
+		 */
+		char	   *collname = NameStr(collform->collname);
+
+		visible = (CollationGetCollid(collname) == collid);
+	}
+
+	ReleaseSysCache(colltup);
+
+	return visible;
+}
+
+
+/*
  * ConversionGetConid
  *		Try to resolve an unqualified conversion name.
  *		Returns OID if conversion found in search path, else InvalidOid.
@@ -2340,6 +2426,40 @@ LookupCreationNamespace(const char *nspname)
 }
 
 /*
+ * Common checks on switching namespaces.
+ *
+ * We complain if (1) the old and new namespaces are the same, (2) either the
+ * old or new namespaces is a temporary schema (or temporary toast schema), or
+ * (3) either the old or new namespaces is the TOAST schema.
+ */
+void
+CheckSetNamespace(Oid oldNspOid, Oid nspOid, Oid classid, Oid objid)
+{
+	if (oldNspOid == nspOid)
+		ereport(ERROR,
+				(classid == RelationRelationId ?
+					errcode(ERRCODE_DUPLICATE_TABLE) :
+				 classid == ProcedureRelationId ?
+					errcode(ERRCODE_DUPLICATE_FUNCTION) :
+					errcode(ERRCODE_DUPLICATE_OBJECT),
+				 errmsg("%s is already in schema \"%s\"",
+						getObjectDescriptionOids(classid, objid),
+						get_namespace_name(nspOid))));
+
+	/* disallow renaming into or out of temp schemas */
+	if (isAnyTempNamespace(nspOid) || isAnyTempNamespace(oldNspOid))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("cannot move objects into or out of temporary schemas")));
+
+	/* same for TOAST schema */
+	if (nspOid == PG_TOAST_NAMESPACE || oldNspOid == PG_TOAST_NAMESPACE)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("cannot move objects into or out of TOAST schema")));
+}
+
+/*
  * QualifiedNameGetCreationNamespace
  *		Given a possibly-qualified name for an object (in List-of-Values
  *		format), determine what namespace the object should be created in.
@@ -2772,6 +2892,63 @@ PopOverrideSearchPath(void)
 	}
 }
 
+
+/*
+ * get_collation_oid - find a collation by possibly qualified name
+ */
+Oid
+get_collation_oid(List *name, bool missing_ok)
+{
+	char	   *schemaname;
+	char	   *collation_name;
+	Oid			namespaceId;
+	Oid			colloid = InvalidOid;
+	ListCell   *l;
+	int			encoding;
+
+	encoding = GetDatabaseEncoding();
+
+	/* deconstruct the name list */
+	DeconstructQualifiedName(name, &schemaname, &collation_name);
+
+	if (schemaname)
+	{
+		/* use exact schema given */
+		namespaceId = LookupExplicitNamespace(schemaname);
+		colloid = GetSysCacheOid3(COLLNAMEENCNSP,
+								  PointerGetDatum(collation_name),
+								  Int32GetDatum(encoding),
+								  ObjectIdGetDatum(namespaceId));
+	}
+	else
+	{
+		/* search for it in search path */
+		recomputeNamespacePath();
+
+		foreach(l, activeSearchPath)
+		{
+			namespaceId = lfirst_oid(l);
+
+			if (namespaceId == myTempNamespace)
+				continue;		/* do not look in temp namespace */
+
+			colloid = GetSysCacheOid3(COLLNAMEENCNSP,
+									  PointerGetDatum(collation_name),
+									  Int32GetDatum(encoding),
+									  ObjectIdGetDatum(namespaceId));
+			if (OidIsValid(colloid))
+				return colloid;
+		}
+	}
+
+	/* Not found in path */
+	if (!OidIsValid(colloid) && !missing_ok)
+		ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_OBJECT),
+				 errmsg("collation \"%s\" for current database encoding \"%s\" does not exist",
+						NameListToString(name), GetDatabaseEncodingName())));
+	return colloid;
+}
 
 /*
  * get_conversion_oid - find a conversion by possibly qualified name
@@ -3530,6 +3707,17 @@ pg_opclass_is_visible(PG_FUNCTION_ARGS)
 		PG_RETURN_NULL();
 
 	PG_RETURN_BOOL(OpclassIsVisible(oid));
+}
+
+Datum
+pg_collation_is_visible(PG_FUNCTION_ARGS)
+{
+	Oid			oid = PG_GETARG_OID(0);
+
+	if (!SearchSysCacheExists1(COLLOID, ObjectIdGetDatum(oid)))
+		PG_RETURN_NULL();
+
+	PG_RETURN_BOOL(CollationIsVisible(oid));
 }
 
 Datum

@@ -3,7 +3,7 @@
  * async.c
  *	  Asynchronous notification: NOTIFY, LISTEN, UNLISTEN
  *
- * Portions Copyright (c) 1996-2010, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2011, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -507,7 +507,7 @@ AsyncShmemInit(void)
 		LWLockAcquire(AsyncCtlLock, LW_EXCLUSIVE);
 		slotno = SimpleLruZeroPage(AsyncCtl, QUEUE_POS_PAGE(QUEUE_HEAD));
 		/* This write is just to verify that pg_notify/ is writable */
-		SimpleLruWritePage(AsyncCtl, slotno, NULL);
+		SimpleLruWritePage(AsyncCtl, slotno);
 		LWLockRelease(AsyncCtlLock);
 	}
 }

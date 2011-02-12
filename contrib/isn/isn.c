@@ -4,7 +4,7 @@
  *	  PostgreSQL type definitions for ISNs (ISBN, ISMN, ISSN, EAN13, UPC)
  *
  * Author:	German Mendez Bravo (Kronuz)
- * Portions Copyright (c) 1996-2010, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2011, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *	  contrib/isn/isn.c
@@ -573,7 +573,7 @@ ean2string(ean13 ean, bool errorOK, char *result, bool shortType)
 
 	/* find out what type of hyphenation is needed: */
 	if (!strncmp("978-", result, search))
-	{							/* ISBN */
+	{							/* ISBN -13 978-range */
 		/* The string should be in this form: 978-??000000000-0" */
 		type = ISBN;
 		TABLE = ISBN_range;
@@ -592,6 +592,13 @@ ean2string(ean13 ean, bool errorOK, char *result, bool shortType)
 		type = ISMN;
 		TABLE = ISMN_range;
 		TABLE_index = ISMN_index;
+	}
+	else if (!strncmp("979-", result, search))
+	{							/* ISBN-13 979-range */
+		/* The string should be in this form: 979-??000000000-0" */
+		type = ISBN;
+		TABLE = ISBN_range_new;
+		TABLE_index = ISBN_index_new;
 	}
 	else if (*result == '0')
 	{							/* UPC */

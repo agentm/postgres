@@ -435,10 +435,10 @@ select hstore 'a=>NULL, b=>qq' ?& ARRAY['c','d'];
 select hstore 'a=>NULL, b=>qq' ?& '{}'::text[];
  ?column? 
 ----------
- f
+ t
 (1 row)
 
--- delete 
+-- delete
 select delete('a=>1 , b=>2, c=>3'::hstore, 'a');
        delete       
 --------------------

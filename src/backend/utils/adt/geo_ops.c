@@ -3,7 +3,7 @@
  * geo_ops.c
  *	  2D geometric operations
  *
- * Portions Copyright (c) 1996-2010, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2011, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -1072,13 +1072,20 @@ line_construct_pm(Point *pt, double m)
 {
 	LINE	   *result = (LINE *) palloc(sizeof(LINE));
 
-	/* use "mx - y + yinter = 0" */
-	result->A = m;
-	result->B = -1.0;
 	if (m == DBL_MAX)
-		result->C = pt->y;
+	{
+		/* vertical - use "x = C" */
+		result->A = -1;
+		result->B = 0;
+		result->C = pt->x;
+	}
 	else
+	{
+		/* use "mx - y + yinter = 0" */
+		result->A = m;
+		result->B = -1.0;
 		result->C = pt->y - m * pt->x;
+	}
 
 #ifdef NOT_USED
 	result->m = m;
@@ -3896,7 +3903,7 @@ lseg_inside_poly(Point *a, Point *b, POLYGON *poly, int start)
 	t.p[1] = *b;
 	s.p[0] = poly->p[(start == 0) ? (poly->npts - 1) : (start - 1)];
 
-	for (i = start; i < poly->npts && res == true; i++)
+	for (i = start; i < poly->npts && res; i++)
 	{
 		Point	   *interpt;
 
@@ -3972,7 +3979,7 @@ poly_contain(PG_FUNCTION_ARGS)
 		s.p[0] = polyb->p[polyb->npts - 1];
 		result = true;
 
-		for (i = 0; i < polyb->npts && result == true; i++)
+		for (i = 0; i < polyb->npts && result; i++)
 		{
 			s.p[1] = polyb->p[i];
 			result = lseg_inside_poly(s.p, s.p + 1, polya, 0);

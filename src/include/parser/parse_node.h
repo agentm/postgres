@@ -4,7 +4,7 @@
  *		Internal definitions for parser
  *
  *
- * Portions Copyright (c) 1996-2010, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2011, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/parser/parse_node.h
@@ -139,12 +139,13 @@ extern void cancel_parser_errposition_callback(ParseCallbackState *pcbstate);
 
 extern Var *make_var(ParseState *pstate, RangeTblEntry *rte, int attrno,
 		 int location);
-extern Oid	transformArrayType(Oid arrayType);
+extern Oid	transformArrayType(Oid *arrayType, int32 *arrayTypmod);
 extern ArrayRef *transformArraySubscripts(ParseState *pstate,
 						 Node *arrayBase,
 						 Oid arrayType,
 						 Oid elementType,
-						 int32 elementTypMod,
+						 int32 arrayTypMod,
+						 Oid arrayColl,
 						 List *indirection,
 						 Node *assignFrom);
 extern Const *make_const(ParseState *pstate, Value *value, int location);

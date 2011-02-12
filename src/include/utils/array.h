@@ -46,7 +46,7 @@
  * only work with varlena arrays.
  *
  *
- * Portions Copyright (c) 1996-2010, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2011, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/utils/array.h
@@ -192,6 +192,7 @@ extern Datum array_gt(PG_FUNCTION_ARGS);
 extern Datum array_le(PG_FUNCTION_ARGS);
 extern Datum array_ge(PG_FUNCTION_ARGS);
 extern Datum btarraycmp(PG_FUNCTION_ARGS);
+extern Datum hash_array(PG_FUNCTION_ARGS);
 extern Datum arrayoverlap(PG_FUNCTION_ARGS);
 extern Datum arraycontains(PG_FUNCTION_ARGS);
 extern Datum arraycontained(PG_FUNCTION_ARGS);
@@ -243,6 +244,7 @@ extern void deconstruct_array(ArrayType *array,
 				  Oid elmtype,
 				  int elmlen, bool elmbyval, char elmalign,
 				  Datum **elemsp, bool **nullsp, int *nelemsp);
+extern bool array_contains_nulls(ArrayType *array);
 extern ArrayBuildState *accumArrayResult(ArrayBuildState *astate,
 				 Datum dvalue, bool disnull,
 				 Oid element_type,

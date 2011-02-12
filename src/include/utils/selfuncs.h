@@ -5,7 +5,7 @@
  *	  standard operators and index access methods.
  *
  *
- * Portions Copyright (c) 1996-2010, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2011, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/utils/selfuncs.h
@@ -74,6 +74,7 @@ typedef struct VariableStatData
 	Oid			vartype;		/* exposed type of expression */
 	Oid			atttype;		/* type to pass to get_attstatsslot */
 	int32		atttypmod;		/* typmod to pass to get_attstatsslot */
+	Oid			attcollation;	/* collation of the variable */
 	bool		isunique;		/* true if matched to a unique index */
 } VariableStatData;
 
@@ -178,7 +179,7 @@ extern Selectivity rowcomparesel(PlannerInfo *root,
 			  int varRelid, JoinType jointype, SpecialJoinInfo *sjinfo);
 
 extern void mergejoinscansel(PlannerInfo *root, Node *clause,
-				 Oid opfamily, int strategy, bool nulls_first,
+				 Oid opfamily, Oid collation, int strategy, bool nulls_first,
 				 Selectivity *leftstart, Selectivity *leftend,
 				 Selectivity *rightstart, Selectivity *rightend);
 

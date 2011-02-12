@@ -35,7 +35,7 @@
  * and munge the system catalogs of the new database.
  *
  *
- * Portions Copyright (c) 1996-2010, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2011, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -59,6 +59,7 @@
 #include "catalog/catalog.h"
 #include "catalog/dependency.h"
 #include "catalog/indexing.h"
+#include "catalog/objectaccess.h"
 #include "catalog/pg_tablespace.h"
 #include "commands/comment.h"
 #include "commands/defrem.h"
@@ -333,6 +334,10 @@ CreateTableSpace(CreateTableSpaceStmt *stmt)
 	/* Record dependency on owner */
 	recordDependencyOnOwner(TableSpaceRelationId, tablespaceoid, ownerId);
 
+	/* Post creation hook for new tablespace */
+	InvokeObjectAccessHook(OAT_POST_CREATE,
+						   TableSpaceRelationId, tablespaceoid, 0);
+
 	create_tablespace_directories(location, tablespaceoid);
 
 	/* Record the filesystem change in XLOG */
@@ -547,7 +552,7 @@ create_tablespace_directories(const char *location, const Oid tablespaceoid)
 	 * Attempt to coerce target directory to safe permissions.	If this fails,
 	 * it doesn't exist or has the wrong owner.
 	 */
-	if (chmod(location, 0700) != 0)
+	if (chmod(location, S_IRWXU) != 0)
 	{
 		if (errno == ENOENT)
 			ereport(ERROR,
@@ -608,7 +613,7 @@ create_tablespace_directories(const char *location, const Oid tablespaceoid)
 					 errmsg("could not remove symbolic link \"%s\": %m",
 							linkloc)));
 	}
-	
+
 	/*
 	 * Create the symlink under PGDATA
 	 */
@@ -1045,8 +1050,8 @@ assign_default_tablespace(const char *newval, bool doit, GucSource source)
 /*
  * GetDefaultTablespace -- get the OID of the current default tablespace
  *
- * Regular objects and temporary objects have different default tablespaces,
- * hence the forTemp parameter must be specified.
+ * Temporary objects have different default tablespaces, hence the
+ * relpersistence parameter must be specified.
  *
  * May return InvalidOid to indicate "use the database's default tablespace".
  *
@@ -1057,12 +1062,12 @@ assign_default_tablespace(const char *newval, bool doit, GucSource source)
  * default_tablespace GUC variable.
  */
 Oid
-GetDefaultTablespace(bool forTemp)
+GetDefaultTablespace(char relpersistence)
 {
 	Oid			result;
 
 	/* The temp-table case is handled elsewhere */
-	if (forTemp)
+	if (relpersistence == RELPERSISTENCE_TEMP)
 	{
 		PrepareTempTablespaces();
 		return GetNextTempTableSpace();

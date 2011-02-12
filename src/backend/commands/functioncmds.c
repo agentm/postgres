@@ -5,7 +5,7 @@
  *	  Routines for CREATE and DROP FUNCTION commands and CREATE and DROP
  *	  CAST commands.
  *
- * Portions Copyright (c) 1996-2010, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2011, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -37,6 +37,7 @@
 #include "access/sysattr.h"
 #include "catalog/dependency.h"
 #include "catalog/indexing.h"
+#include "catalog/objectaccess.h"
 #include "catalog/pg_aggregate.h"
 #include "catalog/pg_cast.h"
 #include "catalog/pg_language.h"
@@ -86,7 +87,7 @@ compute_return_type(TypeName *returnType, Oid languageOid,
 	Oid			rettype;
 	Type		typtup;
 
-	typtup = LookupTypeName(NULL, returnType, NULL);
+	typtup = LookupTypeName(NULL, returnType, NULL, NULL);
 
 	if (typtup)
 	{
@@ -206,7 +207,7 @@ examine_parameter_list(List *parameters, Oid languageOid,
 		Oid			toid;
 		Type		typtup;
 
-		typtup = LookupTypeName(NULL, t, NULL);
+		typtup = LookupTypeName(NULL, t, NULL, NULL);
 		if (typtup)
 		{
 			if (!((Form_pg_type) GETSTRUCT(typtup))->typisdefined)
@@ -1496,8 +1497,8 @@ CreateCast(CreateCastStmt *stmt)
 	ObjectAddress myself,
 				referenced;
 
-	sourcetypeid = typenameTypeId(NULL, stmt->sourcetype, NULL);
-	targettypeid = typenameTypeId(NULL, stmt->targettype, NULL);
+	sourcetypeid = typenameTypeId(NULL, stmt->sourcetype);
+	targettypeid = typenameTypeId(NULL, stmt->targettype);
 	sourcetyptype = get_typtype(sourcetypeid);
 	targettyptype = get_typtype(targettypeid);
 
@@ -1657,6 +1658,23 @@ CreateCast(CreateCastStmt *stmt)
 			ereport(ERROR,
 					(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
 					 errmsg("array data types are not binary-compatible")));
+
+		/*
+		 * We also disallow creating binary-compatibility casts involving
+		 * domains.  Casting from a domain to its base type is already
+		 * allowed, and casting the other way ought to go through domain
+		 * coercion to permit constraint checking.  Again, if you're intent on
+		 * having your own semantics for that, create a no-op cast function.
+		 *
+		 * NOTE: if we were to relax this, the above checks for composites
+		 * etc. would have to be modified to look through domains to their
+		 * base types.
+		 */
+		if (sourcetyptype == TYPTYPE_DOMAIN ||
+			targettyptype == TYPTYPE_DOMAIN)
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
+					 errmsg("domain data types must not be marked binary-compatible")));
 	}
 
 	/*
@@ -1744,6 +1762,13 @@ CreateCast(CreateCastStmt *stmt)
 		recordDependencyOn(&myself, &referenced, DEPENDENCY_NORMAL);
 	}
 
+	/* dependency on extension */
+	recordDependencyOnCurrentExtension(&myself);
+
+	/* Post creation hook for new cast */
+	InvokeObjectAccessHook(OAT_POST_CREATE,
+						   CastRelationId, myself.objectId, 0);
+
 	heap_freetuple(tuple);
 
 	heap_close(relation, RowExclusiveLock);
@@ -1762,8 +1787,8 @@ DropCast(DropCastStmt *stmt)
 	ObjectAddress object;
 
 	/* when dropping a cast, the types must exist even if you use IF EXISTS */
-	sourcetypeid = typenameTypeId(NULL, stmt->sourcetype, NULL);
-	targettypeid = typenameTypeId(NULL, stmt->targettype, NULL);
+	sourcetypeid = typenameTypeId(NULL, stmt->sourcetype);
+	targettypeid = typenameTypeId(NULL, stmt->targettype);
 
 	object.classId = CastRelationId;
 	object.objectId = get_cast_oid(sourcetypeid, targettypeid,
@@ -1853,13 +1878,7 @@ AlterFunctionNamespace(List *name, List *argtypes, bool isagg,
 					   const char *newschema)
 {
 	Oid			procOid;
-	Oid			oldNspOid;
 	Oid			nspOid;
-	HeapTuple	tup;
-	Relation	procRel;
-	Form_pg_proc proc;
-
-	procRel = heap_open(ProcedureRelationId, RowExclusiveLock);
 
 	/* get function OID */
 	if (isagg)
@@ -1867,39 +1886,36 @@ AlterFunctionNamespace(List *name, List *argtypes, bool isagg,
 	else
 		procOid = LookupFuncNameTypeNames(name, argtypes, false);
 
-	/* check permissions on function */
-	if (!pg_proc_ownercheck(procOid, GetUserId()))
-		aclcheck_error(ACLCHECK_NOT_OWNER, ACL_KIND_PROC,
-					   NameListToString(name));
+	/* get schema OID and check its permissions */
+	nspOid = LookupCreationNamespace(newschema);
+
+	AlterFunctionNamespace_oid(procOid, nspOid);
+}
+
+Oid
+AlterFunctionNamespace_oid(Oid procOid, Oid nspOid)
+{
+	Oid			oldNspOid;
+	HeapTuple	tup;
+	Relation	procRel;
+	Form_pg_proc proc;
+
+	procRel = heap_open(ProcedureRelationId, RowExclusiveLock);
 
 	tup = SearchSysCacheCopy1(PROCOID, ObjectIdGetDatum(procOid));
 	if (!HeapTupleIsValid(tup))
 		elog(ERROR, "cache lookup failed for function %u", procOid);
 	proc = (Form_pg_proc) GETSTRUCT(tup);
 
+	/* check permissions on function */
+	if (!pg_proc_ownercheck(procOid, GetUserId()))
+		aclcheck_error(ACLCHECK_NOT_OWNER, ACL_KIND_PROC,
+					   NameStr(proc->proname));
+
 	oldNspOid = proc->pronamespace;
 
-	/* get schema OID and check its permissions */
-	nspOid = LookupCreationNamespace(newschema);
-
-	if (oldNspOid == nspOid)
-		ereport(ERROR,
-				(errcode(ERRCODE_DUPLICATE_FUNCTION),
-				 errmsg("function \"%s\" is already in schema \"%s\"",
-						NameListToString(name),
-						newschema)));
-
-	/* disallow renaming into or out of temp schemas */
-	if (isAnyTempNamespace(nspOid) || isAnyTempNamespace(oldNspOid))
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-			errmsg("cannot move objects into or out of temporary schemas")));
-
-	/* same for TOAST schema */
-	if (nspOid == PG_TOAST_NAMESPACE || oldNspOid == PG_TOAST_NAMESPACE)
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("cannot move objects into or out of TOAST schema")));
+	/* common checks on switching namespaces */
+	CheckSetNamespace(oldNspOid, nspOid, ProcedureRelationId, procOid);
 
 	/* check for duplicate name (more friendly than unique-index failure) */
 	if (SearchSysCacheExists3(PROCNAMEARGSNSP,
@@ -1910,7 +1926,7 @@ AlterFunctionNamespace(List *name, List *argtypes, bool isagg,
 				(errcode(ERRCODE_DUPLICATE_FUNCTION),
 				 errmsg("function \"%s\" already exists in schema \"%s\"",
 						NameStr(proc->proname),
-						newschema)));
+						get_namespace_name(nspOid))));
 
 	/* OK, modify the pg_proc row */
 
@@ -1924,11 +1940,13 @@ AlterFunctionNamespace(List *name, List *argtypes, bool isagg,
 	if (changeDependencyFor(ProcedureRelationId, procOid,
 							NamespaceRelationId, oldNspOid, nspOid) != 1)
 		elog(ERROR, "failed to change schema dependency for function \"%s\"",
-			 NameListToString(name));
+			 NameStr(proc->proname));
 
 	heap_freetuple(tup);
 
 	heap_close(procRel, RowExclusiveLock);
+
+	return oldNspOid;
 }
 
 

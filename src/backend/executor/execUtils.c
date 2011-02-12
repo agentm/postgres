@@ -3,7 +3,7 @@
  * execUtils.c
  *	  miscellaneous executor utility routines
  *
- * Portions Copyright (c) 1996-2010, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2011, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -1211,8 +1211,8 @@ check_exclusion_constraint(Relation heap, Relation index, IndexInfo *indexInfo,
 retry:
 	conflict = false;
 	found_self = false;
-	index_scan = index_beginscan(heap, index, &DirtySnapshot,
-								 index_natts, scankeys);
+	index_scan = index_beginscan(heap, index, &DirtySnapshot, index_natts, 0);
+	index_rescan(index_scan, scankeys, index_natts, NULL, 0);
 
 	while ((tup = index_getnext(index_scan,
 								ForwardScanDirection)) != NULL)

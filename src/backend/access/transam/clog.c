@@ -23,7 +23,7 @@
  * for aborts (whether sync or async), since the post-crash assumption would
  * be that such transactions failed anyway.
  *
- * Portions Copyright (c) 1996-2010, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2011, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/backend/access/transam/clog.c
@@ -445,7 +445,7 @@ BootStrapCLOG(void)
 	slotno = ZeroCLOGPage(0, false);
 
 	/* Make sure it's written out */
-	SimpleLruWritePage(ClogCtl, slotno, NULL);
+	SimpleLruWritePage(ClogCtl, slotno);
 	Assert(!ClogCtl->shared->page_dirty[slotno]);
 
 	LWLockRelease(CLogControlLock);
@@ -698,7 +698,7 @@ clog_redo(XLogRecPtr lsn, XLogRecord *record)
 		LWLockAcquire(CLogControlLock, LW_EXCLUSIVE);
 
 		slotno = ZeroCLOGPage(pageno, false);
-		SimpleLruWritePage(ClogCtl, slotno, NULL);
+		SimpleLruWritePage(ClogCtl, slotno);
 		Assert(!ClogCtl->shared->page_dirty[slotno]);
 
 		LWLockRelease(CLogControlLock);

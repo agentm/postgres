@@ -4,7 +4,7 @@
  *	  prototypes for the creator functions (for primitive nodes)
  *
  *
- * Portions Copyright (c) 1996-2010, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2011, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/nodes/makefuncs.h
@@ -27,10 +27,15 @@ extern Var *makeVar(Index varno,
 		AttrNumber varattno,
 		Oid vartype,
 		int32 vartypmod,
+		Oid varcollid,
 		Index varlevelsup);
 
 extern Var *makeVarFromTargetEntry(Index varno,
 								   TargetEntry *tle);
+
+extern Var *makeWholeRowVar(RangeTblEntry *rte,
+				Index varno,
+				Index varlevelsup);
 
 extern TargetEntry *makeTargetEntry(Expr *expr,
 				AttrNumber resno,
@@ -63,10 +68,10 @@ extern RangeVar *makeRangeVar(char *schemaname, char *relname, int location);
 
 extern TypeName *makeTypeName(char *typnam);
 extern TypeName *makeTypeNameFromNameList(List *names);
-extern TypeName *makeTypeNameFromOid(Oid typeOid, int32 typmod);
+extern TypeName *makeTypeNameFromOid(Oid typeOid, int32 typmod, Oid collOid);
 
 extern FuncExpr *makeFuncExpr(Oid funcid, Oid rettype,
-			 List *args, CoercionForm fformat);
+			 List *args, Oid collid, CoercionForm fformat);
 
 extern DefElem *makeDefElem(char *name, Node *arg);
 extern DefElem *makeDefElemExtended(char *nameSpace, char *name, Node *arg,

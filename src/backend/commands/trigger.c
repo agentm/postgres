@@ -3,7 +3,7 @@
  * trigger.c
  *	  PostgreSQL TRIGGERs support code.
  *
- * Portions Copyright (c) 1996-2010, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2011, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -20,6 +20,7 @@
 #include "catalog/catalog.h"
 #include "catalog/dependency.h"
 #include "catalog/indexing.h"
+#include "catalog/objectaccess.h"
 #include "catalog/pg_constraint.h"
 #include "catalog/pg_proc.h"
 #include "catalog/pg_trigger.h"
@@ -421,6 +422,7 @@ CreateTrigger(CreateTrigStmt *stmt, const char *queryString,
 											  CONSTRAINT_TRIGGER,
 											  stmt->deferrable,
 											  stmt->initdeferred,
+											  true,
 											  RelationGetRelid(rel),
 											  NULL,		/* no conkey */
 											  0,
@@ -734,6 +736,10 @@ CreateTrigger(CreateTrigStmt *stmt, const char *queryString,
 	if (whenClause != NULL)
 		recordDependencyOnExpr(&myself, whenClause, whenRtable,
 							   DEPENDENCY_NORMAL);
+
+	/* Post creation hook for new trigger */
+	InvokeObjectAccessHook(OAT_POST_CREATE,
+						   TriggerRelationId, trigoid, 0);
 
 	/* Keep lock on target rel until end of xact */
 	heap_close(rel, NoLock);

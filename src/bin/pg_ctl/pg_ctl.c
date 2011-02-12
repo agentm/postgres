@@ -2,7 +2,7 @@
  *
  * pg_ctl --- start/stops/restarts the PostgreSQL server
  *
- * Portions Copyright (c) 1996-2010, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2011, PostgreSQL Global Development Group
  *
  * src/bin/pg_ctl/pg_ctl.c
  *
@@ -22,6 +22,7 @@
 
 #include <locale.h>
 #include <signal.h>
+#include <time.h>
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -89,6 +90,24 @@ static char *register_username = NULL;
 static char *register_password = NULL;
 static char *argv0 = NULL;
 static bool allow_core_files = false;
+static time_t start_time;
+
+static char postopts_file[MAXPGPATH];
+static char pid_file[MAXPGPATH];
+static char backup_file[MAXPGPATH];
+static char recovery_file[MAXPGPATH];
+
+#if defined(WIN32) || defined(__CYGWIN__)
+static DWORD pgctl_start_type = SERVICE_AUTO_START;
+static SERVICE_STATUS status;
+static SERVICE_STATUS_HANDLE hStatus = (SERVICE_STATUS_HANDLE) 0;
+static HANDLE shutdownHandles[2];
+static pid_t postmasterPID = -1;
+
+#define shutdownEvent	  shutdownHandles[0]
+#define postmasterProcess shutdownHandles[1]
+#endif
+
 
 static void
 write_stderr(const char *fmt,...)
@@ -120,15 +139,6 @@ static void WINAPI pgwin32_ServiceHandler(DWORD);
 static void WINAPI pgwin32_ServiceMain(DWORD, LPTSTR *);
 static void pgwin32_doRunAsService(void);
 static int	CreateRestrictedProcess(char *cmd, PROCESS_INFORMATION *processInfo, bool as_service);
-
-static DWORD pgctl_start_type = SERVICE_AUTO_START;
-static SERVICE_STATUS status;
-static SERVICE_STATUS_HANDLE hStatus = (SERVICE_STATUS_HANDLE) 0;
-static HANDLE shutdownHandles[2];
-static pid_t postmasterPID = -1;
-
-#define shutdownEvent	  shutdownHandles[0]
-#define postmasterProcess shutdownHandles[1]
 #endif
 
 static pgpid_t get_pgpid(void);
@@ -136,14 +146,8 @@ static char **readfile(const char *path);
 static int	start_postmaster(void);
 static void read_post_opts(void);
 
-static bool test_postmaster_connection(bool);
+static PGPing test_postmaster_connection(bool);
 static bool postmaster_is_alive(pid_t pid);
-
-static char postopts_file[MAXPGPATH];
-static char pid_file[MAXPGPATH];
-static char conf_file[MAXPGPATH];
-static char backup_file[MAXPGPATH];
-static char recovery_file[MAXPGPATH];
 
 #if defined(HAVE_GETRLIMIT) && defined(RLIMIT_CORE)
 static void unlimit_core_size(void);
@@ -397,153 +401,164 @@ start_postmaster(void)
 
 /*
  * Find the pgport and try a connection
+ *
  * Note that the checkpoint parameter enables a Windows service control
  * manager checkpoint, it's got nothing to do with database checkpoints!!
  */
-static bool
+static PGPing
 test_postmaster_connection(bool do_checkpoint)
 {
-	PGconn	   *conn;
-	bool		success = false;
+	PGPing		ret = PQPING_OK;	/* assume success for wait == zero */
+	char		connstr[MAXPGPATH * 2 + 256];
 	int			i;
-	char		portstr[32];
-	char	   *p;
-	char	   *q;
-	char		connstr[128];	/* Should be way more than enough! */
 
-	*portstr = '\0';
-
-	/*
-	 * Look in post_opts for a -p switch.
-	 *
-	 * This parsing code is not amazingly bright; it could for instance get
-	 * fooled if ' -p' occurs within a quoted argument value.  Given that few
-	 * people pass complicated settings in post_opts, it's probably good
-	 * enough.
-	 */
-	for (p = post_opts; *p;)
-	{
-		/* advance past whitespace */
-		while (isspace((unsigned char) *p))
-			p++;
-
-		if (strncmp(p, "-p", 2) == 0)
-		{
-			p += 2;
-			/* advance past any whitespace/quoting */
-			while (isspace((unsigned char) *p) || *p == '\'' || *p == '"')
-				p++;
-			/* find end of value (not including any ending quote!) */
-			q = p;
-			while (*q &&
-				   !(isspace((unsigned char) *q) || *q == '\'' || *q == '"'))
-				q++;
-			/* and save the argument value */
-			strlcpy(portstr, p, Min((q - p) + 1, sizeof(portstr)));
-			/* keep looking, maybe there is another -p */
-			p = q;
-		}
-		/* Advance to next whitespace */
-		while (*p && !isspace((unsigned char) *p))
-			p++;
-	}
-
-	/*
-	 * Search config file for a 'port' option.
-	 *
-	 * This parsing code isn't amazingly bright either, but it should be okay
-	 * for valid port settings.
-	 */
-	if (!*portstr)
-	{
-		char	  **optlines;
-
-		optlines = readfile(conf_file);
-		if (optlines != NULL)
-		{
-			for (; *optlines != NULL; optlines++)
-			{
-				p = *optlines;
-
-				while (isspace((unsigned char) *p))
-					p++;
-				if (strncmp(p, "port", 4) != 0)
-					continue;
-				p += 4;
-				while (isspace((unsigned char) *p))
-					p++;
-				if (*p != '=')
-					continue;
-				p++;
-				/* advance past any whitespace/quoting */
-				while (isspace((unsigned char) *p) || *p == '\'' || *p == '"')
-					p++;
-				/* find end of value (not including any ending quote/comment!) */
-				q = p;
-				while (*q &&
-					   !(isspace((unsigned char) *q) ||
-						 *q == '\'' || *q == '"' || *q == '#'))
-					q++;
-				/* and save the argument value */
-				strlcpy(portstr, p, Min((q - p) + 1, sizeof(portstr)));
-				/* keep looking, maybe there is another */
-			}
-		}
-	}
-
-	/* Check environment */
-	if (!*portstr && getenv("PGPORT") != NULL)
-		strlcpy(portstr, getenv("PGPORT"), sizeof(portstr));
-
-	/* Else use compiled-in default */
-	if (!*portstr)
-		snprintf(portstr, sizeof(portstr), "%d", DEF_PGPORT);
-
-	/*
-	 * We need to set a connect timeout otherwise on Windows the SCM will
-	 * probably timeout first
-	 */
-	snprintf(connstr, sizeof(connstr),
-			 "dbname=postgres port=%s connect_timeout=5", portstr);
-
+	connstr[0] = '\0';
+	
 	for (i = 0; i < wait_seconds; i++)
 	{
-		if ((conn = PQconnectdb(connstr)) != NULL &&
-			(PQstatus(conn) == CONNECTION_OK ||
-			 PQconnectionNeedsPassword(conn)))
+		/* Do we need a connection string? */
+		if (connstr[0] == '\0')
 		{
-			PQfinish(conn);
-			success = true;
-			break;
+			/*----------
+			 * The number of lines in postmaster.pid tells us several things:
+			 *
+			 * # of lines
+			 *		0	lock file created but status not written
+			 *		2	pre-9.1 server, shared memory not created
+			 *		3	pre-9.1 server, shared memory created
+			 *		5	9.1+ server, ports not opened
+			 *		6	9.1+ server, shared memory not created
+			 *		7	9.1+ server, shared memory created
+			 *
+			 * This code does not support pre-9.1 servers.  On Unix machines
+			 * we could consider extracting the port number from the shmem
+			 * key, but that (a) is not robust, and (b) doesn't help with
+			 * finding out the socket directory.  And it wouldn't work anyway
+			 * on Windows.
+			 *
+			 * If we see less than 6 lines in postmaster.pid, just keep
+			 * waiting.
+			 *----------
+			 */
+			char	  **optlines;
+
+			/* Try to read the postmaster.pid file */
+			if ((optlines = readfile(pid_file)) != NULL &&
+				optlines[0] != NULL &&
+				optlines[1] != NULL &&
+				optlines[2] != NULL)
+			{
+				if (optlines[3] == NULL)
+				{
+					/* File is exactly three lines, must be pre-9.1 */
+					write_stderr(_("%s: -w option is not supported when starting a pre-9.1 server\n"),
+								 progname);
+					return PQPING_NO_ATTEMPT;
+				}
+				else if (optlines[4] != NULL &&
+						 optlines[5] != NULL)
+				{
+					/* File is complete enough for us, parse it */
+					time_t	pmstart;
+					int		portnum;
+					char   *sockdir;
+					char   *hostaddr;
+					char	host_str[MAXPGPATH];
+
+					/*
+					 * Easy cross-check that we are looking at the right data
+					 * directory: is the postmaster older than this execution
+					 * of pg_ctl?  Subtract 2 seconds to allow for possible
+					 * clock skew between pg_ctl and the postmaster.
+					 */
+					pmstart = atol(optlines[LOCK_FILE_LINE_START_TIME - 1]);
+					if (pmstart < start_time - 2)
+					{
+						write_stderr(_("%s: this data directory is running a pre-existing postmaster\n"),
+									 progname);
+						return PQPING_NO_ATTEMPT;
+					}
+
+					/*
+					 * OK, extract port number and host string to use.
+					 * Prefer using Unix socket if available.
+					 */
+					portnum = atoi(optlines[LOCK_FILE_LINE_PORT - 1]);
+
+					sockdir = optlines[LOCK_FILE_LINE_SOCKET_DIR - 1];
+					hostaddr = optlines[LOCK_FILE_LINE_LISTEN_ADDR - 1];
+
+					/*
+					 * While unix_socket_directory can accept relative
+					 * directories, libpq's host parameter must have a leading
+					 * slash to indicate a socket directory.  So, ignore
+					 * sockdir if it's relative, and try to use TCP instead.
+					 */
+					if (sockdir[0] == '/')
+						strlcpy(host_str, sockdir, sizeof(host_str));
+					else
+						strlcpy(host_str, hostaddr, sizeof(host_str));
+
+					/* remove trailing newline */
+					if (strchr(host_str, '\n') != NULL)
+						*strchr(host_str, '\n') = '\0';
+
+					/* Fail if we couldn't get either sockdir or host addr */
+					if (host_str[0] == '\0')
+					{
+						write_stderr(_("%s: -w option cannot use a relative socket directory specification\n"),
+									 progname);
+						return PQPING_NO_ATTEMPT;
+					}
+
+					/* If postmaster is listening on "*", use "localhost" */
+					if (strcmp(host_str, "*") == 0)
+						strcpy(host_str, "localhost");
+
+					/*
+					 * We need to set connect_timeout otherwise on Windows the
+					 * Service Control Manager (SCM) will probably timeout
+					 * first.
+					 */
+					snprintf(connstr, sizeof(connstr),
+							 "dbname=postgres port=%d host='%s' connect_timeout=5",
+							 portnum, host_str);
+				}
+			}
+		}
+
+		/* If we have a connection string, ping the server */
+		if (connstr[0] != '\0')
+		{
+			ret = PQping(connstr);
+			if (ret == PQPING_OK || ret == PQPING_NO_ATTEMPT)
+				break;
+		}
+
+		/* No response, or startup still in process; wait */
+#if defined(WIN32)
+		if (do_checkpoint)
+		{
+			/*
+			 * Increment the wait hint by 6 secs (connection timeout +
+			 * sleep) We must do this to indicate to the SCM that our
+			 * startup time is changing, otherwise it'll usually send a
+			 * stop signal after 20 seconds, despite incrementing the
+			 * checkpoint counter.
+			 */
+			status.dwWaitHint += 6000;
+			status.dwCheckPoint++;
+			SetServiceStatus(hStatus, (LPSERVICE_STATUS) &status);
 		}
 		else
-		{
-			PQfinish(conn);
-
-#if defined(WIN32)
-			if (do_checkpoint)
-			{
-				/*
-				 * Increment the wait hint by 6 secs (connection timeout +
-				 * sleep) We must do this to indicate to the SCM that our
-				 * startup time is changing, otherwise it'll usually send a
-				 * stop signal after 20 seconds, despite incrementing the
-				 * checkpoint counter.
-				 */
-				status.dwWaitHint += 6000;
-				status.dwCheckPoint++;
-				SetServiceStatus(hStatus, (LPSERVICE_STATUS) &status);
-			}
-
-			else
 #endif
-				print_msg(".");
+			print_msg(".");
 
-			pg_usleep(1000000); /* 1 sec */
-		}
+		pg_usleep(1000000); /* 1 sec */
 	}
 
-	return success;
+	/* return result of last call to PQping */
+	return ret;
 }
 
 
@@ -748,17 +763,28 @@ do_start(void)
 	{
 		print_msg(_("waiting for server to start..."));
 
-		if (test_postmaster_connection(false) == false)
+		switch (test_postmaster_connection(false))
 		{
-			write_stderr(_("%s: could not start server\n"
-						   "Examine the log output.\n"),
-						 progname);
-			exit(1);
-		}
-		else
-		{
-			print_msg(_(" done\n"));
-			print_msg(_("server started\n"));
+			case PQPING_OK:
+				print_msg(_(" done\n"));
+				print_msg(_("server started\n"));
+				break;
+			case PQPING_REJECT:
+				print_msg(_(" stopped waiting\n"));
+				print_msg(_("server is still starting up\n"));
+				break;
+			case PQPING_NO_RESPONSE:
+				print_msg(_(" stopped waiting\n"));
+				write_stderr(_("%s: could not start server\n"
+							   "Examine the log output.\n"),
+							 progname);
+				exit(1);
+				break;
+			case PQPING_NO_ATTEMPT:
+				print_msg(_(" failed\n"));
+				write_stderr(_("%s: could not wait for server because of misconfiguration\n"),
+							 progname);
+				exit(1);
 		}
 	}
 	else
@@ -1292,7 +1318,7 @@ pgwin32_ServiceMain(DWORD argc, LPTSTR *argv)
 	if (do_wait)
 	{
 		write_eventlog(EVENTLOG_INFORMATION_TYPE, _("Waiting for server startup...\n"));
-		if (test_postmaster_connection(true) == false)
+		if (test_postmaster_connection(true) != PQPING_OK)
 		{
 			write_eventlog(EVENTLOG_INFORMATION_TYPE, _("Timed out waiting for server startup\n"));
 			pgwin32_SetServiceStatus(SERVICE_STOPPED);
@@ -1760,6 +1786,7 @@ main(int argc, char **argv)
 
 	progname = get_progname(argv[0]);
 	set_pglocale_pgservice(argv[0], PG_TEXTDOMAIN("pg_ctl"));
+	start_time = time(NULL);
 
 	/*
 	 * save argv[0] so do_start() can look for the postmaster if necessary. we
@@ -1767,7 +1794,7 @@ main(int argc, char **argv)
 	 */
 	argv0 = argv[0];
 
-	umask(077);
+	umask(S_IRWXG | S_IRWXO);
 
 	/* support --help and --version even if invoked as root */
 	if (argc > 1)
@@ -2007,7 +2034,6 @@ main(int argc, char **argv)
 	{
 		snprintf(postopts_file, MAXPGPATH, "%s/postmaster.opts", pg_data);
 		snprintf(pid_file, MAXPGPATH, "%s/postmaster.pid", pg_data);
-		snprintf(conf_file, MAXPGPATH, "%s/postgresql.conf", pg_data);
 		snprintf(backup_file, MAXPGPATH, "%s/backup_label", pg_data);
 		snprintf(recovery_file, MAXPGPATH, "%s/recovery.conf", pg_data);
 	}

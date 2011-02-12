@@ -7,7 +7,7 @@
 #    header files.  The .bki files are used to initialize the postgres
 #    template database.
 #
-# Portions Copyright (c) 1996-2010, PostgreSQL Global Development Group
+# Portions Copyright (c) 1996-2011, PostgreSQL Global Development Group
 # Portions Copyright (c) 1994, Regents of the University of California
 #
 # src/backend/catalog/genbki.pl
@@ -264,7 +264,7 @@ print SCHEMAPG <<EOM;
  * schemapg.h
  *    Schema_pg_xxx macros for use by relcache.c
  *
- * Portions Copyright (c) 1996-2010, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2011, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * NOTES
@@ -340,6 +340,7 @@ sub emit_pgattr_row
             $row{attalign}    = $type->{typalign};
             # set attndims if it's an array type
             $row{attndims}    = $type->{typcategory} eq 'A' ? '1' : '0';
+            $row{attcollation} = $type->{typcollation};
             # attnotnull must be set true if the type is fixed-width and
             # prior columns are too --- compare DefineAttr in bootstrap.c.
             # oidvector and int2vector are also treated as not-nullable.

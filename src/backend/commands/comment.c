@@ -4,7 +4,7 @@
  *
  * PostgreSQL object comments utility code.
  *
- * Copyright (c) 1996-2010, PostgreSQL Global Development Group
+ * Copyright (c) 1996-2011, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *	  src/backend/commands/comment.c
@@ -91,6 +91,7 @@ CommentObject(CommentStmt *stmt)
 		case OBJECT_SEQUENCE:
 		case OBJECT_TABLE:
 		case OBJECT_VIEW:
+		case OBJECT_FOREIGN_TABLE:
 			if (!pg_class_ownercheck(RelationGetRelid(relation), GetUserId()))
 				aclcheck_error(ACLCHECK_NOT_OWNER, ACL_KIND_CLASS,
 							   RelationGetRelationName(relation));
@@ -104,6 +105,7 @@ CommentObject(CommentStmt *stmt)
 							   strVal(linitial(stmt->objname)));
 			break;
 		case OBJECT_TYPE:
+		case OBJECT_DOMAIN:
 			if (!pg_type_ownercheck(address.objectId, GetUserId()))
 				aclcheck_error(ACLCHECK_NOT_OWNER, ACL_KIND_TYPE,
 							   format_type_be(address.objectId));
@@ -131,6 +133,11 @@ CommentObject(CommentStmt *stmt)
 				aclcheck_error(ACLCHECK_NOT_OWNER, ACL_KIND_NAMESPACE,
 							   strVal(linitial(stmt->objname)));
 			break;
+		case OBJECT_COLLATION:
+			if (!pg_collation_ownercheck(address.objectId, GetUserId()))
+				aclcheck_error(ACLCHECK_NOT_OWNER, ACL_KIND_COLLATION,
+							   NameListToString(stmt->objname));
+			break;
 		case OBJECT_CONVERSION:
 			if (!pg_conversion_ownercheck(address.objectId, GetUserId()))
 				aclcheck_error(ACLCHECK_NOT_OWNER, ACL_KIND_CONVERSION,
@@ -141,6 +148,12 @@ CommentObject(CommentStmt *stmt)
 				ereport(ERROR,
 						(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
 					 errmsg("must be superuser to comment on procedural language")));
+			break;
+		case OBJECT_EXTENSION:
+			if (!superuser())
+				ereport(ERROR,
+						(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+						 errmsg("must be superuser to comment on extension")));
 			break;
 		case OBJECT_OPCLASS:
 			if (!pg_opclass_ownercheck(address.objectId, GetUserId()))
@@ -208,7 +221,7 @@ CommentObject(CommentStmt *stmt)
 	 * catalog.  Comments on all other objects are recorded in pg_description.
 	 */
 	if (stmt->objtype == OBJECT_DATABASE || stmt->objtype == OBJECT_TABLESPACE
-		|| stmt->objtype == OBJECT_ROLE)	
+		|| stmt->objtype == OBJECT_ROLE)
 		CreateSharedComments(address.objectId, address.classId, stmt->comment);
 	else
 		CreateComments(address.objectId, address.classId, address.objectSubId,
@@ -574,18 +587,20 @@ CheckAttributeComment(Relation relation)
 					   RelationGetRelationName(relation));
 
 	/*
-	 * Allow comments only on columns of tables, views, and composite types
-	 * (which are the only relkinds for which pg_dump will dump per-column
-	 * comments).  In particular we wish to disallow comments on index
-	 * columns, because the naming of an index's columns may change across PG
-	 * versions, so dumping per-column comments could create reload failures.
+	 * Allow comments only on columns of tables, views, composite types, and
+	 * foreign tables (which are the only relkinds for which pg_dump will dump
+	 * per-column comments).  In particular we wish to disallow comments on
+	 * index columns, because the naming of an index's columns may change
+	 * across PG versions, so dumping per-column comments could create reload
+	 * failures.
 	 */
 	if (relation->rd_rel->relkind != RELKIND_RELATION &&
 		relation->rd_rel->relkind != RELKIND_VIEW &&
-		relation->rd_rel->relkind != RELKIND_COMPOSITE_TYPE)
+		relation->rd_rel->relkind != RELKIND_COMPOSITE_TYPE &&
+		relation->rd_rel->relkind != RELKIND_FOREIGN_TABLE)
 		ereport(ERROR,
 				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
-				 errmsg("\"%s\" is not a table, view, or composite type",
+				 errmsg("\"%s\" is not a table, view, composite type, or foreign table",
 						RelationGetRelationName(relation))));
 }
 
@@ -607,8 +622,8 @@ CheckCastComment(List *qualname, List *arguments)
 	targettype = (TypeName *) linitial(arguments);
 	Assert(IsA(targettype, TypeName));
 
-	sourcetypeid = typenameTypeId(NULL, sourcetype, NULL);
-	targettypeid = typenameTypeId(NULL, targettype, NULL);
+	sourcetypeid = typenameTypeId(NULL, sourcetype);
+	targettypeid = typenameTypeId(NULL, targettype);
 
 	/* Permission check */
 	if (!pg_type_ownercheck(sourcetypeid, GetUserId())

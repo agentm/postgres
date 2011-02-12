@@ -19,7 +19,7 @@
  * data across crashes.  During database startup, we simply force the
  * currently-active page of SUBTRANS to zeroes.
  *
- * Portions Copyright (c) 1996-2010, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2011, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/backend/access/transam/subtrans.c
@@ -205,7 +205,7 @@ BootStrapSUBTRANS(void)
 	slotno = ZeroSUBTRANSPage(0);
 
 	/* Make sure it's written out */
-	SimpleLruWritePage(SubTransCtl, slotno, NULL);
+	SimpleLruWritePage(SubTransCtl, slotno);
 	Assert(!SubTransCtl->shared->page_dirty[slotno]);
 
 	LWLockRelease(SubtransControlLock);

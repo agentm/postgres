@@ -3,7 +3,7 @@
  * conversioncmds.c
  *	  conversion creation command support code
  *
- * Portions Copyright (c) 1996-2010, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2011, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -19,7 +19,9 @@
 #include "catalog/indexing.h"
 #include "catalog/pg_conversion.h"
 #include "catalog/pg_conversion_fn.h"
+#include "catalog/pg_namespace.h"
 #include "catalog/pg_type.h"
+#include "commands/alter.h"
 #include "commands/conversioncmds.h"
 #include "mb/pg_wchar.h"
 #include "miscadmin.h"
@@ -325,4 +327,53 @@ AlterConversionOwner_internal(Relation rel, Oid conversionOid, Oid newOwnerId)
 	}
 
 	heap_freetuple(tup);
+}
+
+/*
+ * Execute ALTER CONVERSION SET SCHEMA
+ */
+void
+AlterConversionNamespace(List *name, const char *newschema)
+{
+	Oid			convOid, nspOid;
+	Relation	rel;
+
+	rel = heap_open(ConversionRelationId, RowExclusiveLock);
+
+	convOid = get_conversion_oid(name, false);
+
+	/* get schema OID */
+	nspOid = LookupCreationNamespace(newschema);
+
+	AlterObjectNamespace(rel, CONVOID, CONNAMENSP,
+						 convOid, nspOid,
+						 Anum_pg_conversion_conname,
+						 Anum_pg_conversion_connamespace,
+						 Anum_pg_conversion_conowner,
+						 ACL_KIND_CONVERSION);
+
+	heap_close(rel, RowExclusiveLock);
+}
+
+/*
+ * Change conversion schema, by oid
+ */
+Oid
+AlterConversionNamespace_oid(Oid convOid, Oid newNspOid)
+{
+	Oid         oldNspOid;
+	Relation	rel;
+
+	rel = heap_open(ConversionRelationId, RowExclusiveLock);
+
+	oldNspOid = AlterObjectNamespace(rel, CONVOID, CONNAMENSP,
+									 convOid, newNspOid,
+									 Anum_pg_conversion_conname,
+									 Anum_pg_conversion_connamespace,
+									 Anum_pg_conversion_conowner,
+									 ACL_KIND_CONVERSION);
+
+	heap_close(rel, RowExclusiveLock);
+
+	return oldNspOid;
 }

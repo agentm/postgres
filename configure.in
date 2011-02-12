@@ -23,7 +23,7 @@ m4_if(m4_defn([m4_PACKAGE_VERSION]), [2.63], [], [m4_fatal([Autoconf version 2.6
 Untested combinations of 'autoconf' and PostgreSQL versions are not
 recommended.  You can remove the check from 'configure.in' but it is then
 your responsibility whether the result works or not.])])
-AC_COPYRIGHT([Copyright (c) 1996-2010, PostgreSQL Global Development Group])
+AC_COPYRIGHT([Copyright (c) 1996-2011, PostgreSQL Global Development Group])
 AC_CONFIG_SRCDIR([src/backend/access/common/heaptuple.c])
 AC_CONFIG_AUX_DIR(config)
 AC_PREFIX_DEFAULT(/usr/local/pgsql)
@@ -230,7 +230,7 @@ AC_SUBST(enable_coverage)
 #
 PGAC_ARG_BOOL(enable, dtrace, no,
               [build with DTrace support],
-[AC_DEFINE([ENABLE_DTRACE], 1, 
+[AC_DEFINE([ENABLE_DTRACE], 1,
            [Define to 1 to enable DTrace support. (--enable-dtrace)])
 AC_CHECK_PROGS(DTRACE, dtrace)
 if test -z "$DTRACE"; then
@@ -262,14 +262,14 @@ AC_DEFINE_UNQUOTED([BLCKSZ], ${BLCKSZ}, [
  can set it bigger if you need bigger tuples (although TOAST should
  reduce the need to have large tuples, since fields can be spread
  across multiple tuples).
- 
+
  BLCKSZ must be a power of 2.  The maximum possible value of BLCKSZ
  is currently 2^15 (32768).  This is determined by the 15-bit widths
  of the lp_off and lp_len fields in ItemIdData (see
  include/storage/itemid.h).
- 
+
  Changing BLCKSZ requires an initdb.
-]) 
+])
 
 #
 # Relation segment size
@@ -288,7 +288,7 @@ AC_DEFINE_UNQUOTED([RELSEG_SIZE], ${RELSEG_SIZE}, [
  RELSEG_SIZE is the maximum number of blocks allowed in one disk file.
  Thus, the maximum size of a single file is RELSEG_SIZE * BLCKSZ;
  relations bigger than that are divided into multiple files.
- 
+
  RELSEG_SIZE * BLCKSZ must be less than your OS' limit on file size.
  This is often 2 GB or 4GB in a 32-bit operating system, unless you
  have large file support enabled.  By default, we make the limit 1 GB
@@ -329,7 +329,7 @@ AC_DEFINE_UNQUOTED([XLOG_BLCKSZ], ${XLOG_BLCKSZ}, [
  buffers, else direct I/O may fail.
 
  Changing XLOG_BLCKSZ requires an initdb.
-]) 
+])
 
 #
 # WAL segment size
@@ -429,6 +429,8 @@ if test "$GCC" = yes -a "$ICC" = no; then
   # These work in some but not all gcc versions
   PGAC_PROG_CC_CFLAGS_OPT([-Wdeclaration-after-statement])
   PGAC_PROG_CC_CFLAGS_OPT([-Wendif-labels])
+  # This was included in -Wall/-Wformat in older GCC versions
+  PGAC_PROG_CC_CFLAGS_OPT([-Wformat-security])
   # Disable strict-aliasing rules; needed for gcc 3.3+
   PGAC_PROG_CC_CFLAGS_OPT([-fno-strict-aliasing])
   # Disable optimizations that assume no overflow; needed for gcc 4.3+
@@ -461,7 +463,7 @@ fi
 # enable profiling if --enable-profiling
 if test "$enable_profiling" = yes && test "$ac_cv_prog_cc_g" = yes; then
   if test "$GCC" = yes; then
-    AC_DEFINE([PROFILE_PID_DIR], 1, 
+    AC_DEFINE([PROFILE_PID_DIR], 1,
            [Define to 1 to allow profiling output to be saved separately for each process.])
     CFLAGS="$CFLAGS -pg $PLATFORM_PROFILE_FLAGS"
   else
@@ -676,6 +678,13 @@ PGAC_ARG_BOOL(with, openssl, no, [build with OpenSSL support],
 AC_MSG_RESULT([$with_openssl])
 AC_SUBST(with_openssl)
 
+#
+# SELinux
+#
+AC_MSG_CHECKING([whether to build with SELinux support])
+PGAC_ARG_BOOL(with, selinux, no, [build with SELinux support])
+AC_SUBST(with_selinux)
+AC_MSG_RESULT([$with_selinux])
 
 #
 # Readline
@@ -948,6 +957,12 @@ if test "$with_libxslt" = yes ; then
   AC_CHECK_LIB(xslt, xsltCleanupGlobals, [], [AC_MSG_ERROR([library 'xslt' is required for XSLT support])])
 fi
 
+# for contrib/sepgsql
+if test "$with_selinux" = yes; then
+  AC_CHECK_LIB(selinux, getpeercon_raw, [],
+               [AC_MSG_ERROR([library 'libselinux' is required for SELinux support])])
+fi
+
 # for contrib/uuid-ossp
 if test "$with_ossp_uuid" = yes ; then
   AC_CHECK_LIB(ossp-uuid, uuid_export,
@@ -1103,6 +1118,8 @@ AC_TYPE_INTPTR_T
 AC_TYPE_UINTPTR_T
 AC_TYPE_LONG_LONG_INT
 
+PGAC_TYPE_LOCALE_T
+
 AC_CHECK_TYPES([struct cmsgcred, struct fcred, struct sockcred], [], [],
 [#include <sys/param.h>
 #include <sys/types.h>
@@ -1141,7 +1158,7 @@ if test "$with_krb5" = yes; then
   AC_MSG_CHECKING(for krb5_free_unparsed_name)
   AC_TRY_LINK([#include <krb5.h>],
               [krb5_free_unparsed_name(NULL,NULL);],
-              [AC_DEFINE(HAVE_KRB5_FREE_UNPARSED_NAME, 1, [Define to 1 if you have krb5_free_unparsed_name]) 
+              [AC_DEFINE(HAVE_KRB5_FREE_UNPARSED_NAME, 1, [Define to 1 if you have krb5_free_unparsed_name])
 AC_MSG_RESULT(yes)],
               [AC_MSG_RESULT(no)])
 fi
@@ -1156,8 +1173,8 @@ AC_SYS_LARGEFILE
 AC_CHECK_SIZEOF([off_t])
 
 # If we don't have largefile support, can't handle segsize >= 2GB.
-if test "$ac_cv_sizeof_off_t" -lt 8 -a "$segsize" != "1"; then 
-   AC_MSG_ERROR([Large file support is not enabled. Segment size cannot be larger than 1GB.]) 
+if test "$ac_cv_sizeof_off_t" -lt 8 -a "$segsize" != "1"; then
+   AC_MSG_ERROR([Large file support is not enabled. Segment size cannot be larger than 1GB.])
 fi
 
 
@@ -1228,8 +1245,8 @@ if test "$PORTNAME" = "win32"; then
   #
   # To properly translate all NLS languages strings, we must support the
   # *printf() %$ format, which allows *printf() arguments to be selected
-  # by position in the translated string. 
-  # 
+  # by position in the translated string.
+  #
   # libintl versions < 0.13 use the native *printf() functions, and Win32
   # *printf() doesn't understand %$, so we must use our /port versions,
   # which do understand %$. libintl versions >= 0.13 include their own
@@ -1328,6 +1345,13 @@ if test "$PORTNAME" = "solaris"; then
   AC_LIBOBJ(getopt)
 fi
 
+# mingw has adopted a GNU-centric interpretation of optind/optreset,
+# so always use our version on Windows.
+if test "$PORTNAME" = "win32"; then
+  AC_LIBOBJ(getopt)
+  AC_LIBOBJ(getopt_long)
+fi
+
 # Cygwin's erand48() is broken (always returns zero) in some releases,
 # so force use of ours.
 if test "$PORTNAME" = "cygwin"; then
@@ -1336,13 +1360,23 @@ fi
 
 # Win32 support
 if test "$PORTNAME" = "win32"; then
-AC_REPLACE_FUNCS(gettimeofday)
-AC_LIBOBJ(kill)
-AC_LIBOBJ(open)
-AC_LIBOBJ(win32env)
-AC_LIBOBJ(win32error)
-AC_DEFINE([HAVE_SYMLINK], 1,
-          [Define to 1 if you have the `symlink' function.])
+  AC_REPLACE_FUNCS(gettimeofday)
+  AC_LIBOBJ(kill)
+  AC_LIBOBJ(open)
+  AC_LIBOBJ(win32env)
+  AC_LIBOBJ(win32error)
+  AC_DEFINE([HAVE_SYMLINK], 1,
+            [Define to 1 if you have the `symlink' function.])
+  AC_CHECK_TYPES(MINIDUMP_TYPE, [pgac_minidump_type=yes], [pgac_minidump_type=no], [
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#include <string.h>
+#include <dbghelp.h>])
+fi
+if test x"$pgac_minidump_type" = x"yes" ; then
+  AC_SUBST(have_win32_dbghelp,yes)
+else
+  AC_SUBST(have_win32_dbghelp,no)
 fi
 
 if test "$with_readline" = yes; then
@@ -1590,7 +1624,7 @@ AC_CHECK_SIZEOF([size_t])
 AC_CHECK_SIZEOF([long])
 
 # Decide whether float4 is passed by value: user-selectable, enabled by default
-AC_MSG_CHECKING([whether to build with float4 passed by value])   
+AC_MSG_CHECKING([whether to build with float4 passed by value])
 PGAC_ARG_BOOL(enable, float4-byval, yes, [disable float4 passed by value],
               [AC_DEFINE([USE_FLOAT4_BYVAL], 1,
                          [Define to 1 if you want float4 values to be passed by value. (--enable-float4-byval)])
@@ -1858,7 +1892,7 @@ AC_CONFIG_LINKS([
 
 if test "$PORTNAME" = "win32"; then
 AC_CONFIG_COMMANDS([check_win32_symlinks],[
-# Links sometimes fail undetected on Mingw - 
+# Links sometimes fail undetected on Mingw -
 # so here we detect it and warn the user
 for FILE in $CONFIG_LINKS
  do

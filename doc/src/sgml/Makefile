@@ -52,7 +52,7 @@ override XSLTPROCFLAGS += --stringparam pg.version '$(VERSION)'
 
 
 GENERATED_SGML = bookindex.sgml version.sgml \
-	features-supported.sgml features-unsupported.sgml
+	features-supported.sgml features-unsupported.sgml errcodes-table.sgml
 
 ALLSGML := $(wildcard $(srcdir)/*.sgml $(srcdir)/ref/*.sgml) $(GENERATED_SGML)
 
@@ -64,7 +64,7 @@ CATALOG = -c $(DOCBOOKSTYLE)/catalog
 endif
 
 # Enable some extra warnings
-# -wfully-tagged needed to throw a warning on missing tags 
+# -wfully-tagged needed to throw a warning on missing tags
 # for older tool chains, 2007-08-31
 # Note: try "make SPFLAGS=-wxml" to catch a lot of other dubious constructs,
 # in particular < and & that haven't been made into entities.  It's far too
@@ -136,6 +136,8 @@ features-supported.sgml: $(top_srcdir)/src/backend/catalog/sql_feature_packages.
 features-unsupported.sgml: $(top_srcdir)/src/backend/catalog/sql_feature_packages.txt $(top_srcdir)/src/backend/catalog/sql_features.txt
 	$(PERL) $(srcdir)/mk_feature_tables.pl NO $^ > $@
 
+errcodes-table.sgml: $(top_srcdir)/src/backend/utils/errcodes.txt generate-errcodes-table.pl
+	$(PERL) $(srcdir)/generate-errcodes-table.pl $< > $@
 
 ##
 ## Print

@@ -7,7 +7,7 @@
  *	AccessExclusiveLocks and starting snapshots for Hot Standby mode.
  *	Plus conflict recovery processing.
  *
- * Portions Copyright (c) 1996-2010, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2011, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -21,7 +21,6 @@
 #include "access/xact.h"
 #include "access/xlog.h"
 #include "miscadmin.h"
-#include "pgstat.h"
 #include "storage/bufmgr.h"
 #include "storage/lmgr.h"
 #include "storage/proc.h"
@@ -191,16 +190,18 @@ static void
 ResolveRecoveryConflictWithVirtualXIDs(VirtualTransactionId *waitlist,
 									   ProcSignalReason reason)
 {
+	TimestampTz waitStart;
+	char	   *new_status;
+
+	/* Fast exit, to avoid a kernel call if there's no work to be done. */
+	if (!VirtualTransactionIdIsValid(*waitlist))
+		return;
+
+	waitStart = GetCurrentTimestamp();
+	new_status = NULL;		/* we haven't changed the ps display */
+
 	while (VirtualTransactionIdIsValid(*waitlist))
 	{
-		TimestampTz waitStart;
-		char	   *new_status;
-
-		pgstat_report_waiting(true);
-
-		waitStart = GetCurrentTimestamp();
-		new_status = NULL;		/* we haven't changed the ps display */
-
 		/* reset standbyWait_us for each xact we wait for */
 		standbyWait_us = STANDBY_INITIAL_WAIT_US;
 
@@ -246,16 +247,15 @@ ResolveRecoveryConflictWithVirtualXIDs(VirtualTransactionId *waitlist,
 			}
 		}
 
-		/* Reset ps display if we changed it */
-		if (new_status)
-		{
-			set_ps_display(new_status, false);
-			pfree(new_status);
-		}
-		pgstat_report_waiting(false);
-
 		/* The virtual transaction is gone now, wait for the next one */
 		waitlist++;
+	}
+
+	/* Reset ps display if we changed it */
+	if (new_status)
+	{
+		set_ps_display(new_status, false);
+		pfree(new_status);
 	}
 }
 
@@ -266,21 +266,13 @@ ResolveRecoveryConflictWithSnapshot(TransactionId latestRemovedXid, RelFileNode 
 
 	/*
 	 * If we get passed InvalidTransactionId then we are a little surprised,
-	 * but it is theoretically possible, so spit out a DEBUG1 message, but not
-	 * one that needs translating.
-	 *
-	 * We grab latestCompletedXid instead because this is the very latest
-	 * value it could ever be.
+	 * but it is theoretically possible in normal running. It also happens
+	 * when replaying already applied WAL records after a standby crash or
+	 * restart. If latestRemovedXid is invalid then there is no conflict. That
+	 * rule applies across all record types that suffer from this conflict.
 	 */
 	if (!TransactionIdIsValid(latestRemovedXid))
-	{
-		elog(DEBUG1, "invalid latestremovexXid reported, using latestcompletedxid instead");
-
-		LWLockAcquire(ProcArrayLock, LW_SHARED);
-		latestRemovedXid = ShmemVariableCache->latestCompletedXid;
-		LWLockRelease(ProcArrayLock);
-	}
-	Assert(TransactionIdIsValid(latestRemovedXid));
+		return;
 
 	backends = GetConflictingVirtualXIDs(latestRemovedXid,
 										 node.dbNode);
@@ -502,7 +494,7 @@ CheckRecoveryConflictDeadlock(LWLockId partitionLock)
 	 * process will continue to wait even though we have avoided deadlock.
 	 */
 	ereport(ERROR,
-			(errcode(ERRCODE_QUERY_CANCELED),
+			(errcode(ERRCODE_T_R_DEADLOCK_DETECTED),
 			 errmsg("canceling statement due to conflict with recovery"),
 	   errdetail("User transaction caused buffer deadlock with recovery.")));
 }
@@ -679,7 +671,7 @@ StandbyReleaseAllLocks(void)
 /*
  * StandbyReleaseOldLocks
  *		Release standby locks held by XIDs < removeXid, as long
- *		as their not prepared transactions.
+ *		as they're not prepared transactions.
  */
 void
 StandbyReleaseOldLocks(TransactionId removeXid)
@@ -856,14 +848,9 @@ LogStandbySnapshot(TransactionId *oldestActiveXid, TransactionId *nextXid)
 	 * record we write, because standby will open up when it sees this.
 	 */
 	running = GetRunningTransactionData();
-
-	/*
-	 * The gap between GetRunningTransactionData() and
-	 * LogCurrentRunningXacts() is what most of the fuss is about here, so
-	 * artifically extending this interval is a great way to test the little
-	 * used parts of the code.
-	 */
 	LogCurrentRunningXacts(running);
+	/* GetRunningTransactionData() acquired XidGenLock, we must release it */
+	LWLockRelease(XidGenLock);
 
 	*oldestActiveXid = running->oldestRunningXid;
 	*nextXid = running->nextXid;
@@ -961,14 +948,6 @@ LogAccessExclusiveLock(Oid dbOid, Oid relOid)
 {
 	xl_standby_lock xlrec;
 
-	/*
-	 * Ensure that a TransactionId has been assigned to this transaction. We
-	 * don't actually need the xid yet but if we don't do this then
-	 * RecordTransactionCommit() and RecordTransactionAbort() will optimise
-	 * away the transaction completion record which recovery relies upon to
-	 * release locks. It's a hack, but for a corner case not worth adding code
-	 * for into the main commit path.
-	 */
 	xlrec.xid = GetTopTransactionId();
 
 	/*
@@ -980,4 +959,25 @@ LogAccessExclusiveLock(Oid dbOid, Oid relOid)
 	xlrec.relOid = relOid;
 
 	LogAccessExclusiveLocks(1, &xlrec);
+}
+
+/*
+ * Prepare to log an AccessExclusiveLock, for use during LockAcquire()
+ */
+void
+LogAccessExclusiveLockPrepare(void)
+{
+	/*
+	 * Ensure that a TransactionId has been assigned to this transaction,
+	 * for two reasons, both related to lock release on the standby.
+	 * First, we must assign an xid so that RecordTransactionCommit() and
+	 * RecordTransactionAbort() do not optimise away the transaction
+	 * completion record which recovery relies upon to release locks. It's
+	 * a hack, but for a corner case not worth adding code for into the
+	 * main commit path. Second, must must assign an xid before the lock
+	 * is recorded in shared memory, otherwise a concurrently executing
+	 * GetRunningTransactionLocks() might see a lock associated with an
+	 * InvalidTransactionId which we later assert cannot happen.
+	 */
+	(void) GetTopTransactionId();
 }

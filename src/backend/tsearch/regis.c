@@ -3,7 +3,7 @@
  * regis.c
  *		Fast regex subset
  *
- * Portions Copyright (c) 1996-2010, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2011, PostgreSQL Global Development Group
  *
  *
  * IDENTIFICATION
@@ -244,11 +244,11 @@ RS_execute(Regis *r, char *str)
 		switch (ptr->type)
 		{
 			case RSF_ONEOF:
-				if (mb_strchr((char *) ptr->data, c) != true)
+				if (!mb_strchr((char *) ptr->data, c))
 					return false;
 				break;
 			case RSF_NONEOF:
-				if (mb_strchr((char *) ptr->data, c) == true)
+				if (mb_strchr((char *) ptr->data, c))
 					return false;
 				break;
 			default:

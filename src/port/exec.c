@@ -4,7 +4,7 @@
  *		Functions for finding and validating executable files
  *
  *
- * Portions Copyright (c) 1996-2010, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2011, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -168,7 +168,7 @@ find_my_exec(const char *argv0, char *retpath)
 			else
 				startp = endp + 1;
 
-			endp = first_path_separator(startp);
+			endp = first_path_var_separator(startp);
 			if (!endp)
 				endp = startp + strlen(startp); /* point to end */
 
@@ -358,6 +358,7 @@ pipe_read_line(char *cmd, char *line, int maxsize)
 	if (fgets(line, maxsize, pgver) == NULL)
 	{
 		perror("fgets failure");
+		pclose(pgver);		/* no error checking */
 		return NULL;
 	}
 

@@ -3,7 +3,7 @@
  * explain.c
  *	  Explain query execution plans
  *
- * Portions Copyright (c) 1996-2010, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2011, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994-5, Regents of the University of California
  *
  * IDENTIFICATION
@@ -1017,6 +1017,8 @@ ExplainNode(PlanState *planstate, List *ancestors,
 		case T_IndexScan:
 			show_scan_qual(((IndexScan *) plan)->indexqualorig,
 						   "Index Cond", planstate, ancestors, es);
+			show_scan_qual(((IndexScan *) plan)->indexorderbyorig,
+						   "Order By", planstate, ancestors, es);
 			show_scan_qual(plan->qual, "Filter", planstate, ancestors, es);
 			break;
 		case T_BitmapIndexScan:
@@ -1191,7 +1193,7 @@ ExplainNode(PlanState *planstate, List *ancestors,
 	{
 		ExplainOpenGroup("Plans", "Plans", false, es);
 		/* Pass current PlanState as head of ancestors list for children */
-		ancestors = lcons(planstate, ancestors); 
+		ancestors = lcons(planstate, ancestors);
 	}
 
 	/* initPlan-s */
@@ -1251,7 +1253,7 @@ ExplainNode(PlanState *planstate, List *ancestors,
 	/* end of child plans */
 	if (haschildren)
 	{
-		ancestors = list_delete_first(ancestors); 
+		ancestors = list_delete_first(ancestors);
 		ExplainCloseGroup("Plans", "Plans", false, es);
 	}
 
@@ -1467,7 +1469,7 @@ show_sort_info(SortState *sortstate, ExplainState *es)
 		if (es->format == EXPLAIN_FORMAT_TEXT)
 		{
 			appendStringInfoSpaces(es->str, es->indent * 2);
-			appendStringInfo(es->str, "Sort Method:  %s  %s: %ldkB\n",
+			appendStringInfo(es->str, "Sort Method: %s  %s: %ldkB\n",
 							 sortMethod, spaceType, spaceUsed);
 		}
 		else

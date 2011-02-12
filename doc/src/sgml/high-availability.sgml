@@ -82,7 +82,7 @@
  </para>
 
  <sect1 id="different-replication-solutions">
- <title>Comparison of different solutions</title>
+ <title>Comparison of Different Solutions</title>
 
  <variablelist>
 
@@ -486,18 +486,19 @@ protocol to make nodes agree on a serializable transactional order.
   <para>
    Directly moving WAL records from one database server to another
    is typically described as log shipping. <productname>PostgreSQL</>
-   implements file-based log shipping, which means that WAL records are
-   transferred one file (WAL segment) at a time. WAL files (16MB) can be
+   implements file-based log shipping by transfering WAL records
+   one file (WAL segment) at a time. WAL files (16MB) can be
    shipped easily and cheaply over any distance, whether it be to an
    adjacent system, another system at the same site, or another system on
    the far side of the globe. The bandwidth required for this technique
    varies according to the transaction rate of the primary server.
-   Record-based log shipping is also possible with streaming replication
-   (see <xref linkend="streaming-replication">).
+   Record-based log shipping is more granular and streams WAL changes
+   incrementally over a network connection (see <xref
+   linkend="streaming-replication">).
   </para>
 
   <para>
-   It should be noted that the log shipping is asynchronous, i.e., the WAL
+   It should be noted that log shipping is asynchronous, i.e., the WAL
    records are shipped after transaction commit. As a result, there is a
    window for data loss should the primary server suffer a catastrophic
    failure; transactions not yet shipped will be lost.  The size of the
@@ -505,8 +506,8 @@ protocol to make nodes agree on a serializable transactional order.
    <varname>archive_timeout</varname> parameter, which can be set as low
    as a few seconds.  However such a low setting will
    substantially increase the bandwidth required for file shipping.
-   If you need a window of less than a minute or so, consider using
-   streaming replication (see <xref linkend="streaming-replication">).
+   Streaming replication (see <xref linkend="streaming-replication">)
+   allows a much smaller window of data loss.
   </para>
 
   <para>
@@ -636,8 +637,8 @@ protocol to make nodes agree on a serializable transactional order.
    <para>
     If you want to use streaming replication, set up authentication on the
     primary server to allow replication connections from the standby
-    server(s); that is, provide a suitable entry or entries in
-    <filename>pg_hba.conf</> with the database field set to
+    server(s); that is, create a role and provide a suitable entry or
+    entries in <filename>pg_hba.conf</> with the database field set to
     <literal>replication</>.  Also ensure <varname>max_wal_senders</> is set
     to a sufficiently large value in the configuration file of the primary
     server.
@@ -796,15 +797,28 @@ archive_cleanup_command = 'pg_archivecleanup /path/to/archive %r'
      It is very important that the access privileges for replication be set up
      so that only trusted users can read the WAL stream, because it is
      easy to extract privileged information from it.  Standby servers must
-     authenticate to the primary as a superuser account.
-     So a role with the <literal>SUPERUSER</> and <literal>LOGIN</>
-     privileges needs to be created on the primary.
+     authenticate to the primary as an account that has the
+     <literal>REPLICATION</> privilege. So a role with the
+     <literal>REPLICATION</> and <literal>LOGIN</> privileges needs to be
+     created on the primary.
     </para>
+
+    <note>
+     <para>
+      It is recommended that a dedicated user account is used for replication.
+      While the <literal>REPLICATION</> privilege is granted to superuser
+      accounts by default, it is not recommended to use superuser accounts
+      for replication. While <literal>REPLICATION</> privilege gives very high
+      permissions, it does not allow the user to modify any data on the
+      primary system, which the <literal>SUPERUSER</> privilege does.
+     </para>
+    </note>
+
     <para>
      Client authentication for replication is controlled by a
      <filename>pg_hba.conf</> record specifying <literal>replication</> in the
      <replaceable>database</> field. For example, if the standby is running on
-     host IP <literal>192.168.1.100</> and the superuser's name for replication
+     host IP <literal>192.168.1.100</> and the account name for replication
      is <literal>foo</>, the administrator can add the following line to the
      <filename>pg_hba.conf</> file on the primary:
 
@@ -823,7 +837,7 @@ host    replication     foo             192.168.1.100/32        md5
      standby (specify <literal>replication</> in the <replaceable>database</>
      field).
      For example, if the primary is running on host IP <literal>192.168.1.50</>,
-     port <literal>5432</literal>, the superuser's name for replication is
+     port <literal>5432</literal>, the account name for replication is
      <literal>foo</>, and the password is <literal>foopass</>, the administrator
      can add the following line to the <filename>recovery.conf</> file on the
      standby:
@@ -851,6 +865,16 @@ primary_conninfo = 'host=192.168.1.50 port=5432 user=foo password=foopass'
      The last WAL receive location in the standby is also displayed in the
      process status of the WAL receiver process, displayed using the
      <command>ps</> command (see <xref linkend="monitoring-ps"> for details).
+    </para>
+    <para>
+     You can retrieve a list of WAL sender processes via the
+     <link linkend="monitoring-stats-views-table">
+     <literal>pg_stat_replication</></link> view. Large differences between
+     <function>pg_current_xlog_location</> and <literal>sent_location</> field
+     might indicate that the master server is under heavy load, while
+     differences between <literal>sent_location</> and 
+     <function>pg_last_xlog_receive_location</> on the standby might indicate
+     network delay, or that the the standby is under heavy load.
     </para>
    </sect3>
 
@@ -936,15 +960,15 @@ primary_conninfo = 'host=192.168.1.50 port=5432 user=foo password=foopass'
   </sect1>
 
   <sect1 id="log-shipping-alternative">
-   <title>Alternative method for log shipping</title>
+   <title>Alternative Method for Log Shipping</title>
 
    <para>
     An alternative to the built-in standby mode described in the previous
     sections is to use a <varname>restore_command</> that polls the archive location.
     This was the only option available in versions 8.4 and below. In this
     setup, set <varname>standby_mode</> off, because you are implementing
-    the polling required for standby operation yourself. See
-    contrib/pg_standby (<xref linkend="pgstandby">) for a reference
+    the polling required for standby operation yourself. See the
+    <xref linkend="pgstandby"> module for a reference
     implementation of this.
    </para>
 
@@ -1004,7 +1028,7 @@ if (!triggered)
 
    <para>
     A working example of a waiting <varname>restore_command</> is provided
-    as a <filename>contrib</> module named <application>pg_standby</>. It
+    in the <xref linkend="pgstandby"> module. It
     should be used as a reference on how to correctly implement the logic
     described above. It can also be extended as needed to support specific
     configurations and environments.
@@ -1353,7 +1377,7 @@ if (!triggered)
   </sect2>
 
   <sect2 id="hot-standby-conflict">
-   <title>Handling query conflicts</title>
+   <title>Handling Query Conflicts</title>
 
    <para>
     The primary and standby servers are in many ways loosely connected. Actions
@@ -1519,7 +1543,7 @@ if (!triggered)
     primary server and keep a query active for as long as needed to
     run queries on the standby. This prevents <command>VACUUM</> from removing
     recently-dead rows and so cleanup conflicts do not occur.
-    This could be done using <filename>contrib/dblink</> and
+    This could be done using <xref linkend="dblink"> and
     <function>pg_sleep()</>, or via other mechanisms. If you do this, you
     should note that this will delay cleanup of dead rows on the primary,
     which may result in undesirable table bloat. However, the cleanup
@@ -1540,6 +1564,13 @@ if (!triggered)
     difficult to guarantee any specific execution-time window with this
     approach, since <varname>vacuum_defer_cleanup_age</> is measured in
     transactions executed on the primary server.
+   </para>
+
+   <para>
+    The number of query cancels and the reason for them can be viewed using
+    the <structname>pg_stat_database_conflicts</> system view on the standby
+    server. The <structname>pg_stat_database</> system view also contains
+    summary information.
    </para>
   </sect2>
 
@@ -1845,8 +1876,7 @@ LOG:  database system is ready to accept read only connections
    <listitem>
     <para>
      Operations on hash indexes are not presently WAL-logged, so
-     replay will not update these indexes.  Hash indexes will not be
-     used for query plans during recovery.
+     replay will not update these indexes.
     </para>
    </listitem>
    <listitem>
@@ -1883,7 +1913,16 @@ LOG:  database system is ready to accept read only connections
      advised to select a larger value of <varname>max_locks_per_transaction</>,
      perhaps as much as twice the value of the parameter on
      the primary server. You need not consider this at all if
-     your setting of <varname>max_prepared_transactions</> is <literal>0</>.
+     your setting of <varname>max_prepared_transactions</> is 0.
+    </para>
+   </listitem>
+   <listitem>
+    <para>
+     The Serializable transaction isolation level is not yet available in hot
+     standby.  (See <xref linkend="xact-serializable"> and
+     <xref linkend="serializable-consistency"> for details.)
+     An attempt to set a transaction to the serializable isolation level in
+     hot standby mode will generate an error.
     </para>
    </listitem>
   </itemizedlist>

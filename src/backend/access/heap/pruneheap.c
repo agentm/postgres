@@ -3,7 +3,7 @@
  * pruneheap.c
  *	  heap page pruning and HOT-chain management code
  *
- * Portions Copyright (c) 1996-2010, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2011, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -233,11 +233,10 @@ heap_page_prune(Relation relation, Buffer buffer, TransactionId OldestXmin,
 		/*
 		 * Emit a WAL HEAP_CLEAN record showing what we did
 		 */
-		if (!relation->rd_istemp)
+		if (RelationNeedsWAL(relation))
 		{
 			XLogRecPtr	recptr;
 
-			Assert(TransactionIdIsValid(prstate.latestRemovedXid));
 			recptr = log_heap_clean(relation, buffer,
 									prstate.redirected, prstate.nredirected,
 									prstate.nowdead, prstate.ndead,

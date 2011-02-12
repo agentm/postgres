@@ -27,7 +27,7 @@
  * always be so; try to be careful to maintain the distinction.)
  *
  *
- * Portions Copyright (c) 1996-2010, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2011, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/nodes/pg_list.h
@@ -181,6 +181,15 @@ extern int	list_length(List *l);
 	for ((cell1) = list_head(list1), (cell2) = list_head(list2);	\
 		 (cell1) != NULL && (cell2) != NULL;						\
 		 (cell1) = lnext(cell1), (cell2) = lnext(cell2))
+
+/*
+ * forthree -
+ *    the same for three lists
+ */
+#define forthree(cell1, list1, cell2, list2, cell3, list3)			\
+	for ((cell1) = list_head(list1), (cell2) = list_head(list2), (cell3) = list_head(list3); \
+		 (cell1) != NULL && (cell2) != NULL && (cell3) != NULL;		\
+		 (cell1) = lnext(cell1), (cell2) = lnext(cell2), (cell3) = lnext(cell3))
 
 extern List *lappend(List *list, void *datum);
 extern List *lappend_int(List *list, int datum);

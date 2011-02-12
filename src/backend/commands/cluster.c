@@ -6,7 +6,7 @@
  * There is hardly anything left of Paul Brown's original implementation...
  *
  *
- * Portions Copyright (c) 1996-2010, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2011, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994-5, Regents of the University of California
  *
  *
@@ -436,43 +436,6 @@ check_index_is_clusterable(Relation OldHeap, Oid indexOid, bool recheck, LOCKMOD
 				 errmsg("cannot cluster on partial index \"%s\"",
 						RelationGetRelationName(OldIndex))));
 
-	if (!OldIndex->rd_am->amindexnulls)
-	{
-		AttrNumber	colno;
-
-		/*
-		 * If the AM doesn't index nulls, then it's a partial index unless we
-		 * can prove all the rows are non-null.  Note we only need look at the
-		 * first column; multicolumn-capable AMs are *required* to index nulls
-		 * in columns after the first.
-		 */
-		colno = OldIndex->rd_index->indkey.values[0];
-		if (colno > 0)
-		{
-			/* ordinary user attribute */
-			if (!OldHeap->rd_att->attrs[colno - 1]->attnotnull)
-				ereport(ERROR,
-						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-						 errmsg("cannot cluster on index \"%s\" because access method does not handle null values",
-								RelationGetRelationName(OldIndex)),
-						 recheck
-						 ? errhint("You might be able to work around this by marking column \"%s\" NOT NULL, or use ALTER TABLE ... SET WITHOUT CLUSTER to remove the cluster specification from the table.",
-						 NameStr(OldHeap->rd_att->attrs[colno - 1]->attname))
-						 : errhint("You might be able to work around this by marking column \"%s\" NOT NULL.",
-					  NameStr(OldHeap->rd_att->attrs[colno - 1]->attname))));
-		}
-		else if (colno < 0)
-		{
-			/* system column --- okay, always non-null */
-		}
-		else
-			/* index expression, lose... */
-			ereport(ERROR,
-					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-					 errmsg("cannot cluster on expressional index \"%s\" because its index access method does not handle null values",
-							RelationGetRelationName(OldIndex))));
-	}
-
 	/*
 	 * Disallow if index is left over from a failed CREATE INDEX CONCURRENTLY;
 	 * it might well not contain entries for every heap row, or might not even
@@ -602,7 +565,7 @@ rebuild_relation(Relation OldHeap, Oid indexOid,
 	 * rebuild the target's indexes and throw away the transient table.
 	 */
 	finish_heap_swap(tableOid, OIDNewHeap, is_system_catalog,
-					 swap_toast_by_content, frozenXid);
+					 swap_toast_by_content, false, frozenXid);
 }
 
 
@@ -675,6 +638,7 @@ make_new_heap(Oid OIDOldHeap, Oid NewTableSpace)
 										  tupdesc,
 										  NIL,
 										  OldHeap->rd_rel->relkind,
+										  OldHeap->rd_rel->relpersistence,
 										  false,
 										  RelationIsMapped(OldHeap),
 										  true,
@@ -789,9 +753,9 @@ copy_heap_data(Oid OIDNewHeap, Oid OIDOldHeap, Oid OIDOldIndex,
 
 	/*
 	 * We need to log the copied data in WAL iff WAL archiving/streaming is
-	 * enabled AND it's not a temp rel.
+	 * enabled AND it's not a WAL-logged rel.
 	 */
-	use_wal = XLogIsNeeded() && !NewHeap->rd_istemp;
+	use_wal = XLogIsNeeded() && RelationNeedsWAL(NewHeap);
 
 	/* use_wal off requires smgr_targblock be initially invalid */
 	Assert(RelationGetTargetBlock(NewHeap) == InvalidBlockNumber);
@@ -875,8 +839,8 @@ copy_heap_data(Oid OIDNewHeap, Oid OIDOldHeap, Oid OIDOldIndex,
 	if (OldIndex != NULL && !use_sort)
 	{
 		heapScan = NULL;
-		indexScan = index_beginscan(OldHeap, OldIndex,
-									SnapshotAny, 0, (ScanKey) NULL);
+		indexScan = index_beginscan(OldHeap, OldIndex, SnapshotAny, 0, 0);
+		index_rescan(indexScan, NULL, 0, NULL, 0);
 	}
 	else
 	{
@@ -1313,7 +1277,8 @@ swap_relation_files(Oid r1, Oid r2, bool target_is_pg_class,
 			if (relform1->reltoastrelid)
 			{
 				count = deleteDependencyRecordsFor(RelationRelationId,
-												   relform1->reltoastrelid);
+												   relform1->reltoastrelid,
+												   false);
 				if (count != 1)
 					elog(ERROR, "expected one dependency record for TOAST table, found %ld",
 						 count);
@@ -1321,7 +1286,8 @@ swap_relation_files(Oid r1, Oid r2, bool target_is_pg_class,
 			if (relform2->reltoastrelid)
 			{
 				count = deleteDependencyRecordsFor(RelationRelationId,
-												   relform2->reltoastrelid);
+												   relform2->reltoastrelid,
+												   false);
 				if (count != 1)
 					elog(ERROR, "expected one dependency record for TOAST table, found %ld",
 						 count);
@@ -1398,10 +1364,12 @@ void
 finish_heap_swap(Oid OIDOldHeap, Oid OIDNewHeap,
 				 bool is_system_catalog,
 				 bool swap_toast_by_content,
+				 bool check_constraints,
 				 TransactionId frozenXid)
 {
 	ObjectAddress object;
 	Oid			mapped_tables[4];
+	int			reindex_flags;
 	int			i;
 
 	/* Zero out possible results from swapped_relation_files */
@@ -1431,7 +1399,10 @@ finish_heap_swap(Oid OIDOldHeap, Oid OIDNewHeap,
 	 * so no chance to reclaim disk space before commit.  We do not need a
 	 * final CommandCounterIncrement() because reindex_relation does it.
 	 */
-	reindex_relation(OIDOldHeap, false, true);
+	reindex_flags = REINDEX_SUPPRESS_INDEX_USE;
+	if (check_constraints)
+		reindex_flags |= REINDEX_CHECK_CONSTRAINTS;
+	reindex_relation(OIDOldHeap, false, reindex_flags);
 
 	/* Destroy new heap with old filenode */
 	object.classId = RelationRelationId;

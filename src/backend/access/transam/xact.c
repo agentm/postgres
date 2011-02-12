@@ -5,7 +5,7 @@
  *
  * See src/backend/access/transam/README for more information.
  *
- * Portions Copyright (c) 1996-2010, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2011, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -40,6 +40,7 @@
 #include "storage/bufmgr.h"
 #include "storage/fd.h"
 #include "storage/lmgr.h"
+#include "storage/predicate.h"
 #include "storage/procarray.h"
 #include "storage/sinvaladt.h"
 #include "storage/smgr.h"
@@ -62,6 +63,9 @@ int			XactIsoLevel;
 
 bool		DefaultXactReadOnly = false;
 bool		XactReadOnly;
+
+bool		DefaultXactDeferrable = false;
+bool		XactDeferrable;
 
 bool		XactSyncCommit = true;
 
@@ -729,17 +733,6 @@ CommandCounterIncrement(void)
 		 */
 		AtCCI_LocalCache();
 	}
-
-	/*
-	 * Make any other backends' catalog changes visible to me.
-	 *
-	 * XXX this is probably in the wrong place: CommandCounterIncrement should
-	 * be purely a local operation, most likely.  However fooling with this
-	 * will affect asynchronous cross-backend interactions, which doesn't seem
-	 * like a wise thing to do in late beta, so save improving this for
-	 * another day - tgl 2007-11-30
-	 */
-	AtStart_Cache();
 }
 
 /*
@@ -918,6 +911,7 @@ RecordTransactionCommit(void)
 	int			nmsgs = 0;
 	SharedInvalidationMessage *invalMessages = NULL;
 	bool		RelcacheInitFileInval = false;
+	bool		wrote_xlog;
 
 	/* Get data needed for commit record */
 	nrels = smgrGetPendingDeletes(true, &rels);
@@ -925,6 +919,7 @@ RecordTransactionCommit(void)
 	if (XLogStandbyInfoActive())
 		nmsgs = xactGetCommittedInvalidationMessages(&invalMessages,
 													 &RelcacheInitFileInval);
+	wrote_xlog = (XactLastRecEnd.xrecoff != 0);
 
 	/*
 	 * If we haven't been assigned an XID yet, we neither can, nor do we want
@@ -951,7 +946,7 @@ RecordTransactionCommit(void)
 		 * assigned is a sequence advance record due to nextval() --- we want
 		 * to flush that to disk before reporting commit.)
 		 */
-		if (XactLastRecEnd.xrecoff == 0)
+		if (!wrote_xlog)
 			goto cleanup;
 	}
 	else
@@ -1039,16 +1034,28 @@ RecordTransactionCommit(void)
 	}
 
 	/*
-	 * Check if we want to commit asynchronously.  If the user has set
-	 * synchronous_commit = off, and we're not doing cleanup of any non-temp
-	 * rels nor committing any command that wanted to force sync commit, then
-	 * we can defer flushing XLOG.	(We must not allow asynchronous commit if
-	 * there are any non-temp tables to be deleted, because we might delete
-	 * the files before the COMMIT record is flushed to disk.  We do allow
-	 * asynchronous commit if all to-be-deleted tables are temporary though,
-	 * since they are lost anyway if we crash.)
+	 * Check if we want to commit asynchronously.  We can allow the XLOG flush
+	 * to happen asynchronously if synchronous_commit=off, or if the current
+	 * transaction has not performed any WAL-logged operation.  The latter case
+	 * can arise if the current transaction wrote only to temporary and/or
+	 * unlogged tables.  In case of a crash, the loss of such a transaction
+	 * will be irrelevant since temp tables will be lost anyway, and unlogged
+	 * tables will be truncated.  (Given the foregoing, you might think that it
+	 * would be unnecessary to emit the XLOG record at all in this case, but we
+	 * don't currently try to do that.  It would certainly cause problems at
+	 * least in Hot Standby mode, where the KnownAssignedXids machinery
+	 * requires tracking every XID assignment.  It might be OK to skip it only
+	 * when wal_level < hot_standby, but for now we don't.)
+	 *
+	 * However, if we're doing cleanup of any non-temp rels or committing any
+	 * command that wanted to force sync commit, then we must flush XLOG
+	 * immediately.  (We must not allow asynchronous commit if there are any
+	 * non-temp tables to be deleted, because we might delete the files before
+	 * the COMMIT record is flushed to disk.  We do allow asynchronous commit
+	 * if all to-be-deleted tables are temporary though, since they are lost
+	 * anyway if we crash.)
 	 */
-	if (XactSyncCommit || forceSyncCommit || nrels > 0)
+	if ((wrote_xlog && XactSyncCommit) || forceSyncCommit || nrels > 0)
 	{
 		/*
 		 * Synchronous commit case:
@@ -1063,7 +1070,7 @@ RecordTransactionCommit(void)
 		 * fewer than CommitSiblings other backends with active transactions.
 		 */
 		if (CommitDelay > 0 && enableFsync &&
-			CountActiveBackends() >= CommitSiblings)
+			MinimumActiveBackends(CommitSiblings))
 			pg_usleep(CommitDelay);
 
 		XLogFlush(XactLastRecEnd);
@@ -1637,6 +1644,7 @@ StartTransaction(void)
 		s->startedInRecovery = false;
 		XactReadOnly = DefaultXactReadOnly;
 	}
+	XactDeferrable = DefaultXactDeferrable;
 	XactIsoLevel = DefaultXactIsoLevel;
 	forceSyncCommit = false;
 	MyXactAccessedTempRel = false;
@@ -1782,6 +1790,13 @@ CommitTransaction(void)
 
 	/* close large objects before lower-level cleanup */
 	AtEOXact_LargeObject(true);
+
+	/*
+	 * Mark serializable transaction as complete for predicate locking
+	 * purposes.  This should be done as late as we can put it and still
+	 * allow errors to be raised for failure patterns found at commit.
+	 */
+	PreCommit_CheckForSerializationFailure();
 
 	/*
 	 * Insert notifications sent by NOTIFY commands into the queue.  This
@@ -1977,6 +1992,13 @@ PrepareTransaction(void)
 	/* close large objects before lower-level cleanup */
 	AtEOXact_LargeObject(true);
 
+	/*
+	 * Mark serializable transaction as complete for predicate locking
+	 * purposes.  This should be done as late as we can put it and still
+	 * allow errors to be raised for failure patterns found at commit.
+	 */
+	PreCommit_CheckForSerializationFailure();
+
 	/* NOTIFY will be handled below */
 
 	/*
@@ -2041,6 +2063,7 @@ PrepareTransaction(void)
 
 	AtPrepare_Notify();
 	AtPrepare_Locks();
+	AtPrepare_PredicateLocks();
 	AtPrepare_PgStat();
 	AtPrepare_MultiXact();
 	AtPrepare_RelationMap();
@@ -2100,6 +2123,7 @@ PrepareTransaction(void)
 	PostPrepare_MultiXact(xid);
 
 	PostPrepare_Locks(xid);
+	PostPrepare_PredicateLocks(xid);
 
 	ResourceOwnerRelease(TopTransactionResourceOwner,
 						 RESOURCE_RELEASE_LOCKS,

@@ -4,7 +4,7 @@
  *	  Definitions for tagged nodes.
  *
  *
- * Portions Copyright (c) 1996-2010, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2011, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/nodes/nodes.h
@@ -166,6 +166,7 @@ typedef enum NodeTag
 	T_JoinExpr,
 	T_FromExpr,
 	T_IntoClause,
+	T_CollateClause,
 
 	/*
 	 * TAGS FOR EXPRESSION STATE NODES (execnodes.h)
@@ -230,6 +231,7 @@ typedef enum NodeTag
 	T_SpecialJoinInfo,
 	T_AppendRelInfo,
 	T_PlaceHolderInfo,
+	T_MinMaxAggInfo,
 	T_PlannerParamItem,
 
 	/*
@@ -338,6 +340,7 @@ typedef enum NodeTag
 	T_ReassignOwnedStmt,
 	T_CompositeTypeStmt,
 	T_CreateEnumStmt,
+	T_AlterEnumStmt,
 	T_AlterTSDictionaryStmt,
 	T_AlterTSConfigurationStmt,
 	T_CreateFdwStmt,
@@ -351,6 +354,10 @@ typedef enum NodeTag
 	T_DropUserMappingStmt,
 	T_AlterTableSpaceOptionsStmt,
 	T_SecLabelStmt,
+	T_CreateForeignTableStmt,
+	T_CreateExtensionStmt,
+	T_AlterExtensionStmt,
+	T_AlterExtensionContentsStmt,
 
 	/*
 	 * TAGS FOR PARSE TREE NODES (parsenodes.h)

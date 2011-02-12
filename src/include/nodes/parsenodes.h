@@ -10,7 +10,7 @@
  * the location.
  *
  *
- * Portions Copyright (c) 1996-2010, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2011, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/nodes/parsenodes.h
@@ -167,7 +167,8 @@ typedef struct Query
  * specify the type by OID than by name.  If "names" is NIL then the
  * actual type OID is given by typeOid, otherwise typeOid is unused.
  * Similarly, if "typmods" is NIL then the actual typmod is expected to
- * be prespecified in typemod, otherwise typemod is unused.
+ * be prespecified in typemod, otherwise typemod is unused.  Similarly
+ * for collnames/collOid.
  *
  * If pct_type is TRUE, then names is actually a field name and we look up
  * the type of that field.	Otherwise (the normal case), names is a type
@@ -183,6 +184,8 @@ typedef struct TypeName
 	List	   *typmods;		/* type modifier expression(s) */
 	int32		typemod;		/* prespecified type modifier */
 	List	   *arrayBounds;	/* array bounds */
+	List	   *collnames;		/* collation name */
+	Oid			collOid;		/* collation by OID */
 	int			location;		/* token location, or -1 if unknown */
 } TypeName;
 
@@ -517,6 +520,7 @@ typedef struct IndexElem
 	char	   *name;			/* name of attribute to index, or NULL */
 	Node	   *expr;			/* expression to index, or NULL */
 	char	   *indexcolname;	/* name for index column; NULL = default */
+	List	   *collation;		/* name of collation; NIL = default */
 	List	   *opclass;		/* name of desired opclass; NIL = default */
 	SortByDir	ordering;		/* ASC/DESC/default */
 	SortByNulls nulls_ordering; /* FIRST/LAST/default */
@@ -702,12 +706,14 @@ typedef struct RangeTblEntry
 	 * Fields valid for a function RTE (else NULL):
 	 *
 	 * If the function returns RECORD, funccoltypes lists the column types
-	 * declared in the RTE's column type specification, and funccoltypmods
-	 * lists their declared typmods.  Otherwise, both fields are NIL.
+	 * declared in the RTE's column type specification, funccoltypmods
+	 * lists their declared typmods, funccolcollations their collations.
+	 * Otherwise, those fields are NIL.
 	 */
 	Node	   *funcexpr;		/* expression tree for func call */
 	List	   *funccoltypes;	/* OID list of column type OIDs */
 	List	   *funccoltypmods; /* integer list of column typmods */
+	List	   *funccolcollations; /* OID list of column collation OIDs */
 
 	/*
 	 * Fields valid for a values RTE (else NIL):
@@ -722,6 +728,7 @@ typedef struct RangeTblEntry
 	bool		self_reference; /* is this a recursive self-reference? */
 	List	   *ctecoltypes;	/* OID list of column type OIDs */
 	List	   *ctecoltypmods;	/* integer list of column typmods */
+	List	   *ctecolcollations; /* OID list of column collation OIDs */
 
 	/*
 	 * Fields valid in all RTEs:
@@ -757,6 +764,8 @@ typedef struct RangeTblEntry
  *		or InvalidOid if not available.
  * nulls_first means about what you'd expect.  If sortop is InvalidOid
  *		then nulls_first is meaningless and should be set to false.
+ * hashable is TRUE if eqop is hashable (note this condition also depends
+ *		on the datatype of the input expression).
  *
  * In an ORDER BY item, all fields must be valid.  (The eqop isn't essential
  * here, but it's cheap to get it along with the sortop, and requiring it
@@ -772,6 +781,11 @@ typedef struct RangeTblEntry
  * we will set eqop to the hash equality operator, sortop to InvalidOid,
  * and nulls_first to false.  A grouping item of this kind can only be
  * implemented by hashing, and of course it'll never match an ORDER BY item.
+ *
+ * The hashable flag is provided since we generally have the requisite
+ * information readily available when the SortGroupClause is constructed,
+ * and it's relatively expensive to get it again later.  Note there is no
+ * need for a "sortable" flag since OidIsValid(sortop) serves the purpose.
  *
  * A query might have both ORDER BY and DISTINCT (or DISTINCT ON) clauses.
  * In SELECT DISTINCT, the distinctClause list is as long or longer than the
@@ -789,6 +803,7 @@ typedef struct SortGroupClause
 	Oid			eqop;			/* the equality operator ('=' op) */
 	Oid			sortop;			/* the ordering operator ('<' op), or 0 */
 	bool		nulls_first;	/* do NULLs come before normal values? */
+	bool		hashable;		/* can eqop be implemented by hashing? */
 } SortGroupClause;
 
 /*
@@ -875,6 +890,7 @@ typedef struct CommonTableExpr
 	List	   *ctecolnames;	/* list of output column names */
 	List	   *ctecoltypes;	/* OID list of output column type OIDs */
 	List	   *ctecoltypmods;	/* integer list of output column typmods */
+	List	   *ctecolcollations; /* OID list of column collation OIDs */
 } CommonTableExpr;
 
 /*****************************************************************************
@@ -1024,6 +1040,7 @@ typedef struct SetOperationStmt
 	/* Fields derived during parse analysis: */
 	List	   *colTypes;		/* OID list of output column type OIDs */
 	List	   *colTypmods;		/* integer list of output column typmods */
+	List	   *colCollations;	/* OID list of output column collation OIDs */
 	List	   *groupClauses;	/* a list of SortGroupClause's */
 	/* groupClauses is NIL if UNION ALL, but must be set otherwise */
 } SetOperationStmt;
@@ -1043,21 +1060,24 @@ typedef struct SetOperationStmt
 /*
  * When a command can act on several kinds of objects with only one
  * parse structure required, use these constants to designate the
- * object type.
+ * object type.  Note that commands typically don't support all the types.
  */
 
 typedef enum ObjectType
 {
 	OBJECT_AGGREGATE,
-	OBJECT_ATTRIBUTE,			/* type's attribute, when distinct from column */
+	OBJECT_ATTRIBUTE,		/* type's attribute, when distinct from column */
 	OBJECT_CAST,
 	OBJECT_COLUMN,
 	OBJECT_CONSTRAINT,
+	OBJECT_COLLATION,
 	OBJECT_CONVERSION,
 	OBJECT_DATABASE,
 	OBJECT_DOMAIN,
+	OBJECT_EXTENSION,
 	OBJECT_FDW,
 	OBJECT_FOREIGN_SERVER,
+	OBJECT_FOREIGN_TABLE,
 	OBJECT_FUNCTION,
 	OBJECT_INDEX,
 	OBJECT_LANGUAGE,
@@ -1131,8 +1151,10 @@ typedef enum AlterTableType
 	AT_ReAddIndex,				/* internal to commands/tablecmds.c */
 	AT_AddConstraint,			/* add constraint */
 	AT_AddConstraintRecurse,	/* internal to commands/tablecmds.c */
+	AT_ValidateConstraint,		/* validate constraint */
 	AT_ProcessedConstraint,		/* pre-processed add constraint (local in
 								 * parser/parse_utilcmd.c) */
+	AT_AddIndexConstraint,		/* add constraint using existing index */
 	AT_DropConstraint,			/* drop constraint */
 	AT_DropConstraintRecurse,	/* internal to commands/tablecmds.c */
 	AT_AlterColumnType,			/* alter column type */
@@ -1157,7 +1179,8 @@ typedef enum AlterTableType
 	AT_EnableReplicaRule,		/* ENABLE REPLICA RULE name */
 	AT_DisableRule,				/* DISABLE RULE name */
 	AT_AddInherit,				/* INHERIT parent */
-	AT_DropInherit				/* NO INHERIT parent */
+	AT_DropInherit,				/* NO INHERIT parent */
+	AT_GenericOptions,			/* OPTIONS (...) */
 } AlterTableType;
 
 typedef struct AlterTableCmd	/* one subcommand of an ALTER TABLE */
@@ -1171,6 +1194,7 @@ typedef struct AlterTableCmd	/* one subcommand of an ALTER TABLE */
 	Node	   *transform;		/* transformation expr for ALTER TYPE */
 	DropBehavior behavior;		/* RESTRICT or CASCADE for DROP cases */
 	bool		missing_ok;		/* skip error if missing? */
+	bool		validated;
 } AlterTableCmd;
 
 
@@ -1218,6 +1242,7 @@ typedef enum GrantObjectType
 	ACL_OBJECT_DATABASE,		/* database */
 	ACL_OBJECT_FDW,				/* foreign-data wrapper */
 	ACL_OBJECT_FOREIGN_SERVER,	/* foreign server */
+	ACL_OBJECT_FOREIGN_TABLE,	/* foreign table */
 	ACL_OBJECT_FUNCTION,		/* function */
 	ACL_OBJECT_LANGUAGE,		/* procedural language */
 	ACL_OBJECT_LARGEOBJECT,		/* largeobject */
@@ -1466,6 +1491,7 @@ typedef struct Constraint
 
 	/* Fields used for index constraints (UNIQUE, PRIMARY KEY, EXCLUSION): */
 	List	   *options;		/* options from WITH clause */
+	char	   *indexname;		/* existing index to use; otherwise NULL */
 	char	   *indexspace;		/* index tablespace; NULL for default */
 	/* These could be, but currently are not, used for UNIQUE/PKEY: */
 	char	   *access_method;	/* index access method; NULL for default */
@@ -1508,6 +1534,36 @@ typedef struct AlterTableSpaceOptionsStmt
 	List	   *options;
 	bool		isReset;
 } AlterTableSpaceOptionsStmt;
+
+/* ----------------------
+ *		Create/Alter Extension Statements
+ * ----------------------
+ */
+
+typedef struct CreateExtensionStmt
+{
+	NodeTag		type;
+	char	   *extname;
+	List	   *options;		/* List of DefElem nodes */
+} CreateExtensionStmt;
+
+/* Only used for ALTER EXTENSION UPDATE; later might need an action field */
+typedef struct AlterExtensionStmt
+{
+	NodeTag		type;
+	char	   *extname;
+	List	   *options;		/* List of DefElem nodes */
+} AlterExtensionStmt;
+
+typedef struct AlterExtensionContentsStmt
+{
+	NodeTag		type;
+	char	   *extname;		/* Extension's name */
+	int			action;			/* +1 = add object, -1 = drop object */
+	ObjectType	objtype;		/* Object's type */
+	List	   *objname;		/* Qualified name of the object */
+	List	   *objargs;		/* Arguments if needed (eg, for functions) */
+} AlterExtensionContentsStmt;
 
 /* ----------------------
  *		Create/Drop FOREIGN DATA WRAPPER Statements
@@ -1570,6 +1626,18 @@ typedef struct DropForeignServerStmt
 	bool		missing_ok;		/* ignore missing servers */
 	DropBehavior behavior;		/* drop behavior - cascade/restrict */
 } DropForeignServerStmt;
+
+/* ----------------------
+ *		Create FOREIGN TABLE Statements
+ * ----------------------
+ */
+
+typedef struct CreateForeignTableStmt
+{
+	CreateStmt	base;
+	char	   *servername;
+	List	   *options;
+} CreateForeignTableStmt;
 
 /* ----------------------
  *		Create/Drop USER MAPPING Statements
@@ -1768,6 +1836,7 @@ typedef struct CreateOpClassItem
 	List	   *name;			/* operator or function name */
 	List	   *args;			/* argument types */
 	int			number;			/* strategy num or support proc num */
+	List	   *order_family;	/* only used for ordering operators */
 	List	   *class_args;		/* only used for functions */
 	/* fields used for a storagetype item: */
 	TypeName   *storedtype;		/* datatype stored in index */
@@ -1929,6 +1998,12 @@ typedef struct FetchStmt
 
 /* ----------------------
  *		Create Index Statement
+ *
+ * This represents creation of an index and/or an associated constraint.
+ * If indexOid isn't InvalidOid, we are not creating an index, just a
+ * UNIQUE/PKEY constraint using an existing index.  isconstraint must always
+ * be true in this case, and the fields describing the index properties are
+ * empty.
  * ----------------------
  */
 typedef struct IndexStmt
@@ -1942,6 +2017,7 @@ typedef struct IndexStmt
 	List	   *options;		/* options from WITH clause */
 	Node	   *whereClause;	/* qualification (partial-index predicate) */
 	List	   *excludeOpNames; /* exclusion operator names, or NIL if none */
+	Oid			indexOid;		/* OID of an existing index, if any */
 	bool		unique;			/* is index unique? */
 	bool		primary;		/* is index on primary key? */
 	bool		isconstraint;	/* is it from a CONSTRAINT clause? */
@@ -2059,12 +2135,14 @@ typedef struct RenameStmt
 {
 	NodeTag		type;
 	ObjectType	renameType;		/* OBJECT_TABLE, OBJECT_COLUMN, etc */
+	ObjectType	relationType;	/* if column name, associated relation type */
 	RangeVar   *relation;		/* in case it's a table */
 	List	   *object;			/* in case it's some other object */
 	List	   *objarg;			/* argument types, if applicable */
 	char	   *subname;		/* name of contained object (column, rule,
 								 * trigger, etc) */
 	char	   *newname;		/* the new name */
+	DropBehavior behavior;		/* RESTRICT or CASCADE behavior */
 } RenameStmt;
 
 /* ----------------------
@@ -2193,6 +2271,18 @@ typedef struct CreateEnumStmt
 	List	   *vals;			/* enum values (list of Value strings) */
 } CreateEnumStmt;
 
+/* ----------------------
+ *		Alter Type Statement, enum types
+ * ----------------------
+ */
+typedef struct AlterEnumStmt
+{
+	NodeTag		type;
+	List	   *typeName;		/* qualified name (list of Value strings) */
+	char	   *newVal;			/* new enum value's name */
+	char	   *newValNeighbor;	/* neighboring enum value, if specified */
+	bool	    newValIsAfter;	/* place new enum value after neighbor? */
+} AlterEnumStmt;
 
 /* ----------------------
  *		Create View Statement
@@ -2285,7 +2375,8 @@ typedef enum VacuumOption
 	VACOPT_ANALYZE = 1 << 1,	/* do ANALYZE */
 	VACOPT_VERBOSE = 1 << 2,	/* print progress info */
 	VACOPT_FREEZE = 1 << 3,		/* FREEZE option */
-	VACOPT_FULL = 1 << 4		/* FULL (non-concurrent) vacuum */
+	VACOPT_FULL = 1 << 4,		/* FULL (non-concurrent) vacuum */
+	VACOPT_NOWAIT = 1 << 5
 } VacuumOption;
 
 typedef struct VacuumStmt

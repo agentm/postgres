@@ -6,7 +6,7 @@
  * See src/backend/utils/misc/README for more information.
  *
  *
- * Copyright (c) 2000-2010, PostgreSQL Global Development Group
+ * Copyright (c) 2000-2011, PostgreSQL Global Development Group
  * Written by Peter Eisentraut <peter_e@gmx.net>.
  *
  * IDENTIFICATION
@@ -55,10 +55,12 @@
 #include "postmaster/postmaster.h"
 #include "postmaster/syslogger.h"
 #include "postmaster/walwriter.h"
+#include "replication/walreceiver.h"
 #include "replication/walsender.h"
 #include "storage/bufmgr.h"
 #include "storage/standby.h"
 #include "storage/fd.h"
+#include "storage/predicate.h"
 #include "tcop/tcopprot.h"
 #include "tsearch/ts_cache.h"
 #include "utils/builtins.h"
@@ -128,6 +130,7 @@ extern char *temp_tablespaces;
 extern bool synchronize_seqscans;
 extern bool fullPageWrites;
 extern int	ssl_renegotiation_limit;
+extern char *SSLCipherSuites;
 
 #ifdef TRACE_SORT
 extern bool trace_sort;
@@ -139,10 +142,6 @@ extern bool trace_syncscan;
 extern bool optimize_bounded_sort;
 #endif
 
-#ifdef USE_SSL
-extern char *SSLCipherSuites;
-#endif
-
 static void set_config_sourcefile(const char *name, char *sourcefile,
 					  int sourceline);
 
@@ -151,12 +150,14 @@ static const char *assign_log_destination(const char *value,
 
 #ifdef HAVE_SYSLOG
 static int	syslog_facility = LOG_LOCAL0;
+#else
+static int	syslog_facility = 0;
+#endif
 
 static bool assign_syslog_facility(int newval,
 					   bool doit, GucSource source);
 static const char *assign_syslog_ident(const char *ident,
 					bool doit, GucSource source);
-#endif
 
 static bool assign_session_replication_role(int newval, bool doit,
 								GucSource source);
@@ -169,7 +170,6 @@ static bool assign_bonjour(bool newval, bool doit, GucSource source);
 static bool assign_ssl(bool newval, bool doit, GucSource source);
 static bool assign_stage_log_stats(bool newval, bool doit, GucSource source);
 static bool assign_log_stats(bool newval, bool doit, GucSource source);
-static bool assign_transaction_read_only(bool newval, bool doit, GucSource source);
 static const char *assign_canonical_path(const char *newval, bool doit, GucSource source);
 static const char *assign_timezone_abbreviations(const char *newval, bool doit, GucSource source);
 static const char *show_archive_command(void);
@@ -280,8 +280,8 @@ static const struct config_enum_entry session_replication_role_options[] = {
 	{NULL, 0, false}
 };
 
-#ifdef HAVE_SYSLOG
 static const struct config_enum_entry syslog_facility_options[] = {
+#ifdef HAVE_SYSLOG
 	{"local0", LOG_LOCAL0, false},
 	{"local1", LOG_LOCAL1, false},
 	{"local2", LOG_LOCAL2, false},
@@ -290,9 +290,11 @@ static const struct config_enum_entry syslog_facility_options[] = {
 	{"local5", LOG_LOCAL5, false},
 	{"local6", LOG_LOCAL6, false},
 	{"local7", LOG_LOCAL7, false},
+#else
+	{"none", 0, false},
+#endif
 	{NULL, 0}
 };
-#endif
 
 static const struct config_enum_entry track_function_options[] = {
 	{"none", TRACK_FUNC_OFF, false},
@@ -389,6 +391,7 @@ int			trace_recovery_messages = LOG;
 
 int			num_temp_buffers = 1000;
 
+char	   *data_directory;
 char	   *ConfigFileName;
 char	   *HbaFileName;
 char	   *IdentFileName;
@@ -409,9 +412,7 @@ int			tcp_keepalives_count;
  */
 static char *log_destination_string;
 
-#ifdef HAVE_SYSLOG
 static char *syslog_ident_str;
-#endif
 static bool phony_autocommit;
 static bool session_auth_is_superuser;
 static double phony_random_seed;
@@ -425,8 +426,6 @@ static int	server_version_num;
 static char *timezone_string;
 static char *log_timezone_string;
 static char *timezone_abbreviations_string;
-static char *XactIsoLevel_string;
-static char *data_directory;
 static char *custom_variable_classes;
 static int	max_function_args;
 static int	max_index_keys;
@@ -441,6 +440,7 @@ static int	effective_io_concurrency;
 /* should be static, but commands/variable.c needs to get at these */
 char	   *role_string;
 char	   *session_authorization_string;
+char	   *XactIsoLevel_string;
 
 
 /*
@@ -1099,6 +1099,23 @@ static struct config_bool ConfigureNamesBool[] =
 		false, assign_transaction_read_only, NULL
 	},
 	{
+		{"default_transaction_deferrable", PGC_USERSET, CLIENT_CONN_STATEMENT,
+			gettext_noop("Sets the default deferrable status of new transactions."),
+			NULL
+		},
+		&DefaultXactDeferrable,
+		false, NULL, NULL
+	},
+	{
+		{"transaction_deferrable", PGC_USERSET, CLIENT_CONN_STATEMENT,
+			gettext_noop("Whether to defer a read-only serializable transaction until it can be executed with no possible serialization failures."),
+			NULL,
+			GUC_NO_RESET_ALL | GUC_NOT_IN_SAMPLE | GUC_DISALLOW_IN_FILE
+		},
+		&XactDeferrable,
+		false, assign_transaction_deferrable, NULL
+	},
+	{
 		{"check_function_bodies", PGC_USERSET, CLIENT_CONN_STATEMENT,
 			gettext_noop("Check function bodies during CREATE FUNCTION."),
 			NULL
@@ -1425,6 +1442,16 @@ static struct config_int ConfigureNamesInt[] =
 	},
 
 	{
+		{"wal_receiver_status_interval", PGC_SIGHUP, WAL_STANDBY_SERVERS,
+			gettext_noop("Sets the maximum interval between WAL receiver status reports to the master."),
+			NULL,
+			GUC_UNIT_S
+		},
+		&wal_receiver_status_interval,
+		10, 0, INT_MAX/1000, NULL, NULL
+	},
+
+	{
 		{"max_connections", PGC_POSTMASTER, CONN_AUTH_SETTINGS,
 			gettext_noop("Sets the maximum number of concurrent connections."),
 			NULL
@@ -1698,6 +1725,17 @@ static struct config_int ConfigureNamesInt[] =
 	},
 
 	{
+		{"max_predicate_locks_per_transaction", PGC_POSTMASTER, LOCK_MANAGEMENT,
+			gettext_noop("Sets the maximum number of predicate locks per transaction."),
+			gettext_noop("The shared predicate lock table is sized on the assumption that "
+			  "at most max_predicate_locks_per_transaction * max_connections distinct "
+						 "objects will need to be locked at any one time.")
+		},
+		&max_predicate_locks_per_xact,
+		64, 10, INT_MAX, NULL, NULL
+	},
+
+	{
 		{"authentication_timeout", PGC_SIGHUP, CONN_AUTH_SECURITY,
 			gettext_noop("Sets the maximum allowed time to complete client authentication."),
 			NULL,
@@ -1766,7 +1804,7 @@ static struct config_int ConfigureNamesInt[] =
 			GUC_UNIT_XBLOCKS
 		},
 		&XLOGbuffers,
-		8, 4, INT_MAX, NULL, NULL
+		-1, -1, INT_MAX, NULL, NULL
 	},
 
 	{
@@ -1816,7 +1854,7 @@ static struct config_int ConfigureNamesInt[] =
 			NULL
 		},
 		&CommitSiblings,
-		5, 1, 1000, NULL, NULL
+		5, 0, 1000, NULL, NULL
 	},
 
 	{
@@ -2531,7 +2569,6 @@ static struct config_string ConfigureNamesString[] =
 		"postgresql-%Y-%m-%d_%H%M%S.log", NULL, NULL
 	},
 
-#ifdef HAVE_SYSLOG
 	{
 		{"syslog_ident", PGC_SIGHUP, LOGGING_WHERE,
 			gettext_noop("Sets the program name used to identify PostgreSQL "
@@ -2541,7 +2578,6 @@ static struct config_string ConfigureNamesString[] =
 		&syslog_ident_str,
 		"postgres", assign_syslog_ident, NULL
 	},
-#endif
 
 	{
 		{"TimeZone", PGC_USERSET, CLIENT_CONN_LOCALE,
@@ -2680,7 +2716,6 @@ static struct config_string ConfigureNamesString[] =
 		"pg_catalog.simple", assignTSCurrentConfig, NULL
 	},
 
-#ifdef USE_SSL
 	{
 		{"ssl_ciphers", PGC_POSTMASTER, CONN_AUTH_SECURITY,
 			gettext_noop("Sets the list of allowed SSL ciphers."),
@@ -2688,9 +2723,13 @@ static struct config_string ConfigureNamesString[] =
 			GUC_SUPERUSER_ONLY
 		},
 		&SSLCipherSuites,
-		"ALL:!ADH:!LOW:!EXP:!MD5:@STRENGTH", NULL, NULL
+#ifdef USE_SSL
+		"ALL:!ADH:!LOW:!EXP:!MD5:@STRENGTH",
+#else
+		"none",
+#endif
+		NULL, NULL
 	},
-#endif   /* USE_SSL */
 
 	{
 		{"application_name", PGC_USERSET, LOGGING_WHAT,
@@ -2807,16 +2846,19 @@ static struct config_enum ConfigureNamesEnum[] =
 		LOGSTMT_NONE, log_statement_options, NULL, NULL
 	},
 
-#ifdef HAVE_SYSLOG
 	{
 		{"syslog_facility", PGC_SIGHUP, LOGGING_WHERE,
 			gettext_noop("Sets the syslog \"facility\" to be used when syslog enabled."),
 			NULL
 		},
 		&syslog_facility,
-		LOG_LOCAL0, syslog_facility_options, assign_syslog_facility, NULL
-	},
+#ifdef HAVE_SYSLOG
+		LOG_LOCAL0,
+#else
+		0,
 #endif
+		syslog_facility_options, assign_syslog_facility, NULL
+	},
 
 	{
 		{"session_replication_role", PGC_SUSET, CLIENT_CONN_STATEMENT,
@@ -3458,6 +3500,8 @@ InitializeGUCOptions(void)
 					PGC_POSTMASTER, PGC_S_OVERRIDE);
 	SetConfigOption("transaction_read_only", "no",
 					PGC_POSTMASTER, PGC_S_OVERRIDE);
+	SetConfigOption("transaction_deferrable", "no",
+					PGC_POSTMASTER, PGC_S_OVERRIDE);
 
 	/*
 	 * For historical reasons, some GUC parameters can receive defaults from
@@ -3485,14 +3529,14 @@ InitializeGUCOptions(void)
 	stack_rlimit = get_stack_depth_rlimit();
 	if (stack_rlimit > 0)
 	{
-		int			new_limit = (stack_rlimit - STACK_DEPTH_SLOP) / 1024L;
+		long		new_limit = (stack_rlimit - STACK_DEPTH_SLOP) / 1024L;
 
 		if (new_limit > 100)
 		{
 			char		limbuf[16];
 
 			new_limit = Min(new_limit, 2048);
-			sprintf(limbuf, "%d", new_limit);
+			sprintf(limbuf, "%ld", new_limit);
 			SetConfigOption("max_stack_depth", limbuf,
 							PGC_POSTMASTER, PGC_S_ENV_VAR);
 		}
@@ -5621,7 +5665,7 @@ flatten_set_variable_args(const char *name, List *args)
 					Datum		interval;
 					char	   *intervalout;
 
-					typoid = typenameTypeId(NULL, typeName, &typmod);
+					typenameTypeIdAndMod(NULL, typeName, &typoid, &typmod);
 					Assert(typoid == INTERVALOID);
 
 					interval =
@@ -5697,6 +5741,9 @@ ExecSetVariableStmt(VariableSetStmt *stmt)
 					else if (strcmp(item->defname, "transaction_read_only") == 0)
 						SetPGVariable("transaction_read_only",
 									  list_make1(item->arg), stmt->is_local);
+					else if (strcmp(item->defname, "transaction_deferrable") == 0)
+						SetPGVariable("transaction_deferrable",
+									  list_make1(item->arg), stmt->is_local);
 					else
 						elog(ERROR, "unexpected SET TRANSACTION element: %s",
 							 item->defname);
@@ -5715,6 +5762,9 @@ ExecSetVariableStmt(VariableSetStmt *stmt)
 									  list_make1(item->arg), stmt->is_local);
 					else if (strcmp(item->defname, "transaction_read_only") == 0)
 						SetPGVariable("default_transaction_read_only",
+									  list_make1(item->arg), stmt->is_local);
+					else if (strcmp(item->defname, "transaction_deferrable") == 0)
+						SetPGVariable("default_transaction_deferrable",
 									  list_make1(item->arg), stmt->is_local);
 					else
 						elog(ERROR, "unexpected SET SESSION element: %s",
@@ -7637,14 +7687,15 @@ assign_log_destination(const char *value, bool doit, GucSource source)
 	return value;
 }
 
-#ifdef HAVE_SYSLOG
-
 static bool
 assign_syslog_facility(int newval, bool doit, GucSource source)
 {
+#ifdef HAVE_SYSLOG
 	if (doit)
 		set_syslog_parameters(syslog_ident_str ? syslog_ident_str : "postgres",
 							  newval);
+#endif
+	/* Without syslog support, just ignore it */
 
 	return true;
 }
@@ -7652,12 +7703,14 @@ assign_syslog_facility(int newval, bool doit, GucSource source)
 static const char *
 assign_syslog_ident(const char *ident, bool doit, GucSource source)
 {
+#ifdef HAVE_SYSLOG
 	if (doit)
 		set_syslog_parameters(ident, syslog_facility);
+#endif
+	/* Without syslog support, it will always be set to "none", so ignore */
 
 	return ident;
 }
-#endif   /* HAVE_SYSLOG */
 
 
 static bool
@@ -7834,34 +7887,6 @@ assign_log_stats(bool newval, bool doit, GucSource source)
 		if (source != PGC_S_OVERRIDE)
 			return false;
 	}
-	return true;
-}
-
-static bool
-assign_transaction_read_only(bool newval, bool doit, GucSource source)
-{
-	/* Can't go to r/w mode inside a r/o transaction */
-	if (newval == false && XactReadOnly && IsSubTransaction())
-	{
-		ereport(GUC_complaint_elevel(source),
-				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-				 errmsg("cannot set transaction read-write mode inside a read-only transaction")));
-		/* source == PGC_S_OVERRIDE means do it anyway, eg at xact abort */
-		if (source != PGC_S_OVERRIDE)
-			return false;
-	}
-
-	/* Can't go to r/w mode while recovery is still active */
-	if (newval == false && XactReadOnly && RecoveryInProgress())
-	{
-		ereport(GUC_complaint_elevel(source),
-				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-		  errmsg("cannot set transaction read-write mode during recovery")));
-		/* source == PGC_S_OVERRIDE means do it anyway, eg at xact abort */
-		if (source != PGC_S_OVERRIDE)
-			return false;
-	}
-
 	return true;
 }
 

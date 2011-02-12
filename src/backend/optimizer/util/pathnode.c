@@ -3,7 +3,7 @@
  * pathnode.c
  *	  Routines to manipulate pathlists and create path nodes
  *
- * Portions Copyright (c) 1996-2010, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2011, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -18,6 +18,7 @@
 
 #include "catalog/pg_operator.h"
 #include "miscadmin.h"
+#include "nodes/nodeFuncs.h"
 #include "optimizer/clauses.h"
 #include "optimizer/cost.h"
 #include "optimizer/pathnode.h"
@@ -413,6 +414,8 @@ create_seqscan_path(PlannerInfo *root, RelOptInfo *rel)
  * 'index' is a usable index.
  * 'clause_groups' is a list of lists of RestrictInfo nodes
  *			to be used as index qual conditions in the scan.
+ * 'indexorderbys' is a list of bare expressions (no RestrictInfos)
+ *			to be used as index ordering operators in the scan.
  * 'pathkeys' describes the ordering of the path.
  * 'indexscandir' is ForwardScanDirection or BackwardScanDirection
  *			for an ordered index, or NoMovementScanDirection for
@@ -426,6 +429,7 @@ IndexPath *
 create_index_path(PlannerInfo *root,
 				  IndexOptInfo *index,
 				  List *clause_groups,
+				  List *indexorderbys,
 				  List *pathkeys,
 				  ScanDirection indexscandir,
 				  RelOptInfo *outer_rel)
@@ -462,6 +466,7 @@ create_index_path(PlannerInfo *root,
 	pathnode->indexinfo = index;
 	pathnode->indexclauses = allclauses;
 	pathnode->indexquals = indexquals;
+	pathnode->indexorderbys = indexorderbys;
 
 	pathnode->isjoininner = (outer_rel != NULL);
 	pathnode->indexscandir = indexscandir;
@@ -503,7 +508,7 @@ create_index_path(PlannerInfo *root,
 		pathnode->rows = rel->rows;
 	}
 
-	cost_index(pathnode, root, index, indexquals, outer_rel);
+	cost_index(pathnode, root, index, indexquals, indexorderbys, outer_rel);
 
 	return pathnode;
 }
@@ -693,6 +698,35 @@ create_merge_append_path(PlannerInfo *root,
 	pathnode->path.pathkeys = pathkeys;
 	pathnode->subpaths = subpaths;
 
+	/*
+	 * Apply query-wide LIMIT if known and path is for sole base relation.
+	 * Finding out the latter at this low level is a bit klugy.
+	 */
+	pathnode->limit_tuples = root->limit_tuples;
+	if (pathnode->limit_tuples >= 0)
+	{
+		Index		rti;
+
+		for (rti = 1; rti < root->simple_rel_array_size; rti++)
+		{
+			RelOptInfo *brel = root->simple_rel_array[rti];
+
+			if (brel == NULL)
+				continue;
+
+			/* ignore RTEs that are "other rels" */
+			if (brel->reloptkind != RELOPT_BASEREL)
+				continue;
+
+			if (brel != rel)
+			{
+				/* Oops, it's a join query */
+				pathnode->limit_tuples = -1.0;
+				break;
+			}
+		}
+	}
+
 	/* Add up all the costs of the input paths */
 	input_startup_cost = 0;
 	input_total_cost = 0;
@@ -719,7 +753,7 @@ create_merge_append_path(PlannerInfo *root,
 					  subpath->parent->width,
 					  0.0,
 					  work_mem,
-					  -1.0);
+					  pathnode->limit_tuples);
 			input_startup_cost += sort_path.startup_cost;
 			input_total_cost += sort_path.total_cost;
 		}
@@ -878,6 +912,7 @@ create_unique_path(PlannerInfo *root, RelOptInfo *rel, Path *subpath,
 		Relids		left_varnos;
 		Relids		right_varnos;
 		Relids		all_varnos;
+		Oid			opinputtype;
 
 		/* Is it a binary opclause? */
 		if (!IsA(op, OpExpr) ||
@@ -908,6 +943,7 @@ create_unique_path(PlannerInfo *root, RelOptInfo *rel, Path *subpath,
 		left_varnos = pull_varnos(left_expr);
 		right_varnos = pull_varnos(right_expr);
 		all_varnos = bms_union(left_varnos, right_varnos);
+		opinputtype = exprType(left_expr);
 
 		/* Does it reference both sides? */
 		if (!bms_overlap(all_varnos, sjinfo->syn_righthand) ||
@@ -946,14 +982,14 @@ create_unique_path(PlannerInfo *root, RelOptInfo *rel, Path *subpath,
 		if (all_btree)
 		{
 			/* oprcanmerge is considered a hint... */
-			if (!op_mergejoinable(opno) ||
+			if (!op_mergejoinable(opno, opinputtype) ||
 				get_mergejoin_opfamilies(opno) == NIL)
 				all_btree = false;
 		}
 		if (all_hash)
 		{
 			/* ... but oprcanhash had better be correct */
-			if (!op_hashjoinable(opno))
+			if (!op_hashjoinable(opno, opinputtype))
 				all_hash = false;
 		}
 		if (!(all_btree || all_hash))

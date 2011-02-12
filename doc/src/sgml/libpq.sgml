@@ -164,22 +164,36 @@ PGconn *PQconnectdbParams(const char **keywords, const char **values, int expand
            Using <literal>hostaddr</> instead of <literal>host</> allows the
            application to avoid a host name look-up, which might be important
            in applications with time constraints. However, a host name is
-           required for Kerberos, GSSAPI, or SSPI authentication, as well as
-           for full SSL certificate verification. The following rules are
-           used:
-           If <literal>host</> is specified without <literal>hostaddr</>,
-           a host name lookup occurs.
-           If <literal>hostaddr</> is specified without <literal>host</>,
-           the value for <literal>hostaddr</> gives the server address.
-           The connection attempt will fail in any of the cases where a
-           host name is required.
-           If both <literal>host</> and <literal>hostaddr</> are specified,
-           the value for <literal>hostaddr</> gives the server address.
-           The value for <literal>host</> is ignored unless needed for
-           authentication or verification purposes, in which case it will be
-           used as the host name.  Note that authentication is likely to fail
-           if <literal>host</> is not the name of the machine at
-           <literal>hostaddr</>.
+           required for Kerberos, GSSAPI, or SSPI authentication
+           methods, as well as for <literal>verify-full</> SSL
+           certificate verification.  The following rules are used:
+           <itemizedlist>
+            <listitem>
+             <para>
+              If <literal>host</> is specified without <literal>hostaddr</>,
+              a host name lookup occurs.
+             </para>
+            </listitem>
+            <listitem>
+             <para>
+              If <literal>hostaddr</> is specified without <literal>host</>,
+              the value for <literal>hostaddr</> gives the server network address.
+              The connection attempt will fail if the authentication
+              method requires a host name.
+             </para>
+            </listitem>
+            <listitem>
+             <para>
+              If both <literal>host</> and <literal>hostaddr</> are specified,
+              the value for <literal>hostaddr</> gives the server network address.
+              The value for <literal>host</> is ignored unless the
+              authentication method requires it, in which case it will be
+              used as the host name.  
+             </para>
+            </listitem>
+           </itemizedlist>
+           Note that authentication is likely to fail if <literal>host</>
+           is not the name of the server at network address <literal>hostaddr</>.
            Also, note that <literal>host</> rather than <literal>hostaddr</>
            is used to identify the connection in <filename>~/.pgpass</> (see
            <xref linkend="libpq-pgpass">).
@@ -359,7 +373,7 @@ PGconn *PQconnectdbParams(const char **keywords, const char **values, int expand
           </para>
 
           <table id="libpq-connect-sslmode-options">
-           <title><literal>sslmode</literal> options</title>
+           <title><literal>sslmode</literal> Options</title>
            <tgroup cols="2">
             <thead>
              <row>
@@ -397,8 +411,8 @@ PGconn *PQconnectdbParams(const char **keywords, const char **values, int expand
              <row>
               <entry><literal>verify-ca</></entry>
               <entry>only try an <acronym>SSL</> connection, and verify that
-              the server certificate is issued by a trusted <acronym>CA</>
-              </entry>
+              the server certificate is issued by a trusted certificate
+              authority (<acronym>CA</>)</entry>
              </row>
 
              <row>
@@ -461,7 +475,7 @@ PGconn *PQconnectdbParams(const char **keywords, const char **values, int expand
            This parameter specifies the file name of the client SSL
            certificate, replacing the default
            <filename>~/.postgresql/postgresql.crt</>.
-           This parameter is ignored if an SSL connection is not made. 
+           This parameter is ignored if an SSL connection is not made.
           </para>
          </listitem>
         </varlistentry>
@@ -691,7 +705,9 @@ PGconn *PQsetdb(char *pghost,
        Make a connection to the database server in a nonblocking manner.
 
 <synopsis>
-PGconn *PQconnectStartParams(const char **keywords, const char **values, int expand_dbname);
+PGconn *PQconnectStartParams(const char **keywords,
+                             const char **values,
+                             int expand_dbname);
 
 PGconn *PQconnectStart(const char *conninfo);
 
@@ -789,8 +805,8 @@ PostgresPollingStatusType PQconnectPoll(PGconn *conn);
 
       <para>
        At any time during connection, the status of the connection can be
-       checked by calling <function>PQstatus</>. If this gives <symbol>CONNECTION_BAD</>, then the
-       connection procedure has failed; if it gives <function>CONNECTION_OK</>, then the
+       checked by calling <function>PQstatus</>. If this call returns <symbol>CONNECTION_BAD</>, then the
+       connection procedure has failed; if the call returns <function>CONNECTION_OK</>, then the
        connection is ready.  Both of these states are equally detectable
        from the return value of <function>PQconnectPoll</>, described above. Other states might also occur
        during (and only during) an asynchronous connection procedure. These
@@ -954,7 +970,7 @@ PQconninfoOption *PQconninfoParse(const char *conninfo, char **errmsg);
       <para>
        Parses a connection string and returns the resulting options as an
        array; or returns <symbol>NULL</> if there is a problem with the connection
-       string.  This can be used to determine
+       string.  This function can be used to extract
        the <function>PQconnectdb</function> options in the provided
        connection string.  The return value points to an array of
        <structname>PQconninfoOption</structname> structures, which ends
@@ -970,8 +986,8 @@ PQconninfoOption *PQconninfoParse(const char *conninfo, char **errmsg);
        If <literal>errmsg</> is not <symbol>NULL</>, then <literal>*errmsg</> is set
        to <symbol>NULL</> on success, else to a <function>malloc</>'d error string explaining
        the problem.  (It is also possible for <literal>*errmsg</> to be
-       set to <symbol>NULL</> even when <symbol>NULL</> is returned; this indicates an out-of-memory
-       situation.)
+       set to <symbol>NULL</> and the function to return <symbol>NULL</>;
+       this indicates an out-of-memory condition.)
       </para>
 
       <para>
@@ -1057,6 +1073,94 @@ PostgresPollingStatusType PQresetPoll(PGconn *conn);
        <function>PQresetPoll</function> in exactly the same way as you
        would create the connection using <function>PQconnectPoll</function>.
       </para>
+     </listitem>
+    </varlistentry>
+
+    <varlistentry id="libpq-pqpingparams">
+     <term><function>PQpingParams</function><indexterm><primary>PQpingParams</></></term>
+     <listitem>
+      <para>
+       <function>PQpingParams</function> reports the status of the
+       server.  It accepts connection parameters identical to those of
+       <function>PQconnectdbParams</>, described above.  It is not, however,
+       necessary to supply correct user name, password, or database name
+       values to obtain the server status.
+
+<synopsis>
+PGPing PQpingParams(const char **keywords, const char **values, int expand_dbname);
+</synopsis>
+
+       The function returns one of the following values:
+
+       <variablelist>
+        <varlistentry id="libpq-pqpingparams-pqping-ok">
+         <term><literal>PQPING_OK</literal></term>
+         <listitem>
+          <para>
+           The server is running and appears to be accepting connections.
+          </para>
+         </listitem>
+        </varlistentry>
+
+        <varlistentry id="libpq-pqpingparams-pqping-reject">
+         <term><literal>PQPING_REJECT</literal></term>
+         <listitem>
+          <para>
+           The server is running but is in a state that disallows connections
+           (startup, shutdown, or crash recovery).
+          </para>
+         </listitem>
+        </varlistentry>
+
+        <varlistentry id="libpq-pqpingparams-pqping-no-response">
+         <term><literal>PQPING_NO_RESPONSE</literal></term>
+         <listitem>
+          <para>
+           The server could not be contacted.  This might indicate that the
+           server is not running, or that there is something wrong with the
+           given connection parameters (for example, wrong port number), or
+           that there is a network connectivity problem (for example, a
+           firewall blocking the connection request).
+          </para>
+         </listitem>
+        </varlistentry>
+
+        <varlistentry id="libpq-pqpingparams-pqping-no-attempt">
+         <term><literal>PQPING_NO_ATTEMPT</literal></term>
+         <listitem>
+          <para>
+           No attempt was made to contact the server, because the supplied
+           parameters were obviously incorrect or there was some client-side
+           problem (for example, out of memory).
+          </para>
+         </listitem>
+        </varlistentry>
+       </variablelist>
+
+      </para>
+
+     </listitem>
+    </varlistentry>
+
+    <varlistentry id="libpq-pqping">
+     <term><function>PQping</function><indexterm><primary>PQping</></></term>
+     <listitem>
+      <para>
+       <function>PQping</function> reports the status of the
+       server.  It accepts connection parameters identical to those of
+       <function>PQconnectdb</>, described above.  It is not, however,
+       necessary to supply correct user name, password, or database name
+       values to obtain the server status.
+
+<synopsis>
+PGPing PQping(const char *conninfo);
+</synopsis>
+      </para>
+
+      <para>
+       The return values are the same as for <function>PQpingParams</>.
+      </para>
+
      </listitem>
     </varlistentry>
 
@@ -1262,7 +1366,7 @@ ConnStatusType PQstatus(const PGconn *conn);
       <para>
        See the entry for <function>PQconnectStartParams</>, <function>PQconnectStart</>
        and <function>PQconnectPoll</> with regards to other status codes that
-       might be seen.
+       might be returned.
       </para>
      </listitem>
     </varlistentry>
@@ -1328,46 +1432,46 @@ const char *PQparameterStatus(const PGconn *conn, const char *paramName);
 
       <para>
        Parameters reported as of the current release include
-       <literal>server_version</>,
-       <literal>server_encoding</>,
-       <literal>client_encoding</>,
-       <literal>application_name</>,
-       <literal>is_superuser</>,
-       <literal>session_authorization</>,
-       <literal>DateStyle</>,
-       <literal>IntervalStyle</>,
-       <literal>TimeZone</>,
-       <literal>integer_datetimes</>, and
-       <literal>standard_conforming_strings</>.
-       (<literal>server_encoding</>, <literal>TimeZone</>, and
-       <literal>integer_datetimes</> were not reported by releases before 8.0;
-       <literal>standard_conforming_strings</> was not reported by releases
+       <varname>server_version</>,
+       <varname>server_encoding</>,
+       <varname>client_encoding</>,
+       <varname>application_name</>,
+       <varname>is_superuser</>,
+       <varname>session_authorization</>,
+       <varname>DateStyle</>,
+       <varname>IntervalStyle</>,
+       <varname>TimeZone</>,
+       <varname>integer_datetimes</>, and
+       <varname>standard_conforming_strings</>.
+       (<varname>server_encoding</>, <varname>TimeZone</>, and
+       <varname>integer_datetimes</> were not reported by releases before 8.0;
+       <varname>standard_conforming_strings</> was not reported by releases
        before 8.1;
-       <literal>IntervalStyle</> was not reported by releases before 8.4;
-       <literal>application_name</> was not reported by releases before 9.0.)
+       <varname>IntervalStyle</> was not reported by releases before 8.4;
+       <varname>application_name</> was not reported by releases before 9.0.)
        Note that
-       <literal>server_version</>,
-       <literal>server_encoding</> and
-       <literal>integer_datetimes</>
+       <varname>server_version</>,
+       <varname>server_encoding</> and
+       <varname>integer_datetimes</>
        cannot change after startup.
       </para>
 
       <para>
        Pre-3.0-protocol servers do not report parameter settings, but
        <application>libpq</> includes logic to obtain values for
-       <literal>server_version</> and <literal>client_encoding</> anyway.
+       <varname>server_version</> and <varname>client_encoding</> anyway.
        Applications are encouraged to use <function>PQparameterStatus</>
        rather than <foreignphrase>ad hoc</> code to determine these values.
        (Beware however that on a pre-3.0 connection, changing
-       <literal>client_encoding</> via <command>SET</> after connection
+       <varname>client_encoding</> via <command>SET</> after connection
        startup will not be reflected by <function>PQparameterStatus</>.)
-       For <literal>server_version</>, see also
+       For <varname>server_version</>, see also
        <function>PQserverVersion</>, which returns the information in a
        numeric form that is much easier to compare against.
       </para>
 
       <para>
-       If no value for <literal>standard_conforming_strings</> is reported,
+       If no value for <varname>standard_conforming_strings</> is reported,
        applications can assume it is <literal>off</>, that is, backslashes
        are treated as escapes in string literals.  Also, the presence of
        this parameter can be taken as an indication that the escape string
@@ -1396,9 +1500,10 @@ const char *PQparameterStatus(const PGconn *conn, const char *paramName);
 <synopsis>
 int PQprotocolVersion(const PGconn *conn);
 </synopsis>
-       Applications might wish to use this to determine whether certain
+       Applications might wish to use this function to determine whether certain
        features are supported.  Currently, the possible values are 2 (2.0
-       protocol), 3 (3.0 protocol), or zero (connection bad).  This will
+       protocol), 3 (3.0 protocol), or zero (connection bad).  The
+       protocol version will
        not change after connection startup is complete, but it could
        theoretically change during a connection reset.  The 3.0 protocol
        will normally be used when communicating with
@@ -1423,7 +1528,7 @@ int PQprotocolVersion(const PGconn *conn);
 <synopsis>
 int PQserverVersion(const PGconn *conn);
 </synopsis>
-       Applications might use this to determine the version of the database
+       Applications might use this function to determine the version of the database
        server they are connected to. The number is formed by converting
        the major, minor, and revision numbers into two-decimal-digit
        numbers and appending them together. For example, version 8.1.5
@@ -1457,7 +1562,7 @@ char *PQerrorMessage(const PGconn *conn);
        Nearly all <application>libpq</> functions will set a message for
        <function>PQerrorMessage</function> if they fail.  Note that by
        <application>libpq</application> convention, a nonempty
-       <function>PQerrorMessage</function> result can be multiple lines,
+       <function>PQerrorMessage</function> result can consist of multiple lines,
        and will include a trailing newline. The caller should not free
        the result directly. It will be freed when the associated
        <structname>PGconn</> handle is passed to
@@ -1627,8 +1732,8 @@ PGresult *PQexec(PGconn *conn, const char *command);
      </varlistentry>
     </variablelist>
 
-    It is allowed to include multiple SQL commands (separated by semicolons)
-    in the command string.  Multiple queries sent in a single
+    The command string can include multiple SQL commands
+    (separated by semicolons).  Multiple queries sent in a single
     <function>PQexec</> call are processed in a single transaction, unless
     there are explicit <command>BEGIN</command>/<command>COMMIT</command>
     commands included in the query string to divide it into multiple
@@ -2129,6 +2234,16 @@ ExecStatusType PQresultStatus(const PGresult *res);
           <listitem>
            <para>
             A fatal error occurred.
+           </para>
+          </listitem>
+         </varlistentry>
+
+         <varlistentry id="libpq-pgres-copy-both">
+          <term><literal>PGRES_COPY_BOTH</literal></term>
+          <listitem>
+           <para>
+            Copy In/Out (to and from server) data transfer started.  This is
+            currently used only for streaming replication.
            </para>
           </listitem>
          </varlistentry>
@@ -3062,23 +3177,15 @@ Oid PQoidValue(const PGresult *res);
 
      <listitem>
       <para>
-       Returns a string with the OID of the inserted row, if the
-       <acronym>SQL</acronym> command was an <command>INSERT</command>
-       that inserted exactly one row, or a <command>EXECUTE</command> of
-       a prepared statement consisting of a suitable
-       <command>INSERT</command>.  (The string will be <literal>0</> if
-       the <command>INSERT</command> did not insert exactly one row, or
-       if the target table does not have OIDs.)  If the command was not
-       an <command>INSERT</command>, returns an empty string.
+       This function is deprecated in favor of
+       <function>PQoidValue</function> and is not thread-safe.
+       It returns a string with the OID of the inserted row, while
+       <function>PQoidValue</function> returns the OID value.
 <synopsis>
 char *PQoidStatus(const PGresult *res);
 </synopsis>
       </para>
 
-      <para>
-       This function is deprecated in favor of
-       <function>PQoidValue</function>.  It is not thread-safe.
-      </para>
      </listitem>
     </varlistentry>
    </variablelist>
@@ -4042,7 +4149,7 @@ int PQcancel(PGcancel *cancel, char *errbuf, int errbufsize);
       <para>
        The return value is 1 if the cancel request was successfully
        dispatched and 0 if not.  If not, <parameter>errbuf</> is filled
-       with an error message explaining why not.  <parameter>errbuf</>
+       with an explanatory error message.  <parameter>errbuf</>
        must be a char array of size <parameter>errbufsize</> (the
        recommended size is 256 bytes).
       </para>
@@ -4079,16 +4186,16 @@ int PQcancel(PGcancel *cancel, char *errbuf, int errbufsize);
 
      <listitem>
       <para>
-       Requests that the server abandon processing of the current
-       command.
+       <function>PQrequestCancel</function> is a deprecated variant of
+       <function>PQcancel</function>.  
 <synopsis>
 int PQrequestCancel(PGconn *conn);
 </synopsis>
       </para>
 
       <para>
-       <function>PQrequestCancel</function> is a deprecated variant of
-       <function>PQcancel</function>.  It operates directly on the
+       Requests that the server abandon processing of the current
+       command.  It operates directly on the
        <structname>PGconn</> object, and in case of failure stores the
        error message in the <structname>PGconn</> object (whence it can
        be retrieved by <function>PQerrorMessage</function>).  Although
@@ -5224,7 +5331,7 @@ int PQsetvalue(PGresult *res, int tup_num, int field_num, char *value, int len);
       function can only grow the tuples array one tuple at a time.  But any
       field of any existing tuple can be modified in any order.  If a value at
       <parameter>field_num</parameter> already exists, it will be overwritten.
-      If <parameter>len</parameter> is <literal>-1</literal> or
+      If <parameter>len</parameter> is -1 or
       <parameter>value</parameter> is <symbol>NULL</>, the field value
       will be set to an SQL null value.  The
       <parameter>value</parameter> is copied into the result's private storage,
@@ -5258,6 +5365,50 @@ void *PQresultAlloc(PGresult *res, size_t nBytes);
       guaranteed to be adequately aligned for any type of data,
       just as for <function>malloc</>.
      </para>
+    </listitem>
+   </varlistentry>
+
+   <varlistentry id="libpq-pqlibversion">
+    <term>
+     <function>PQlibVersion</function>
+     <indexterm>
+      <primary>PQlibVersion</primary>
+      <seealso>PQserverVersion</seealso>
+     </indexterm>
+    </term>
+
+    <listitem>
+     <para>
+      Return the version of <productname>libpq</> that is being used.
+<synopsis>
+int PQlibVersion(void);
+</synopsis>
+     </para>
+
+     <para>
+      The result of this function can be used to determine, at
+      runtime, if specific functionality is available in the currently
+      loaded version of libpq. The function can be used, for example,
+      to determine which connection options are available for
+      <function>PQconnectdb</> or if the <literal>hex</> <type>bytea</>
+      output added in PostgreSQL 9.0 is supported.
+     </para>
+
+     <para>
+      The number is formed by converting the major, minor, and revision
+      numbers into two-decimal-digit numbers and appending them together.
+      For example, version 9.1 will be returned as 90100, and version
+      9.1.2 will be returned as 90102 (leading zeroes are not shown).
+     </para>
+
+     <note>
+      <para>
+       This function appeared in <productname>PostgreSQL</> version 9.1, so
+       it cannot be used to detect required functionality in earlier
+       versions, since linking to it will create a link dependency
+       on version 9.1.
+      </para>
+     </note>
     </listitem>
    </varlistentry>
 
@@ -6331,6 +6482,8 @@ myEventProc(PGEventId evtId, void *evtInfo, void *passThrough)
    or the default socket directory) connections coming from the local
    machine. In a standby server, a database name of <literal>replication</>
    matches streaming replication connections made to the master server.
+   The <literal>database</> field is of limited usefulness because
+   users have the same password for all databases in the same cluster.
   </para>
 
   <para>
@@ -6502,7 +6655,7 @@ ldap://ldap.acme.com/cn=dbserver,cn=hosts?pgconnectinfo?base?(objectclass=*)
   </para>
 
  <sect2 id="libq-ssl-certificates">
-  <title>Certificate verification</title>
+  <title>Client Verification of Server Certificates</title>
 
   <para>
    By default, <productname>PostgreSQL</> will not perform any verification of
@@ -6557,7 +6710,7 @@ ldap://ldap.acme.com/cn=dbserver,cn=hosts?pgconnectinfo?base?(objectclass=*)
  </sect2>
 
  <sect2 id="libpq-ssl-clientcert">
-  <title>Client certificates</title>
+  <title>Client Certificates</title>
 
   <para>
    If the server requests a trusted client certificate,
@@ -6599,7 +6752,7 @@ ldap://ldap.acme.com/cn=dbserver,cn=hosts?pgconnectinfo?base?(objectclass=*)
  </sect2>
 
  <sect2 id="libpq-ssl-protection">
-  <title>Protection provided in different modes</title>
+  <title>Protection Provided in Different Modes</title>
 
   <para>
    The different values for the <literal>sslmode</> parameter provide different
@@ -6607,7 +6760,7 @@ ldap://ldap.acme.com/cn=dbserver,cn=hosts?pgconnectinfo?base?(objectclass=*)
    protection against three types of attacks:
   </para>
   <table id="libpq-ssl-protect-attacks">
-   <title>SSL attacks</title>
+   <title>SSL Attacks</title>
    <tgroup cols="2">
     <thead>
      <row>
@@ -6682,7 +6835,7 @@ ldap://ldap.acme.com/cn=dbserver,cn=hosts?pgconnectinfo?base?(objectclass=*)
   </para>
 
   <table id="libpq-ssl-sslmode-statements">
-   <title>SSL mode descriptions</title>
+   <title>SSL Mode Descriptions</title>
    <tgroup cols="4">
     <thead>
      <row>
@@ -6773,7 +6926,7 @@ ldap://ldap.acme.com/cn=dbserver,cn=hosts?pgconnectinfo?base?(objectclass=*)
  </sect2>
 
  <sect2 id="libpq-ssl-fileusage">
-  <title>SSL File Usage</title>
+  <title>SSL Client File Usage</title>
   <table id="libpq-ssl-file-usage">
    <title>Libpq/Client SSL File Usage</title>
    <tgroup cols="3">
@@ -6819,7 +6972,7 @@ ldap://ldap.acme.com/cn=dbserver,cn=hosts?pgconnectinfo?base?(objectclass=*)
  </sect2>
 
  <sect2 id="libpq-ssl-initialize">
-  <title>SSL library initialization</title>
+  <title>SSL Library Initialization</title>
 
   <para>
    If your application initializes <literal>libssl</> and/or
@@ -7395,7 +7548,7 @@ main(int argc, char **argv)
   </example>
 
   <example id="libpq-example-3">
-   <title><application>libpq</application> Example Program 3</>
+   <title><application>libpq</application> Example Program 3</title>
 
 <programlisting>
 <![CDATA[

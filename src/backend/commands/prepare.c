@@ -7,7 +7,7 @@
  * accessed via the extended FE/BE query protocol.
  *
  *
- * Copyright (c) 2002-2010, PostgreSQL Global Development Group
+ * Copyright (c) 2002-2011, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *	  src/backend/commands/prepare.c
@@ -90,7 +90,7 @@ PrepareQuery(PrepareStmt *stmt, const char *queryString)
 		foreach(l, stmt->argtypes)
 		{
 			TypeName   *tn = lfirst(l);
-			Oid			toid = typenameTypeId(pstate, tn, NULL);
+			Oid			toid = typenameTypeId(pstate, tn);
 
 			argtypes[i++] = toid;
 		}

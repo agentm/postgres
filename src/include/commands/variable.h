@@ -2,7 +2,7 @@
  * variable.h
  *		Routines for handling specialized SET variables.
  *
- * Portions Copyright (c) 1996-2010, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2011, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/commands/variable.h
@@ -21,9 +21,13 @@ extern const char *show_timezone(void);
 extern const char *assign_log_timezone(const char *value,
 					bool doit, GucSource source);
 extern const char *show_log_timezone(void);
+extern bool assign_transaction_read_only(bool value,
+					bool doit, GucSource source);
 extern const char *assign_XactIsoLevel(const char *value,
 					bool doit, GucSource source);
 extern const char *show_XactIsoLevel(void);
+extern bool assign_transaction_deferrable(bool newval, bool doit,
+					GucSource source);
 extern bool assign_random_seed(double value,
 				   bool doit, GucSource source);
 extern const char *show_random_seed(void);

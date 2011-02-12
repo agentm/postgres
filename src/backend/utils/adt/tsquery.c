@@ -3,7 +3,7 @@
  * tsquery.c
  *	  I/O functions for tsquery
  *
- * Portions Copyright (c) 1996-2010, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2011, PostgreSQL Global Development Group
  *
  *
  * IDENTIFICATION
@@ -371,8 +371,8 @@ makepol(TSQueryParserState state,
 			case PT_OPEN:
 				makepol(state, pushval, opaque);
 
-				if (lenstack && (opstack[lenstack - 1] == OP_AND ||
-								 opstack[lenstack - 1] == OP_NOT))
+				while (lenstack && (opstack[lenstack - 1] == OP_AND ||
+									opstack[lenstack - 1] == OP_NOT))
 				{
 					lenstack--;
 					pushOperator(state, opstack[lenstack]);

@@ -4,7 +4,7 @@
  *	  page utilities routines for the postgres inverted index access method.
  *
  *
- * Portions Copyright (c) 1996-2010, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2011, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -14,7 +14,7 @@
 
 #include "postgres.h"
 
-#include "access/gin.h"
+#include "access/gin_private.h"
 #include "miscadmin.h"
 #include "storage/bufmgr.h"
 #include "utils/rel.h"
@@ -104,7 +104,8 @@ ginFindLeafPage(GinBtree btree, GinBtreeStack *stack)
 		 * ok, page is correctly locked, we should check to move right ..,
 		 * root never has a right link, so small optimization
 		 */
-		while (btree->fullScan == FALSE && stack->blkno != rootBlkno && btree->isMoveRight(btree, page))
+		while (btree->fullScan == FALSE && stack->blkno != rootBlkno &&
+			   btree->isMoveRight(btree, page))
 		{
 			BlockNumber rightlink = GinPageGetOpaque(page)->rightlink;
 
@@ -226,7 +227,6 @@ ginFindParents(GinBtree btree, GinBtreeStack *stack,
 	LockBuffer(root->buffer, GIN_UNLOCK);
 	Assert(blkno != InvalidBlockNumber);
 
-
 	for (;;)
 	{
 		buffer = ReadBuffer(btree->index, blkno);
@@ -304,7 +304,7 @@ ginInsertValue(GinBtree btree, GinBtreeStack *stack, GinStatsData *buildStats)
 
 			MarkBufferDirty(stack->buffer);
 
-			if (!btree->index->rd_istemp)
+			if (RelationNeedsWAL(btree->index))
 			{
 				XLogRecPtr	recptr;
 
@@ -373,7 +373,7 @@ ginInsertValue(GinBtree btree, GinBtreeStack *stack, GinStatsData *buildStats)
 				MarkBufferDirty(lbuffer);
 				MarkBufferDirty(stack->buffer);
 
-				if (!btree->index->rd_istemp)
+				if (RelationNeedsWAL(btree->index))
 				{
 					XLogRecPtr	recptr;
 
@@ -422,7 +422,7 @@ ginInsertValue(GinBtree btree, GinBtreeStack *stack, GinStatsData *buildStats)
 				MarkBufferDirty(rbuffer);
 				MarkBufferDirty(stack->buffer);
 
-				if (!btree->index->rd_istemp)
+				if (RelationNeedsWAL(btree->index))
 				{
 					XLogRecPtr	recptr;
 

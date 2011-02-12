@@ -3,7 +3,7 @@
  * fmgr.c
  *	  The Postgres function manager.
  *
- * Portions Copyright (c) 1996-2010, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2011, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -30,6 +30,11 @@
 #include "utils/lsyscache.h"
 #include "utils/syscache.h"
 
+/*
+ * Hooks for function calls
+ */
+PGDLLIMPORT needs_fmgr_hook_type needs_fmgr_hook = NULL;
+PGDLLIMPORT fmgr_hook_type       fmgr_hook = NULL;
 
 /*
  * Declaration for old-style function pointer type.  This is now used only
@@ -187,6 +192,7 @@ fmgr_info_cxt_security(Oid functionId, FmgrInfo *finfo, MemoryContext mcxt,
 	 * elogs.
 	 */
 	finfo->fn_oid = InvalidOid;
+	finfo->fn_collation = InvalidOid;
 	finfo->fn_extra = NULL;
 	finfo->fn_mcxt = mcxt;
 	finfo->fn_expr = NULL;		/* caller may set this later */
@@ -216,9 +222,9 @@ fmgr_info_cxt_security(Oid functionId, FmgrInfo *finfo, MemoryContext mcxt,
 	finfo->fn_retset = procedureStruct->proretset;
 
 	/*
-	 * If it has prosecdef set, or non-null proconfig, use
-	 * fmgr_security_definer call handler --- unless we are being called again
-	 * by fmgr_security_definer.
+	 * If it has prosecdef set, non-null proconfig, or if a plugin wants to
+	 * hook function entry/exit, use fmgr_security_definer call handler ---
+	 * unless we are being called again by fmgr_security_definer.
 	 *
 	 * When using fmgr_security_definer, function stats tracking is always
 	 * disabled at the outer level, and instead we set the flag properly in
@@ -230,7 +236,8 @@ fmgr_info_cxt_security(Oid functionId, FmgrInfo *finfo, MemoryContext mcxt,
 	 */
 	if (!ignore_security &&
 		(procedureStruct->prosecdef ||
-		 !heap_attisnull(procedureTuple, Anum_pg_proc_proconfig)))
+		 !heap_attisnull(procedureTuple, Anum_pg_proc_proconfig) ||
+		 FmgrHookIsNeeded(functionId)))
 	{
 		finfo->fn_addr = fmgr_security_definer;
 		finfo->fn_stats = TRACK_FUNC_ALL;		/* ie, never track */
@@ -411,6 +418,25 @@ fmgr_info_other_lang(Oid functionId, FmgrInfo *finfo, HeapTuple procedureTuple)
 		elog(ERROR, "language %u has old-style handler", language);
 
 	ReleaseSysCache(languageTuple);
+}
+
+/*
+ * Initialize the fn_collation field
+ */
+void
+fmgr_info_collation(Oid collationId, FmgrInfo *finfo)
+{
+	finfo->fn_collation = collationId;
+}
+
+/*
+ * Initialize the fn_expr field and set the collation based on it
+ */
+void
+fmgr_info_expr(Node *expr, FmgrInfo *finfo)
+{
+	finfo->fn_expr = expr;
+	finfo->fn_collation = exprCollation(expr);
 }
 
 /*
@@ -857,17 +883,18 @@ struct fmgr_security_definer_cache
 	FmgrInfo	flinfo;			/* lookup info for target function */
 	Oid			userid;			/* userid to set, or InvalidOid */
 	ArrayType  *proconfig;		/* GUC values to set, or NULL */
+	Datum		arg;			/* passthrough argument for plugin modules */
 };
 
 /*
- * Function handler for security-definer/proconfig functions.  We extract the
- * OID of the actual function and do a fmgr lookup again.  Then we fetch the
- * pg_proc row and copy the owner ID and proconfig fields.	(All this info
- * is cached for the duration of the current query.)  To execute a call,
- * we temporarily replace the flinfo with the cached/looked-up one, while
- * keeping the outer fcinfo (which contains all the actual arguments, etc.)
- * intact.	This is not re-entrant, but then the fcinfo itself can't be used
- * re-entrantly anyway.
+ * Function handler for security-definer/proconfig/plugin-hooked functions.
+ * We extract the OID of the actual function and do a fmgr lookup again.
+ * Then we fetch the pg_proc row and copy the owner ID and proconfig fields.
+ * (All this info is cached for the duration of the current query.)
+ * To execute a call, we temporarily replace the flinfo with the cached
+ * and looked-up one, while keeping the outer fcinfo (which contains all
+ * the actual arguments, etc.) intact.	This is not re-entrant, but then
+ * the fcinfo itself can't be used re-entrantly anyway.
  */
 static Datum
 fmgr_security_definer(PG_FUNCTION_ARGS)
@@ -940,6 +967,10 @@ fmgr_security_definer(PG_FUNCTION_ARGS)
 						GUC_ACTION_SAVE);
 	}
 
+	/* function manager hook */
+	if (fmgr_hook)
+		(*fmgr_hook)(FHET_START, &fcache->flinfo, &fcache->arg);
+
 	/*
 	 * We don't need to restore GUC or userid settings on error, because the
 	 * ensuing xact or subxact abort will do that.	The PG_TRY block is only
@@ -968,6 +999,8 @@ fmgr_security_definer(PG_FUNCTION_ARGS)
 	PG_CATCH();
 	{
 		fcinfo->flinfo = save_flinfo;
+		if (fmgr_hook)
+			(*fmgr_hook)(FHET_ABORT, &fcache->flinfo, &fcache->arg);
 		PG_RE_THROW();
 	}
 	PG_END_TRY();
@@ -978,6 +1011,8 @@ fmgr_security_definer(PG_FUNCTION_ARGS)
 		AtEOXact_GUC(true, save_nestlevel);
 	if (OidIsValid(fcache->userid))
 		SetUserIdAndSecContext(save_userid, save_sec_context);
+	if (fmgr_hook)
+		(*fmgr_hook)(FHET_END, &fcache->flinfo, &fcache->arg);
 
 	return result;
 }
@@ -1248,6 +1283,52 @@ DirectFunctionCall9(PGFunction func, Datum arg1, Datum arg2,
 	fcinfo.argnull[6] = false;
 	fcinfo.argnull[7] = false;
 	fcinfo.argnull[8] = false;
+
+	result = (*func) (&fcinfo);
+
+	/* Check for null result, since caller is clearly not expecting one */
+	if (fcinfo.isnull)
+		elog(ERROR, "function %p returned NULL", (void *) func);
+
+	return result;
+}
+
+Datum
+DirectFunctionCall1WithCollation(PGFunction func, Oid collation, Datum arg1)
+{
+	FunctionCallInfoData fcinfo;
+	FmgrInfo	flinfo;
+	Datum		result;
+
+	InitFunctionCallInfoData(fcinfo, &flinfo, 1, NULL, NULL);
+	fcinfo.flinfo->fn_collation = collation;
+
+	fcinfo.arg[0] = arg1;
+	fcinfo.argnull[0] = false;
+
+	result = (*func) (&fcinfo);
+
+	/* Check for null result, since caller is clearly not expecting one */
+	if (fcinfo.isnull)
+		elog(ERROR, "function %p returned NULL", (void *) func);
+
+	return result;
+}
+
+Datum
+DirectFunctionCall2WithCollation(PGFunction func, Oid collation, Datum arg1, Datum arg2)
+{
+	FunctionCallInfoData fcinfo;
+	FmgrInfo	flinfo;
+	Datum		result;
+
+	InitFunctionCallInfoData(fcinfo, &flinfo, 2, NULL, NULL);
+	fcinfo.flinfo->fn_collation = collation;
+
+	fcinfo.arg[0] = arg1;
+	fcinfo.arg[1] = arg2;
+	fcinfo.argnull[0] = false;
+	fcinfo.argnull[1] = false;
 
 	result = (*func) (&fcinfo);
 
@@ -2326,10 +2407,10 @@ get_call_expr_argtype(Node *expr, int argnum)
 	 */
 	if (IsA(expr, ScalarArrayOpExpr) &&
 		argnum == 1)
-		argtype = get_element_type(argtype);
+		argtype = get_base_element_type(argtype);
 	else if (IsA(expr, ArrayCoerceExpr) &&
 			 argnum == 0)
-		argtype = get_element_type(argtype);
+		argtype = get_base_element_type(argtype);
 
 	return argtype;
 }

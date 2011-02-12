@@ -8,7 +8,7 @@
   hear about it. Your bug reports play an important part in making
   <productname>PostgreSQL</productname> more reliable because even the utmost
   care cannot guarantee that every part of
-  <productname>PostgreSQL</productname> 
+  <productname>PostgreSQL</productname>
   will work on every platform under every circumstance.
  </para>
 
@@ -97,7 +97,7 @@
  </sect2>
 
  <sect2>
-  <title>What to report</title>
+  <title>What to Report</title>
 
   <para>
    The most important thing to remember about bug reporting is to state all
@@ -292,7 +292,7 @@
  </sect2>
 
  <sect2>
-  <title>Where to report bugs</title>
+  <title>Where to Report Bugs</title>
 
   <para>
    In general, send bug reports to the bug report mailing list at
@@ -301,7 +301,7 @@
    message, perhaps parts of the error message.
   </para>
 
-  <para> 
+  <para>
    Another method is to fill in the bug report web-form available
    at the project's
    <ulink url="http://www.postgresql.org/">web site</ulink>.
@@ -316,7 +316,7 @@
    reported privately to <email>security@postgresql.org</email>.
   </para>
 
-  <para> 
+  <para>
    Do not send bug reports to any of the user mailing lists, such as
    <email>pgsql-sql@postgresql.org</email> or
    <email>pgsql-general@postgresql.org</email>.

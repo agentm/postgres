@@ -3,7 +3,7 @@
  * outfuncs.c
  *	  Output functions for Postgres tree nodes.
  *
- * Portions Copyright (c) 1996-2010, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2011, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -365,6 +365,10 @@ _outMergeAppend(StringInfo str, MergeAppend *node)
 	for (i = 0; i < node->numCols; i++)
 		appendStringInfo(str, " %u", node->sortOperators[i]);
 
+	appendStringInfo(str, " :collations");
+	for (i = 0; i < node->numCols; i++)
+		appendStringInfo(str, " %u", node->collations[i]);
+
 	appendStringInfo(str, " :nullsFirst");
 	for (i = 0; i < node->numCols; i++)
 		appendStringInfo(str, " %s", booltostr(node->nullsFirst[i]));
@@ -439,6 +443,8 @@ _outIndexScan(StringInfo str, IndexScan *node)
 	WRITE_OID_FIELD(indexid);
 	WRITE_NODE_FIELD(indexqual);
 	WRITE_NODE_FIELD(indexqualorig);
+	WRITE_NODE_FIELD(indexorderby);
+	WRITE_NODE_FIELD(indexorderbyorig);
 	WRITE_ENUM_FIELD(indexorderdir, ScanDirection);
 }
 
@@ -497,6 +503,7 @@ _outFunctionScan(StringInfo str, FunctionScan *node)
 	WRITE_NODE_FIELD(funccolnames);
 	WRITE_NODE_FIELD(funccoltypes);
 	WRITE_NODE_FIELD(funccoltypmods);
+	WRITE_NODE_FIELD(funccolcollations);
 }
 
 static void
@@ -565,6 +572,10 @@ _outMergeJoin(StringInfo str, MergeJoin *node)
 	appendStringInfo(str, " :mergeFamilies");
 	for (i = 0; i < numCols; i++)
 		appendStringInfo(str, " %u", node->mergeFamilies[i]);
+
+	appendStringInfo(str, " :mergeCollations");
+	for (i = 0; i < numCols; i++)
+		appendStringInfo(str, " %u", node->mergeCollations[i]);
 
 	appendStringInfo(str, " :mergeStrategies");
 	for (i = 0; i < numCols; i++)
@@ -690,6 +701,10 @@ _outSort(StringInfo str, Sort *node)
 	for (i = 0; i < node->numCols; i++)
 		appendStringInfo(str, " %u", node->sortOperators[i]);
 
+	appendStringInfo(str, " :collations");
+	for (i = 0; i < node->numCols; i++)
+		appendStringInfo(str, " %u", node->collations[i]);
+
 	appendStringInfo(str, " :nullsFirst");
 	for (i = 0; i < node->numCols; i++)
 		appendStringInfo(str, " %s", booltostr(node->nullsFirst[i]));
@@ -793,12 +808,10 @@ _outPlanRowMark(StringInfo str, PlanRowMark *node)
 
 	WRITE_UINT_FIELD(rti);
 	WRITE_UINT_FIELD(prti);
+	WRITE_UINT_FIELD(rowmarkId);
 	WRITE_ENUM_FIELD(markType, RowMarkType);
 	WRITE_BOOL_FIELD(noWait);
 	WRITE_BOOL_FIELD(isParent);
-	WRITE_INT_FIELD(ctidAttNo);
-	WRITE_INT_FIELD(toidAttNo);
-	WRITE_INT_FIELD(wholeAttNo);
 }
 
 static void
@@ -839,7 +852,7 @@ _outRangeVar(StringInfo str, RangeVar *node)
 	WRITE_STRING_FIELD(schemaname);
 	WRITE_STRING_FIELD(relname);
 	WRITE_ENUM_FIELD(inhOpt, InhOption);
-	WRITE_BOOL_FIELD(istemp);
+	WRITE_CHAR_FIELD(relpersistence);
 	WRITE_NODE_FIELD(alias);
 	WRITE_LOCATION_FIELD(location);
 }
@@ -865,6 +878,7 @@ _outVar(StringInfo str, Var *node)
 	WRITE_INT_FIELD(varattno);
 	WRITE_OID_FIELD(vartype);
 	WRITE_INT_FIELD(vartypmod);
+	WRITE_OID_FIELD(varcollid);
 	WRITE_UINT_FIELD(varlevelsup);
 	WRITE_UINT_FIELD(varnoold);
 	WRITE_INT_FIELD(varoattno);
@@ -878,6 +892,7 @@ _outConst(StringInfo str, Const *node)
 
 	WRITE_OID_FIELD(consttype);
 	WRITE_INT_FIELD(consttypmod);
+	WRITE_OID_FIELD(constcollid);
 	WRITE_INT_FIELD(constlen);
 	WRITE_BOOL_FIELD(constbyval);
 	WRITE_BOOL_FIELD(constisnull);
@@ -899,6 +914,7 @@ _outParam(StringInfo str, Param *node)
 	WRITE_INT_FIELD(paramid);
 	WRITE_OID_FIELD(paramtype);
 	WRITE_INT_FIELD(paramtypmod);
+	WRITE_OID_FIELD(paramcollation);
 	WRITE_LOCATION_FIELD(location);
 }
 
@@ -914,6 +930,7 @@ _outAggref(StringInfo str, Aggref *node)
 	WRITE_NODE_FIELD(aggdistinct);
 	WRITE_BOOL_FIELD(aggstar);
 	WRITE_UINT_FIELD(agglevelsup);
+	WRITE_OID_FIELD(collid);
 	WRITE_LOCATION_FIELD(location);
 }
 
@@ -928,6 +945,7 @@ _outWindowFunc(StringInfo str, WindowFunc *node)
 	WRITE_UINT_FIELD(winref);
 	WRITE_BOOL_FIELD(winstar);
 	WRITE_BOOL_FIELD(winagg);
+	WRITE_OID_FIELD(collid);
 	WRITE_LOCATION_FIELD(location);
 }
 
@@ -939,6 +957,7 @@ _outArrayRef(StringInfo str, ArrayRef *node)
 	WRITE_OID_FIELD(refarraytype);
 	WRITE_OID_FIELD(refelemtype);
 	WRITE_INT_FIELD(reftypmod);
+	WRITE_INT_FIELD(refcollid);
 	WRITE_NODE_FIELD(refupperindexpr);
 	WRITE_NODE_FIELD(reflowerindexpr);
 	WRITE_NODE_FIELD(refexpr);
@@ -955,6 +974,7 @@ _outFuncExpr(StringInfo str, FuncExpr *node)
 	WRITE_BOOL_FIELD(funcretset);
 	WRITE_ENUM_FIELD(funcformat, CoercionForm);
 	WRITE_NODE_FIELD(args);
+	WRITE_OID_FIELD(collid);
 	WRITE_LOCATION_FIELD(location);
 }
 
@@ -979,6 +999,7 @@ _outOpExpr(StringInfo str, OpExpr *node)
 	WRITE_OID_FIELD(opresulttype);
 	WRITE_BOOL_FIELD(opretset);
 	WRITE_NODE_FIELD(args);
+	WRITE_OID_FIELD(collid);
 	WRITE_LOCATION_FIELD(location);
 }
 
@@ -992,6 +1013,7 @@ _outDistinctExpr(StringInfo str, DistinctExpr *node)
 	WRITE_OID_FIELD(opresulttype);
 	WRITE_BOOL_FIELD(opretset);
 	WRITE_NODE_FIELD(args);
+	WRITE_OID_FIELD(collid);
 	WRITE_LOCATION_FIELD(location);
 }
 
@@ -1004,6 +1026,7 @@ _outScalarArrayOpExpr(StringInfo str, ScalarArrayOpExpr *node)
 	WRITE_OID_FIELD(opfuncid);
 	WRITE_BOOL_FIELD(useOr);
 	WRITE_NODE_FIELD(args);
+	WRITE_OID_FIELD(collid);
 	WRITE_LOCATION_FIELD(location);
 }
 
@@ -1058,6 +1081,7 @@ _outSubPlan(StringInfo str, SubPlan *node)
 	WRITE_STRING_FIELD(plan_name);
 	WRITE_OID_FIELD(firstColType);
 	WRITE_INT_FIELD(firstColTypmod);
+	WRITE_OID_FIELD(firstColCollation);
 	WRITE_BOOL_FIELD(useHashTable);
 	WRITE_BOOL_FIELD(unknownEqFalse);
 	WRITE_NODE_FIELD(setParam);
@@ -1084,6 +1108,7 @@ _outFieldSelect(StringInfo str, FieldSelect *node)
 	WRITE_INT_FIELD(fieldnum);
 	WRITE_OID_FIELD(resulttype);
 	WRITE_INT_FIELD(resulttypmod);
+	WRITE_OID_FIELD(resultcollation);
 }
 
 static void
@@ -1151,6 +1176,7 @@ _outCaseExpr(StringInfo str, CaseExpr *node)
 	WRITE_NODE_TYPE("CASE");
 
 	WRITE_OID_FIELD(casetype);
+	WRITE_OID_FIELD(casecollation);
 	WRITE_NODE_FIELD(arg);
 	WRITE_NODE_FIELD(args);
 	WRITE_NODE_FIELD(defresult);
@@ -1174,6 +1200,7 @@ _outCaseTestExpr(StringInfo str, CaseTestExpr *node)
 
 	WRITE_OID_FIELD(typeId);
 	WRITE_INT_FIELD(typeMod);
+	WRITE_OID_FIELD(collation);
 }
 
 static void
@@ -1208,6 +1235,7 @@ _outRowCompareExpr(StringInfo str, RowCompareExpr *node)
 	WRITE_ENUM_FIELD(rctype, RowCompareType);
 	WRITE_NODE_FIELD(opnos);
 	WRITE_NODE_FIELD(opfamilies);
+	WRITE_NODE_FIELD(collids);
 	WRITE_NODE_FIELD(largs);
 	WRITE_NODE_FIELD(rargs);
 }
@@ -1218,6 +1246,7 @@ _outCoalesceExpr(StringInfo str, CoalesceExpr *node)
 	WRITE_NODE_TYPE("COALESCE");
 
 	WRITE_OID_FIELD(coalescetype);
+	WRITE_OID_FIELD(coalescecollation);
 	WRITE_NODE_FIELD(args);
 	WRITE_LOCATION_FIELD(location);
 }
@@ -1230,6 +1259,7 @@ _outMinMaxExpr(StringInfo str, MinMaxExpr *node)
 	WRITE_OID_FIELD(minmaxtype);
 	WRITE_ENUM_FIELD(op, MinMaxOp);
 	WRITE_NODE_FIELD(args);
+	WRITE_OID_FIELD(collid);
 	WRITE_LOCATION_FIELD(location);
 }
 
@@ -1310,6 +1340,7 @@ _outSetToDefault(StringInfo str, SetToDefault *node)
 
 	WRITE_OID_FIELD(typeId);
 	WRITE_INT_FIELD(typeMod);
+	WRITE_OID_FIELD(collid);
 	WRITE_LOCATION_FIELD(location);
 }
 
@@ -1424,6 +1455,7 @@ _outIndexPath(StringInfo str, IndexPath *node)
 	WRITE_NODE_FIELD(indexinfo);
 	WRITE_NODE_FIELD(indexclauses);
 	WRITE_NODE_FIELD(indexquals);
+	WRITE_NODE_FIELD(indexorderbys);
 	WRITE_BOOL_FIELD(isjoininner);
 	WRITE_ENUM_FIELD(indexscandir, ScanDirection);
 	WRITE_FLOAT_FIELD(indextotalcost, "%.2f");
@@ -1493,6 +1525,7 @@ _outMergeAppendPath(StringInfo str, MergeAppendPath *node)
 	_outPathInfo(str, (Path *) node);
 
 	WRITE_NODE_FIELD(subpaths);
+	WRITE_FLOAT_FIELD(limit_tuples, "%.0f");
 }
 
 static void
@@ -1577,6 +1610,7 @@ _outPlannerGlobal(StringInfo str, PlannerGlobal *node)
 	WRITE_NODE_FIELD(relationOids);
 	WRITE_NODE_FIELD(invalItems);
 	WRITE_UINT_FIELD(lastPHId);
+	WRITE_UINT_FIELD(lastRowMarkId);
 	WRITE_BOOL_FIELD(transientPlan);
 }
 
@@ -1608,8 +1642,10 @@ _outPlannerInfo(StringInfo str, PlannerInfo *node)
 	WRITE_NODE_FIELD(window_pathkeys);
 	WRITE_NODE_FIELD(distinct_pathkeys);
 	WRITE_NODE_FIELD(sort_pathkeys);
+	WRITE_NODE_FIELD(minmax_aggs);
 	WRITE_FLOAT_FIELD(total_table_pages, "%.0f");
 	WRITE_FLOAT_FIELD(tuple_fraction, "%.4f");
+	WRITE_FLOAT_FIELD(limit_tuples, "%.0f");
 	WRITE_BOOL_FIELD(hasInheritedTarget);
 	WRITE_BOOL_FIELD(hasJoinRTEs);
 	WRITE_BOOL_FIELD(hasHavingQual);
@@ -1713,6 +1749,7 @@ _outPathKey(StringInfo str, PathKey *node)
 
 	WRITE_NODE_FIELD(pk_eclass);
 	WRITE_OID_FIELD(pk_opfamily);
+	WRITE_OID_FIELD(pk_collation);
 	WRITE_INT_FIELD(pk_strategy);
 	WRITE_BOOL_FIELD(pk_nulls_first);
 }
@@ -1809,6 +1846,17 @@ _outPlaceHolderInfo(StringInfo str, PlaceHolderInfo *node)
 }
 
 static void
+_outMinMaxAggInfo(StringInfo str, MinMaxAggInfo *node)
+{
+	WRITE_NODE_TYPE("MINMAXAGGINFO");
+
+	WRITE_OID_FIELD(aggfnoid);
+	WRITE_OID_FIELD(aggsortop);
+	WRITE_NODE_FIELD(target);
+	WRITE_NODE_FIELD(pathkeys);
+}
+
+static void
 _outPlannerParamItem(StringInfo str, PlannerParamItem *node)
 {
 	WRITE_NODE_TYPE("PLANNERPARAMITEM");
@@ -1840,6 +1888,17 @@ _outCreateStmt(StringInfo str, CreateStmt *node)
 }
 
 static void
+_outCreateForeignTableStmt(StringInfo str, CreateForeignTableStmt *node)
+{
+	WRITE_NODE_TYPE("CREATEFOREIGNTABLESTMT");
+
+	_outCreateStmt(str, (CreateStmt *) &node->base);
+
+	WRITE_STRING_FIELD(servername);
+	WRITE_NODE_FIELD(options);
+}
+
+static void
 _outIndexStmt(StringInfo str, IndexStmt *node)
 {
 	WRITE_NODE_TYPE("INDEXSTMT");
@@ -1852,6 +1911,7 @@ _outIndexStmt(StringInfo str, IndexStmt *node)
 	WRITE_NODE_FIELD(options);
 	WRITE_NODE_FIELD(whereClause);
 	WRITE_NODE_FIELD(excludeOpNames);
+	WRITE_OID_FIELD(indexOid);
 	WRITE_BOOL_FIELD(unique);
 	WRITE_BOOL_FIELD(primary);
 	WRITE_BOOL_FIELD(isconstraint);
@@ -1931,6 +1991,15 @@ _outDefElem(StringInfo str, DefElem *node)
 }
 
 static void
+_outInhRelation(StringInfo str, InhRelation *node)
+{
+	WRITE_NODE_TYPE("INHRELATION");
+
+	WRITE_NODE_FIELD(relation);
+	WRITE_UINT_FIELD(options);
+}
+
+static void
 _outLockingClause(StringInfo str, LockingClause *node)
 {
 	WRITE_NODE_TYPE("LOCKINGCLAUSE");
@@ -1979,6 +2048,8 @@ _outTypeName(StringInfo str, TypeName *node)
 	WRITE_NODE_FIELD(typmods);
 	WRITE_INT_FIELD(typemod);
 	WRITE_NODE_FIELD(arrayBounds);
+	WRITE_NODE_FIELD(collnames);
+	WRITE_OID_FIELD(collOid);
 	WRITE_LOCATION_FIELD(location);
 }
 
@@ -1993,6 +2064,17 @@ _outTypeCast(StringInfo str, TypeCast *node)
 }
 
 static void
+_outCollateClause(StringInfo str, CollateClause *node)
+{
+	WRITE_NODE_TYPE("COLLATE");
+
+	WRITE_NODE_FIELD(arg);
+	WRITE_NODE_FIELD(collnames);
+	WRITE_OID_FIELD(collOid);
+	WRITE_LOCATION_FIELD(location);
+}
+
+static void
 _outIndexElem(StringInfo str, IndexElem *node)
 {
 	WRITE_NODE_TYPE("INDEXELEM");
@@ -2000,6 +2082,7 @@ _outIndexElem(StringInfo str, IndexElem *node)
 	WRITE_STRING_FIELD(name);
 	WRITE_NODE_FIELD(expr);
 	WRITE_STRING_FIELD(indexcolname);
+	WRITE_NODE_FIELD(collation);
 	WRITE_NODE_FIELD(opclass);
 	WRITE_ENUM_FIELD(ordering, SortByDir);
 	WRITE_ENUM_FIELD(nulls_ordering, SortByNulls);
@@ -2073,6 +2156,7 @@ _outSortGroupClause(StringInfo str, SortGroupClause *node)
 	WRITE_OID_FIELD(eqop);
 	WRITE_OID_FIELD(sortop);
 	WRITE_BOOL_FIELD(nulls_first);
+	WRITE_BOOL_FIELD(hashable);
 }
 
 static void
@@ -2126,6 +2210,7 @@ _outCommonTableExpr(StringInfo str, CommonTableExpr *node)
 	WRITE_NODE_FIELD(ctecolnames);
 	WRITE_NODE_FIELD(ctecoltypes);
 	WRITE_NODE_FIELD(ctecoltypmods);
+	WRITE_NODE_FIELD(ctecolcollations);
 }
 
 static void
@@ -2139,6 +2224,7 @@ _outSetOperationStmt(StringInfo str, SetOperationStmt *node)
 	WRITE_NODE_FIELD(rarg);
 	WRITE_NODE_FIELD(colTypes);
 	WRITE_NODE_FIELD(colTypmods);
+	WRITE_NODE_FIELD(colCollations);
 	WRITE_NODE_FIELD(groupClauses);
 }
 
@@ -2169,6 +2255,7 @@ _outRangeTblEntry(StringInfo str, RangeTblEntry *node)
 			WRITE_NODE_FIELD(funcexpr);
 			WRITE_NODE_FIELD(funccoltypes);
 			WRITE_NODE_FIELD(funccoltypmods);
+			WRITE_NODE_FIELD(funccolcollations);
 			break;
 		case RTE_VALUES:
 			WRITE_NODE_FIELD(values_lists);
@@ -2179,6 +2266,7 @@ _outRangeTblEntry(StringInfo str, RangeTblEntry *node)
 			WRITE_BOOL_FIELD(self_reference);
 			WRITE_NODE_FIELD(ctecoltypes);
 			WRITE_NODE_FIELD(ctecoltypmods);
+			WRITE_NODE_FIELD(ctecolcollations);
 			break;
 		default:
 			elog(ERROR, "unrecognized RTE kind: %d", (int) node->rtekind);
@@ -2439,6 +2527,7 @@ _outConstraint(StringInfo str, Constraint *node)
 			appendStringInfo(str, "PRIMARY_KEY");
 			WRITE_NODE_FIELD(keys);
 			WRITE_NODE_FIELD(options);
+			WRITE_STRING_FIELD(indexname);
 			WRITE_STRING_FIELD(indexspace);
 			/* access_method and where_clause not currently used */
 			break;
@@ -2447,6 +2536,7 @@ _outConstraint(StringInfo str, Constraint *node)
 			appendStringInfo(str, "UNIQUE");
 			WRITE_NODE_FIELD(keys);
 			WRITE_NODE_FIELD(options);
+			WRITE_STRING_FIELD(indexname);
 			WRITE_STRING_FIELD(indexspace);
 			/* access_method and where_clause not currently used */
 			break;
@@ -2455,6 +2545,7 @@ _outConstraint(StringInfo str, Constraint *node)
 			appendStringInfo(str, "EXCLUSION");
 			WRITE_NODE_FIELD(exclusions);
 			WRITE_NODE_FIELD(options);
+			WRITE_STRING_FIELD(indexname);
 			WRITE_STRING_FIELD(indexspace);
 			WRITE_STRING_FIELD(access_method);
 			WRITE_NODE_FIELD(where_clause);
@@ -2693,6 +2784,9 @@ _outNode(StringInfo str, void *obj)
 			case T_RelabelType:
 				_outRelabelType(str, obj);
 				break;
+			case T_CollateClause:
+				_outCollateClause(str, obj);
+				break;
 			case T_CoerceViaIO:
 				_outCoerceViaIO(str, obj);
 				break;
@@ -2844,12 +2938,18 @@ _outNode(StringInfo str, void *obj)
 			case T_PlaceHolderInfo:
 				_outPlaceHolderInfo(str, obj);
 				break;
+			case T_MinMaxAggInfo:
+				_outMinMaxAggInfo(str, obj);
+				break;
 			case T_PlannerParamItem:
 				_outPlannerParamItem(str, obj);
 				break;
 
 			case T_CreateStmt:
 				_outCreateStmt(str, obj);
+				break;
+			case T_CreateForeignTableStmt:
+				_outCreateForeignTableStmt(str, obj);
 				break;
 			case T_IndexStmt:
 				_outIndexStmt(str, obj);
@@ -2946,6 +3046,9 @@ _outNode(StringInfo str, void *obj)
 				break;
 			case T_DefElem:
 				_outDefElem(str, obj);
+				break;
+			case T_InhRelation:
+				_outInhRelation(str, obj);
 				break;
 			case T_LockingClause:
 				_outLockingClause(str, obj);

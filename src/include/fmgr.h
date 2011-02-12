@@ -8,7 +8,7 @@
  * or call fmgr-callable functions.
  *
  *
- * Portions Copyright (c) 1996-2010, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2011, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/fmgr.h
@@ -50,6 +50,7 @@ typedef struct FmgrInfo
 	bool		fn_strict;		/* function is "strict" (NULL in => NULL out) */
 	bool		fn_retset;		/* function returns a set */
 	unsigned char fn_stats;		/* collect stats if track_functions > this */
+	Oid			fn_collation;	/* collation to use */
 	void	   *fn_extra;		/* extra space for use by handler */
 	MemoryContext fn_mcxt;		/* memory context to store fn_extra in */
 	fmNodePtr	fn_expr;		/* expression parse tree for call, or NULL */
@@ -82,6 +83,16 @@ extern void fmgr_info(Oid functionId, FmgrInfo *finfo);
  */
 extern void fmgr_info_cxt(Oid functionId, FmgrInfo *finfo,
 			  MemoryContext mcxt);
+
+/*
+ * Initialize the fn_collation field
+ */
+extern void fmgr_info_collation(Oid collationId, FmgrInfo *finfo);
+
+/*
+ * Initialize the fn_expr field and set the collation based on it
+ */
+extern void fmgr_info_expr(fmNodePtr expr, FmgrInfo *finfo);
 
 /*
  * Copy an FmgrInfo struct
@@ -296,6 +307,7 @@ extern struct varlena *pg_detoast_datum_packed(struct varlena * datum);
 #define PG_RETURN_VARCHAR_P(x) PG_RETURN_POINTER(x)
 #define PG_RETURN_HEAPTUPLEHEADER(x)  PG_RETURN_POINTER(x)
 
+#define PG_GET_COLLATION()		(fcinfo->flinfo ? fcinfo->flinfo->fn_collation : InvalidOid)
 
 /*-------------------------------------------------------------------------
  *		Support for detecting call convention of dynamically-loaded functions
@@ -438,6 +450,12 @@ extern Datum DirectFunctionCall9(PGFunction func, Datum arg1, Datum arg2,
 					Datum arg6, Datum arg7, Datum arg8,
 					Datum arg9);
 
+/* the same but passing a collation */
+extern Datum DirectFunctionCall1WithCollation(PGFunction func, Oid collation,
+											  Datum arg1);
+extern Datum DirectFunctionCall2WithCollation(PGFunction func, Oid collation,
+											  Datum arg1, Datum arg2);
+
 /* These are for invocation of a previously-looked-up function with a
  * directly-computed parameter list.  Note that neither arguments nor result
  * are allowed to be NULL.
@@ -544,6 +562,32 @@ extern void **find_rendezvous_variable(const char *varName);
 extern int AggCheckCallContext(FunctionCallInfo fcinfo,
 					MemoryContext *aggcontext);
 
+/*
+ * We allow plugin modules to hook function entry/exit.  This is intended
+ * as support for loadable security policy modules, which may want to
+ * perform additional privilege checks on function entry or exit, or to do
+ * other internal bookkeeping.  To make this possible, such modules must be
+ * able not only to support normal function entry and exit, but also to trap
+ * the case where we bail out due to an error; and they must also be able to
+ * prevent inlining.
+ */
+typedef enum FmgrHookEventType
+{
+	FHET_START,
+	FHET_END,
+	FHET_ABORT
+} FmgrHookEventType;
+
+typedef bool (*needs_fmgr_hook_type)(Oid fn_oid);
+
+typedef void (*fmgr_hook_type)(FmgrHookEventType event,
+							   FmgrInfo *flinfo, Datum *arg);
+
+extern PGDLLIMPORT needs_fmgr_hook_type	needs_fmgr_hook;
+extern PGDLLIMPORT fmgr_hook_type		fmgr_hook;
+
+#define FmgrHookIsNeeded(fn_oid)							\
+	(!needs_fmgr_hook ? false : (*needs_fmgr_hook)(fn_oid))
 
 /*
  * !!! OLD INTERFACE !!!

@@ -1,7 +1,7 @@
 /*
  * psql - the PostgreSQL interactive terminal
  *
- * Copyright (c) 2000-2010, PostgreSQL Global Development Group
+ * Copyright (c) 2000-2011, PostgreSQL Global Development Group
  *
  * src/bin/psql/command.c
  */
@@ -369,7 +369,7 @@ exec_command(const char *cmd,
 					success = describeTableDetails(pattern, show_verbose, show_system);
 				else
 					/* standard listing of interesting things */
-					success = listTables("tvs", NULL, show_verbose, show_system);
+					success = listTables("tvsE", NULL, show_verbose, show_system);
 				break;
 			case 'a':
 				success = describeAggregates(pattern, show_verbose, show_system);
@@ -416,11 +416,17 @@ exec_command(const char *cmd,
 			case 'l':
 				success = do_lo_list();
 				break;
+			case 'L':
+				success = listLanguages(pattern, show_verbose, show_system);
+				break;
 			case 'n':
-				success = listSchemas(pattern, show_verbose);
+				success = listSchemas(pattern, show_verbose, show_system);
 				break;
 			case 'o':
 				success = describeOperators(pattern, show_system);
+				break;
+			case 'O':
+				success = listCollations(pattern, show_verbose, show_system);
 				break;
 			case 'p':
 				success = permissionsList(pattern);
@@ -432,6 +438,7 @@ exec_command(const char *cmd,
 			case 'v':
 			case 'i':
 			case 's':
+			case 'E':
 				success = listTables(&cmd[1], pattern, show_verbose, show_system);
 				break;
 			case 'r':
@@ -483,10 +490,19 @@ exec_command(const char *cmd,
 					case 'w':
 						success = listForeignDataWrappers(pattern, show_verbose);
 						break;
+					case 't':
+						success = listForeignTables(pattern, show_verbose);
+						break;
 					default:
 						status = PSQL_CMD_UNKNOWN;
 						break;
 				}
+				break;
+			case 'x':          /* Extensions */
+				if (show_verbose)
+					success = listExtensionContents(pattern);
+				else
+					success = listExtensions(pattern);
 				break;
 			default:
 				status = PSQL_CMD_UNKNOWN;
@@ -1987,7 +2003,10 @@ process_file(char *filename, bool single_txn)
 		if ((res = PSQLexec("BEGIN", false)) == NULL)
 		{
 			if (pset.on_error_stop)
-				return EXIT_USER;
+			{
+				result = EXIT_USER;
+				goto error;
+			}
 		}
 		else
 			PQclear(res);
@@ -2000,13 +2019,19 @@ process_file(char *filename, bool single_txn)
 		if ((res = PSQLexec("COMMIT", false)) == NULL)
 		{
 			if (pset.on_error_stop)
-				return EXIT_USER;
+			{
+				result = EXIT_USER;
+				goto error;
+			}
 		}
 		else
 			PQclear(res);
 	}
 
-	fclose(fd);
+error:
+	if (fd != stdin)
+		fclose(fd);
+
 	pset.inputfile = oldfilename;
 	return result;
 }

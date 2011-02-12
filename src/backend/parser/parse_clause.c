@@ -3,7 +3,7 @@
  * parse_clause.c
  *	  handle clauses in parser
  *
- * Portions Copyright (c) 1996-2010, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2011, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -613,7 +613,8 @@ transformRangeFunction(ParseState *pstate, RangeFunction *r)
 
 		tupdesc = BuildDescFromLists(rte->eref->colnames,
 									 rte->funccoltypes,
-									 rte->funccoltypmods);
+									 rte->funccoltypmods,
+									 rte->funccolcollations);
 		CheckAttributeNamesTypes(tupdesc, RELKIND_COMPOSITE_TYPE, false);
 	}
 
@@ -1935,8 +1936,10 @@ addTargetToSortList(ParseState *pstate, TargetEntry *tle,
 					bool resolveUnknown)
 {
 	Oid			restype = exprType((Node *) tle->expr);
+	Oid			rescollation = exprCollation((Node *) tle->expr);
 	Oid			sortop;
 	Oid			eqop;
+	bool		hashable;
 	bool		reverse;
 	int			location;
 	ParseCallbackState pcbstate;
@@ -1972,13 +1975,15 @@ addTargetToSortList(ParseState *pstate, TargetEntry *tle,
 		case SORTBY_ASC:
 			get_sort_group_operators(restype,
 									 true, true, false,
-									 &sortop, &eqop, NULL);
+									 &sortop, &eqop, NULL,
+									 &hashable);
 			reverse = false;
 			break;
 		case SORTBY_DESC:
 			get_sort_group_operators(restype,
 									 false, true, true,
-									 NULL, &eqop, &sortop);
+									 NULL, &eqop, &sortop,
+									 &hashable);
 			reverse = true;
 			break;
 		case SORTBY_USING:
@@ -2000,14 +2005,26 @@ addTargetToSortList(ParseState *pstate, TargetEntry *tle,
 					   errmsg("operator %s is not a valid ordering operator",
 							  strVal(llast(sortby->useOp))),
 						 errhint("Ordering operators must be \"<\" or \">\" members of btree operator families.")));
+
+			/*
+			 * Also see if the equality operator is hashable.
+			 */
+			hashable = op_hashjoinable(eqop, restype);
 			break;
 		default:
 			elog(ERROR, "unrecognized sortby_dir: %d", sortby->sortby_dir);
 			sortop = InvalidOid;	/* keep compiler quiet */
 			eqop = InvalidOid;
+			hashable = false;
 			reverse = false;
 			break;
 	}
+
+	if (type_is_collatable(restype) && !OidIsValid(rescollation))
+		ereport(ERROR,
+				(errcode(ERRCODE_INDETERMINATE_COLLATION),
+				 errmsg("no collation was derived for the sort expression"),
+				 errhint("Use the COLLATE clause to set the collation explicitly.")));
 
 	cancel_parser_errposition_callback(&pcbstate);
 
@@ -2020,6 +2037,7 @@ addTargetToSortList(ParseState *pstate, TargetEntry *tle,
 
 		sortcl->eqop = eqop;
 		sortcl->sortop = sortop;
+		sortcl->hashable = hashable;
 
 		switch (sortby->sortby_nulls)
 		{
@@ -2074,8 +2092,6 @@ addTargetToGroupList(ParseState *pstate, TargetEntry *tle,
 					 bool resolveUnknown)
 {
 	Oid			restype = exprType((Node *) tle->expr);
-	Oid			sortop;
-	Oid			eqop;
 
 	/* if tlist item is an UNKNOWN literal, change it to TEXT */
 	if (restype == UNKNOWNOID && resolveUnknown)
@@ -2092,6 +2108,9 @@ addTargetToGroupList(ParseState *pstate, TargetEntry *tle,
 	if (!targetIsInSortList(tle, InvalidOid, grouplist))
 	{
 		SortGroupClause *grpcl = makeNode(SortGroupClause);
+		Oid			sortop;
+		Oid			eqop;
+		bool		hashable;
 		ParseCallbackState pcbstate;
 
 		setup_parser_errposition_callback(&pcbstate, pstate, location);
@@ -2099,7 +2118,8 @@ addTargetToGroupList(ParseState *pstate, TargetEntry *tle,
 		/* determine the eqop and optional sortop */
 		get_sort_group_operators(restype,
 								 false, true, false,
-								 &sortop, &eqop, NULL);
+								 &sortop, &eqop, NULL,
+								 &hashable);
 
 		cancel_parser_errposition_callback(&pcbstate);
 
@@ -2107,6 +2127,7 @@ addTargetToGroupList(ParseState *pstate, TargetEntry *tle,
 		grpcl->eqop = eqop;
 		grpcl->sortop = sortop;
 		grpcl->nulls_first = false;		/* OK with or without sortop */
+		grpcl->hashable = hashable;
 
 		grouplist = lappend(grouplist, grpcl);
 	}

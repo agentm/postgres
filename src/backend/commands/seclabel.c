@@ -3,7 +3,7 @@
  * seclabel.c
  *    routines to support security label feature.
  *
- * Portions Copyright (c) 1996-2010, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2011, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * -------------------------------------------------------------------------
@@ -15,6 +15,7 @@
 #include "catalog/catalog.h"
 #include "catalog/indexing.h"
 #include "catalog/namespace.h"
+#include "catalog/pg_collation.h"
 #include "catalog/pg_seclabel.h"
 #include "commands/seclabel.h"
 #include "miscadmin.h"
@@ -62,7 +63,7 @@ ExecSecLabelStmt(SecLabelStmt *stmt)
 		if (label_provider_list == NIL)
 			ereport(ERROR,
 					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-				 errmsg("security label providers have been loaded")));
+				 errmsg("no security label providers have been loaded")));
 		if (lnext(list_head(label_provider_list)) != NULL)
 			ereport(ERROR,
 					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
@@ -103,6 +104,7 @@ ExecSecLabelStmt(SecLabelStmt *stmt)
 		case OBJECT_SEQUENCE:
 		case OBJECT_TABLE:
 		case OBJECT_VIEW:
+		case OBJECT_FOREIGN_TABLE:
 			if (!pg_class_ownercheck(RelationGetRelid(relation), GetUserId()))
 				aclcheck_error(ACLCHECK_NOT_OWNER, ACL_KIND_CLASS,
 							   RelationGetRelationName(relation));
@@ -193,6 +195,7 @@ GetSecurityLabel(const ObjectAddress *object, const char *provider)
 				Anum_pg_seclabel_provider,
 				BTEqualStrategyNumber, F_TEXTEQ,
 				CStringGetTextDatum(provider));
+	ScanKeyEntryInitializeCollation(&keys[3], DEFAULT_COLLATION_OID);
 
 	pg_seclabel = heap_open(SecLabelRelationId, AccessShareLock);
 
@@ -262,6 +265,7 @@ SetSecurityLabel(const ObjectAddress *object,
 				Anum_pg_seclabel_provider,
 				BTEqualStrategyNumber, F_TEXTEQ,
 				CStringGetTextDatum(provider));
+	ScanKeyEntryInitializeCollation(&keys[3], DEFAULT_COLLATION_OID);
 
 	pg_seclabel = heap_open(SecLabelRelationId, RowExclusiveLock);
 
@@ -365,10 +369,11 @@ CheckAttributeSecLabel(Relation relation)
 	 */
 	if (relation->rd_rel->relkind != RELKIND_RELATION &&
 		relation->rd_rel->relkind != RELKIND_VIEW &&
-		relation->rd_rel->relkind != RELKIND_COMPOSITE_TYPE)
+		relation->rd_rel->relkind != RELKIND_COMPOSITE_TYPE &&
+		relation->rd_rel->relkind != RELKIND_FOREIGN_TABLE)
 		ereport(ERROR,
 				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
-				 errmsg("\"%s\" is not a table, view, or composite type",
+				 errmsg("\"%s\" is not a table, view, composite type, or foreign table",
 						RelationGetRelationName(relation))));
 }
 

@@ -4,7 +4,7 @@
  *	  prototypes for various files in optimizer/path
  *
  *
- * Portions Copyright (c) 1996-2010, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2011, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/optimizer/paths.h
@@ -116,7 +116,8 @@ extern EquivalenceClass *get_eclass_for_sort_expr(PlannerInfo *root,
 						 Expr *expr,
 						 Oid expr_datatype,
 						 List *opfamilies,
-						 Index sortref);
+						 Index sortref,
+						 bool create_it);
 extern void generate_base_implied_equalities(PlannerInfo *root);
 extern List *generate_join_implied_equalities(PlannerInfo *root,
 								 RelOptInfo *joinrel,
@@ -172,7 +173,12 @@ extern List *make_pathkeys_for_sortclauses(PlannerInfo *root,
 							  List *sortclauses,
 							  List *tlist,
 							  bool canonicalize);
-extern void cache_mergeclause_eclasses(PlannerInfo *root,
+extern List *make_pathkeys_for_aggregate(PlannerInfo *root,
+										 Expr *aggtarget,
+										 Oid aggsortop);
+extern void initialize_mergeclause_eclasses(PlannerInfo *root,
+											RestrictInfo *restrictinfo);
+extern void update_mergeclause_eclasses(PlannerInfo *root,
 						   RestrictInfo *restrictinfo);
 extern List *find_mergeclauses_for_pathkeys(PlannerInfo *root,
 							   List *pathkeys,
@@ -184,10 +190,6 @@ extern List *select_outer_pathkeys_for_merge(PlannerInfo *root,
 extern List *make_inner_pathkeys_for_merge(PlannerInfo *root,
 							  List *mergeclauses,
 							  List *outer_pathkeys);
-extern int pathkeys_useful_for_merging(PlannerInfo *root,
-							RelOptInfo *rel,
-							List *pathkeys);
-extern int	pathkeys_useful_for_ordering(PlannerInfo *root, List *pathkeys);
 extern List *truncate_useless_pathkeys(PlannerInfo *root,
 						  RelOptInfo *rel,
 						  List *pathkeys);

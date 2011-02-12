@@ -7,7 +7,7 @@
  * the nature and use of path keys.
  *
  *
- * Portions Copyright (c) 1996-2010, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2011, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -18,6 +18,7 @@
 #include "postgres.h"
 
 #include "access/skey.h"
+#include "catalog/pg_collation.h"
 #include "catalog/pg_type.h"
 #include "nodes/makefuncs.h"
 #include "nodes/nodeFuncs.h"
@@ -30,17 +31,12 @@
 #include "utils/lsyscache.h"
 
 
-static PathKey *makePathKey(EquivalenceClass *eclass, Oid opfamily,
+static PathKey *makePathKey(EquivalenceClass *eclass, Oid opfamily, Oid collation,
 			int strategy, bool nulls_first);
 static PathKey *make_canonical_pathkey(PlannerInfo *root,
-					   EquivalenceClass *eclass, Oid opfamily,
+					   EquivalenceClass *eclass, Oid opfamily, Oid collation,
 					   int strategy, bool nulls_first);
 static bool pathkey_is_redundant(PathKey *new_pathkey, List *pathkeys);
-static PathKey *make_pathkey_from_sortinfo(PlannerInfo *root,
-						   Expr *expr, Oid ordering_op,
-						   bool nulls_first,
-						   Index sortref,
-						   bool canonicalize);
 static Var *find_indexkey_var(PlannerInfo *root, RelOptInfo *rel,
 				  AttrNumber varattno);
 static bool right_merge_direction(PlannerInfo *root, PathKey *pathkey);
@@ -58,13 +54,14 @@ static bool right_merge_direction(PlannerInfo *root, PathKey *pathkey);
  * convenience routine to build the specified node.
  */
 static PathKey *
-makePathKey(EquivalenceClass *eclass, Oid opfamily,
+makePathKey(EquivalenceClass *eclass, Oid opfamily, Oid collation,
 			int strategy, bool nulls_first)
 {
 	PathKey    *pk = makeNode(PathKey);
 
 	pk->pk_eclass = eclass;
 	pk->pk_opfamily = opfamily;
+	pk->pk_collation = collation;
 	pk->pk_strategy = strategy;
 	pk->pk_nulls_first = nulls_first;
 
@@ -82,7 +79,7 @@ makePathKey(EquivalenceClass *eclass, Oid opfamily,
  */
 static PathKey *
 make_canonical_pathkey(PlannerInfo *root,
-					   EquivalenceClass *eclass, Oid opfamily,
+					   EquivalenceClass *eclass, Oid opfamily, Oid collation,
 					   int strategy, bool nulls_first)
 {
 	PathKey    *pk;
@@ -98,6 +95,7 @@ make_canonical_pathkey(PlannerInfo *root,
 		pk = (PathKey *) lfirst(lc);
 		if (eclass == pk->pk_eclass &&
 			opfamily == pk->pk_opfamily &&
+			collation == pk->pk_collation &&
 			strategy == pk->pk_strategy &&
 			nulls_first == pk->pk_nulls_first)
 			return pk;
@@ -109,7 +107,7 @@ make_canonical_pathkey(PlannerInfo *root,
 	 */
 	oldcontext = MemoryContextSwitchTo(root->planner_cxt);
 
-	pk = makePathKey(eclass, opfamily, strategy, nulls_first);
+	pk = makePathKey(eclass, opfamily, collation, strategy, nulls_first);
 	root->canon_pathkeys = lappend(root->canon_pathkeys, pk);
 
 	MemoryContextSwitchTo(oldcontext);
@@ -211,6 +209,7 @@ canonicalize_pathkeys(PlannerInfo *root, List *pathkeys)
 		cpathkey = make_canonical_pathkey(root,
 										  eclass,
 										  pathkey->pk_opfamily,
+										  pathkey->pk_collation,
 										  pathkey->pk_strategy,
 										  pathkey->pk_nulls_first);
 
@@ -223,57 +222,56 @@ canonicalize_pathkeys(PlannerInfo *root, List *pathkeys)
 
 /*
  * make_pathkey_from_sortinfo
- *	  Given an expression, a sortop, and a nulls-first flag, create
- *	  a PathKey.  If canonicalize = true, the result is a "canonical"
- *	  PathKey, otherwise not.  (But note it might be redundant anyway.)
+ *	  Given an expression and sort-order information, create a PathKey.
+ *	  If canonicalize = true, the result is a "canonical" PathKey,
+ *	  otherwise not.  (But note it might be redundant anyway.)
  *
  * If the PathKey is being generated from a SortGroupClause, sortref should be
  * the SortGroupClause's SortGroupRef; otherwise zero.
+ *
+ * create_it is TRUE if we should create any missing EquivalenceClass
+ * needed to represent the sort key.  If it's FALSE, we return NULL if the
+ * sort key isn't already present in any EquivalenceClass.
  *
  * canonicalize should always be TRUE after EquivalenceClass merging has
  * been performed, but FALSE if we haven't done EquivalenceClass merging yet.
  */
 static PathKey *
 make_pathkey_from_sortinfo(PlannerInfo *root,
-						   Expr *expr, Oid ordering_op,
+						   Expr *expr,
+						   Oid opfamily,
+						   Oid opcintype,
+						   bool reverse_sort,
 						   bool nulls_first,
 						   Index sortref,
+						   bool create_it,
 						   bool canonicalize)
 {
-	Oid			opfamily,
-				opcintype;
 	int16		strategy;
 	Oid			equality_op;
 	List	   *opfamilies;
 	EquivalenceClass *eclass;
+	Oid			collation;
+
+	strategy = reverse_sort ? BTGreaterStrategyNumber : BTLessStrategyNumber;
 
 	/*
-	 * An ordering operator fully determines the behavior of its opfamily, so
-	 * could only meaningfully appear in one family --- or perhaps two if one
-	 * builds a reverse-sort opfamily, but there's not much point in that
-	 * anymore.  But EquivalenceClasses need to contain opfamily lists based
-	 * on the family membership of equality operators, which could easily be
-	 * bigger.	So, look up the equality operator that goes with the ordering
-	 * operator (this should be unique) and get its membership.
+	 * EquivalenceClasses need to contain opfamily lists based on the family
+	 * membership of mergejoinable equality operators, which could belong to
+	 * more than one opfamily.  So we have to look up the opfamily's equality
+	 * operator and get its membership.
 	 */
-
-	/* Find the operator in pg_amop --- failure shouldn't happen */
-	if (!get_ordering_op_properties(ordering_op,
-									&opfamily, &opcintype, &strategy))
-		elog(ERROR, "operator %u is not a valid ordering operator",
-			 ordering_op);
-	/* Get matching equality operator */
 	equality_op = get_opfamily_member(opfamily,
 									  opcintype,
 									  opcintype,
 									  BTEqualStrategyNumber);
 	if (!OidIsValid(equality_op))		/* shouldn't happen */
-		elog(ERROR, "could not find equality operator for ordering operator %u",
-			 ordering_op);
+		elog(ERROR, "could not find equality operator for opfamily %u",
+			 opfamily);
 	opfamilies = get_mergejoin_opfamilies(equality_op);
 	if (!opfamilies)			/* certainly should find some */
-		elog(ERROR, "could not find opfamilies for ordering operator %u",
-			 ordering_op);
+		elog(ERROR, "could not find opfamilies for equality operator %u",
+			 equality_op);
 
 	/*
 	 * When dealing with binary-compatible opclasses, we have to ensure that
@@ -300,16 +298,58 @@ make_pathkey_from_sortinfo(PlannerInfo *root,
 											COERCE_DONTCARE);
 	}
 
-	/* Now find or create a matching EquivalenceClass */
+	/* Now find or (optionally) create a matching EquivalenceClass */
 	eclass = get_eclass_for_sort_expr(root, expr, opcintype, opfamilies,
-									  sortref);
+									  sortref, create_it);
+
+	/* Fail if no EC and !create_it */
+	if (!eclass)
+		return NULL;
+
+	collation = exprCollation((Node *) expr);
 
 	/* And finally we can find or create a PathKey node */
 	if (canonicalize)
-		return make_canonical_pathkey(root, eclass, opfamily,
+		return make_canonical_pathkey(root, eclass, opfamily, collation,
 									  strategy, nulls_first);
 	else
-		return makePathKey(eclass, opfamily, strategy, nulls_first);
+		return makePathKey(eclass, opfamily, collation, strategy, nulls_first);
+}
+
+/*
+ * make_pathkey_from_sortop
+ *	  Like make_pathkey_from_sortinfo, but work from a sort operator.
+ *
+ * This should eventually go away, but we need to restructure SortGroupClause
+ * first.
+ */
+static PathKey *
+make_pathkey_from_sortop(PlannerInfo *root,
+						 Expr *expr,
+						 Oid ordering_op,
+						 bool nulls_first,
+						 Index sortref,
+						 bool create_it,
+						 bool canonicalize)
+{
+	Oid			opfamily,
+				opcintype;
+	int16		strategy;
+
+	/* Find the operator in pg_amop --- failure shouldn't happen */
+	if (!get_ordering_op_properties(ordering_op,
+									&opfamily, &opcintype, &strategy))
+		elog(ERROR, "operator %u is not a valid ordering operator",
+			 ordering_op);
+	return make_pathkey_from_sortinfo(root,
+									  expr,
+									  opfamily,
+									  opcintype,
+									  (strategy == BTGreaterStrategyNumber),
+									  nulls_first,
+									  sortref,
+									  create_it,
+									  canonicalize);
 }
 
 
@@ -469,17 +509,19 @@ get_cheapest_fractional_path_for_pathkeys(List *paths,
  * build_index_pathkeys
  *	  Build a pathkeys list that describes the ordering induced by an index
  *	  scan using the given index.  (Note that an unordered index doesn't
- *	  induce any ordering; such an index will have no sortop OIDS in
- *	  its sortops arrays, and we will return NIL.)
+ *	  induce any ordering, so we return NIL.)
  *
- * If 'scandir' is BackwardScanDirection, attempt to build pathkeys
- * representing a backwards scan of the index.	Return NIL if can't do it.
+ * If 'scandir' is BackwardScanDirection, build pathkeys representing a
+ * backwards scan of the index.
  *
  * The result is canonical, meaning that redundant pathkeys are removed;
  * it may therefore have fewer entries than there are index columns.
  *
- * We generate the full pathkeys list whether or not all are useful for the
- * current query.  Caller should do truncate_useless_pathkeys().
+ * Another reason for stopping early is that we may be able to tell that
+ * an index column's sort order is uninteresting for this query.  However,
+ * that test is just based on the existence of an EquivalenceClass and not
+ * on position in pathkey lists, so it's not complete.  Caller should call
+ * truncate_useless_pathkeys() to possibly remove more pathkeys.
  */
 List *
 build_index_pathkeys(PlannerInfo *root,
@@ -487,12 +529,16 @@ build_index_pathkeys(PlannerInfo *root,
 					 ScanDirection scandir)
 {
 	List	   *retval = NIL;
-	ListCell   *indexprs_item = list_head(index->indexprs);
+	ListCell   *indexprs_item;
 	int			i;
 
+	if (index->sortopfamily == NULL)
+		return NIL;				/* non-orderable index */
+
+	indexprs_item = list_head(index->indexprs);
 	for (i = 0; i < index->ncolumns; i++)
 	{
-		Oid			sortop;
+		bool		reverse_sort;
 		bool		nulls_first;
 		int			ikey;
 		Expr	   *indexkey;
@@ -500,17 +546,14 @@ build_index_pathkeys(PlannerInfo *root,
 
 		if (ScanDirectionIsBackward(scandir))
 		{
-			sortop = index->revsortop[i];
+			reverse_sort = !index->reverse_sort[i];
 			nulls_first = !index->nulls_first[i];
 		}
 		else
 		{
-			sortop = index->fwdsortop[i];
+			reverse_sort = index->reverse_sort[i];
 			nulls_first = index->nulls_first[i];
 		}
-
-		if (!OidIsValid(sortop))
-			break;				/* no more orderable columns */
 
 		ikey = index->indexkeys[i];
 		if (ikey != 0)
@@ -527,13 +570,24 @@ build_index_pathkeys(PlannerInfo *root,
 			indexprs_item = lnext(indexprs_item);
 		}
 
-		/* OK, make a canonical pathkey for this sort key */
+		/* OK, try to make a canonical pathkey for this sort key */
 		cpathkey = make_pathkey_from_sortinfo(root,
 											  indexkey,
-											  sortop,
+											  index->sortopfamily[i],
+											  index->opcintype[i],
+											  reverse_sort,
 											  nulls_first,
 											  0,
+											  false,
 											  true);
+
+		/*
+		 * If the sort key isn't already present in any EquivalenceClass,
+		 * then it's not an interesting sort order for this query.  So
+		 * we can stop now --- lower-order sort keys aren't useful either.
+		 */
+		if (!cpathkey)
+			break;
 
 		/* Add to list unless redundant */
 		if (!pathkey_is_redundant(cpathkey, retval))
@@ -558,7 +612,8 @@ find_indexkey_var(PlannerInfo *root, RelOptInfo *rel, AttrNumber varattno)
 	ListCell   *temp;
 	Index		relid;
 	Oid			reloid,
-				vartypeid;
+				vartypeid,
+				varcollid;
 	int32		type_mod;
 
 	foreach(temp, rel->reltargetlist)
@@ -573,8 +628,9 @@ find_indexkey_var(PlannerInfo *root, RelOptInfo *rel, AttrNumber varattno)
 	relid = rel->relid;
 	reloid = getrelid(relid, root->parse->rtable);
 	get_atttypetypmod(reloid, varattno, &vartypeid, &type_mod);
+	varcollid = get_attcollation(reloid, varattno);
 
-	return makeVar(relid, varattno, vartypeid, type_mod, 0);
+	return makeVar(relid, varattno, vartypeid, type_mod, varcollid, 0);
 }
 
 /*
@@ -644,13 +700,21 @@ convert_subquery_pathkeys(PlannerInfo *root, RelOptInfo *rel,
 											 outer_expr,
 											 sub_member->em_datatype,
 											 sub_eclass->ec_opfamilies,
-											 0);
-				best_pathkey =
-					make_canonical_pathkey(root,
-										   outer_ec,
-										   sub_pathkey->pk_opfamily,
-										   sub_pathkey->pk_strategy,
-										   sub_pathkey->pk_nulls_first);
+											 0,
+											 false);
+
+				/*
+				 * If we don't find a matching EC, sub-pathkey isn't
+				 * interesting to the outer query
+				 */
+				if (outer_ec)
+					best_pathkey =
+						make_canonical_pathkey(root,
+											   outer_ec,
+											   sub_pathkey->pk_opfamily,
+											   sub_pathkey->pk_collation,
+											   sub_pathkey->pk_strategy,
+											   sub_pathkey->pk_nulls_first);
 			}
 		}
 		else
@@ -738,10 +802,20 @@ convert_subquery_pathkeys(PlannerInfo *root, RelOptInfo *rel,
 														outer_expr,
 													 sub_member->em_datatype,
 												   sub_eclass->ec_opfamilies,
-														0);
+														0,
+														false);
+
+					/*
+					 * If we don't find a matching EC, this sub-pathkey isn't
+					 * interesting to the outer query
+					 */
+					if (!outer_ec)
+						continue;
+
 					outer_pk = make_canonical_pathkey(root,
 													  outer_ec,
 													sub_pathkey->pk_opfamily,
+													sub_pathkey->pk_collation,
 													sub_pathkey->pk_strategy,
 												sub_pathkey->pk_nulls_first);
 					/* score = # of equivalence peers */
@@ -854,12 +928,13 @@ make_pathkeys_for_sortclauses(PlannerInfo *root,
 
 		sortkey = (Expr *) get_sortgroupclause_expr(sortcl, tlist);
 		Assert(OidIsValid(sortcl->sortop));
-		pathkey = make_pathkey_from_sortinfo(root,
-											 sortkey,
-											 sortcl->sortop,
-											 sortcl->nulls_first,
-											 sortcl->tleSortGroupRef,
-											 canonicalize);
+		pathkey = make_pathkey_from_sortop(root,
+										   sortkey,
+										   sortcl->sortop,
+										   sortcl->nulls_first,
+										   sortcl->tleSortGroupRef,
+										   true,
+										   canonicalize);
 
 		/* Canonical form eliminates redundant ordering keys */
 		if (canonicalize)
@@ -874,50 +949,118 @@ make_pathkeys_for_sortclauses(PlannerInfo *root,
 }
 
 /****************************************************************************
+ *		PATHKEYS AND AGGREGATES
+ ****************************************************************************/
+
+/*
+ * make_pathkeys_for_aggregate
+ *		Generate a pathkeys list (always a 1-item list) that represents
+ *		the sort order needed by a MIN/MAX aggregate
+ *
+ * This is only called before EquivalenceClass merging, so we can assume
+ * we are not supposed to canonicalize.
+ */
+List *
+make_pathkeys_for_aggregate(PlannerInfo *root,
+							Expr *aggtarget,
+							Oid aggsortop)
+{
+	PathKey    *pathkey;
+
+	/*
+	 * We arbitrarily set nulls_first to false.  Actually, a MIN/MAX agg can
+	 * use either nulls ordering option, but that is dealt with elsewhere.
+	 */
+	pathkey = make_pathkey_from_sortop(root,
+									   aggtarget,
+									   aggsortop,
+									   false,	/* nulls_first */
+									   0,
+									   true,
+									   false);
+	return list_make1(pathkey);
+}
+
+/****************************************************************************
  *		PATHKEYS AND MERGECLAUSES
  ****************************************************************************/
 
 /*
- * cache_mergeclause_eclasses
- *		Make the cached EquivalenceClass links valid in a mergeclause
- *		restrictinfo.
+ * initialize_mergeclause_eclasses
+ *		Set the EquivalenceClass links in a mergeclause restrictinfo.
  *
  * RestrictInfo contains fields in which we may cache pointers to
  * EquivalenceClasses for the left and right inputs of the mergeclause.
  * (If the mergeclause is a true equivalence clause these will be the
- * same EquivalenceClass, otherwise not.)
+ * same EquivalenceClass, otherwise not.)  If the mergeclause is either
+ * used to generate an EquivalenceClass, or derived from an EquivalenceClass,
+ * then it's easy to set up the left_ec and right_ec members --- otherwise,
+ * this function should be called to set them up.  We will generate new
+ * EquivalenceClauses if necessary to represent the mergeclause's left and
+ * right sides.
+ *
+ * Note this is called before EC merging is complete, so the links won't
+ * necessarily point to canonical ECs.  Before they are actually used for
+ * anything, update_mergeclause_eclasses must be called to ensure that
+ * they've been updated to point to canonical ECs.
  */
 void
-cache_mergeclause_eclasses(PlannerInfo *root, RestrictInfo *restrictinfo)
+initialize_mergeclause_eclasses(PlannerInfo *root, RestrictInfo *restrictinfo)
 {
+	Expr	   *clause = restrictinfo->clause;
+	Oid			lefttype,
+				righttype;
+
+	/* Should be a mergeclause ... */
 	Assert(restrictinfo->mergeopfamilies != NIL);
+	/* ... with links not yet set */
+	Assert(restrictinfo->left_ec == NULL);
+	Assert(restrictinfo->right_ec == NULL);
 
-	/* the cached values should be either both set or both not */
-	if (restrictinfo->left_ec == NULL)
-	{
-		Expr	   *clause = restrictinfo->clause;
-		Oid			lefttype,
-					righttype;
+	/* Need the declared input types of the operator */
+	op_input_types(((OpExpr *) clause)->opno, &lefttype, &righttype);
 
-		/* Need the declared input types of the operator */
-		op_input_types(((OpExpr *) clause)->opno, &lefttype, &righttype);
+	/* Find or create a matching EquivalenceClass for each side */
+	restrictinfo->left_ec =
+		get_eclass_for_sort_expr(root,
+								 (Expr *) get_leftop(clause),
+								 lefttype,
+								 restrictinfo->mergeopfamilies,
+								 0,
+								 true);
+	restrictinfo->right_ec =
+		get_eclass_for_sort_expr(root,
+								 (Expr *) get_rightop(clause),
+								 righttype,
+								 restrictinfo->mergeopfamilies,
+								 0,
+								 true);
+}
 
-		/* Find or create a matching EquivalenceClass for each side */
-		restrictinfo->left_ec =
-			get_eclass_for_sort_expr(root,
-									 (Expr *) get_leftop(clause),
-									 lefttype,
-									 restrictinfo->mergeopfamilies,
-									 0);
-		restrictinfo->right_ec =
-			get_eclass_for_sort_expr(root,
-									 (Expr *) get_rightop(clause),
-									 righttype,
-									 restrictinfo->mergeopfamilies,
-									 0);
-	}
-	else
-		Assert(restrictinfo->right_ec != NULL);
+/*
+ * update_mergeclause_eclasses
+ *		Make the cached EquivalenceClass links valid in a mergeclause
+ *		restrictinfo.
+ *
+ * These pointers should have been set by process_equivalence or
+ * initialize_mergeclause_eclasses, but they might have been set to
+ * non-canonical ECs that got merged later.  Chase up to the canonical
+ * merged parent if so.
+ */
+void
+update_mergeclause_eclasses(PlannerInfo *root, RestrictInfo *restrictinfo)
+{
+	/* Should be a merge clause ... */
+	Assert(restrictinfo->mergeopfamilies != NIL);
+	/* ... with pointers already set */
+	Assert(restrictinfo->left_ec != NULL);
+	Assert(restrictinfo->right_ec != NULL);
+
+	/* Chase up to the top as needed */
+	while (restrictinfo->left_ec->ec_merged)
+		restrictinfo->left_ec = restrictinfo->left_ec->ec_merged;
+	while (restrictinfo->right_ec->ec_merged)
+		restrictinfo->right_ec = restrictinfo->right_ec->ec_merged;
 }
 
 /*
@@ -953,7 +1096,7 @@ find_mergeclauses_for_pathkeys(PlannerInfo *root,
 	{
 		RestrictInfo *rinfo = (RestrictInfo *) lfirst(i);
 
-		cache_mergeclause_eclasses(root, rinfo);
+		update_mergeclause_eclasses(root, rinfo);
 	}
 
 	foreach(i, pathkeys)
@@ -1089,7 +1232,7 @@ select_outer_pathkeys_for_merge(PlannerInfo *root,
 		ListCell   *lc2;
 
 		/* get the outer eclass */
-		cache_mergeclause_eclasses(root, rinfo);
+		update_mergeclause_eclasses(root, rinfo);
 
 		if (rinfo->outer_is_left)
 			oeclass = rinfo->left_ec;
@@ -1194,6 +1337,7 @@ select_outer_pathkeys_for_merge(PlannerInfo *root,
 		pathkey = make_canonical_pathkey(root,
 										 ec,
 										 linitial_oid(ec->ec_opfamilies),
+										 DEFAULT_COLLATION_OID,
 										 BTLessStrategyNumber,
 										 false);
 		/* can't be redundant because no duplicate ECs */
@@ -1250,7 +1394,7 @@ make_inner_pathkeys_for_merge(PlannerInfo *root,
 		EquivalenceClass *ieclass;
 		PathKey    *pathkey;
 
-		cache_mergeclause_eclasses(root, rinfo);
+		update_mergeclause_eclasses(root, rinfo);
 
 		if (rinfo->outer_is_left)
 		{
@@ -1287,6 +1431,7 @@ make_inner_pathkeys_for_merge(PlannerInfo *root,
 			pathkey = make_canonical_pathkey(root,
 											 ieclass,
 											 opathkey->pk_opfamily,
+											 opathkey->pk_collation,
 											 opathkey->pk_strategy,
 											 opathkey->pk_nulls_first);
 
@@ -1305,10 +1450,11 @@ make_inner_pathkeys_for_merge(PlannerInfo *root,
  *		PATHKEY USEFULNESS CHECKS
  *
  * We only want to remember as many of the pathkeys of a path as have some
- * potential use, either for subsequent mergejoins or for meeting the query's
- * requested output ordering.  This ensures that add_path() won't consider
- * a path to have a usefully different ordering unless it really is useful.
- * These routines check for usefulness of given pathkeys.
+ * potential use, which can include subsequent mergejoins, meeting the query's
+ * requested output ordering, or implementing MIN/MAX aggregates.  This
+ * ensures that add_path() won't consider a path to have a usefully different
+ * ordering unless it really is useful.  These routines check for usefulness
+ * of given pathkeys.
  ****************************************************************************/
 
 /*
@@ -1329,7 +1475,7 @@ make_inner_pathkeys_for_merge(PlannerInfo *root,
  * that direction should be preferred, in hopes of avoiding a final sort step.
  * right_merge_direction() implements this heuristic.
  */
-int
+static int
 pathkeys_useful_for_merging(PlannerInfo *root, RelOptInfo *rel, List *pathkeys)
 {
 	int			useful = 0;
@@ -1366,7 +1512,7 @@ pathkeys_useful_for_merging(PlannerInfo *root, RelOptInfo *rel, List *pathkeys)
 
 				if (restrictinfo->mergeopfamilies == NIL)
 					continue;
-				cache_mergeclause_eclasses(root, restrictinfo);
+				update_mergeclause_eclasses(root, restrictinfo);
 
 				if (pathkey->pk_eclass == restrictinfo->left_ec ||
 					pathkey->pk_eclass == restrictinfo->right_ec)
@@ -1406,6 +1552,7 @@ right_merge_direction(PlannerInfo *root, PathKey *pathkey)
 		PathKey    *query_pathkey = (PathKey *) lfirst(l);
 
 		if (pathkey->pk_eclass == query_pathkey->pk_eclass &&
+			pathkey->pk_collation == query_pathkey->pk_collation &&
 			pathkey->pk_opfamily == query_pathkey->pk_opfamily)
 		{
 			/*
@@ -1432,7 +1579,7 @@ right_merge_direction(PlannerInfo *root, PathKey *pathkey)
  * no good to order by just the first key(s) of the requested ordering.
  * So the result is always either 0 or list_length(root->query_pathkeys).
  */
-int
+static int
 pathkeys_useful_for_ordering(PlannerInfo *root, List *pathkeys)
 {
 	if (root->query_pathkeys == NIL)
@@ -1451,6 +1598,50 @@ pathkeys_useful_for_ordering(PlannerInfo *root, List *pathkeys)
 }
 
 /*
+ * pathkeys_useful_for_minmax
+ *		Count the number of pathkeys that are useful for implementing
+ *		some MIN/MAX aggregate.
+ *
+ * Like pathkeys_useful_for_ordering, this is a yes-or-no affair, but
+ * there could be several MIN/MAX aggregates and we can match to any one.
+ *
+ * We can't use pathkeys_contained_in() because we would like to match
+ * pathkeys regardless of the nulls_first setting.  However, we know that
+ * MIN/MAX aggregates will have at most one item in their pathkeys, so it's
+ * not too complicated to match by brute force.
+ */
+static int
+pathkeys_useful_for_minmax(PlannerInfo *root, List *pathkeys)
+{
+	PathKey    *pathkey;
+	ListCell   *lc;
+
+	if (pathkeys == NIL)
+		return 0;				/* unordered path */
+	pathkey = (PathKey *) linitial(pathkeys);
+
+	foreach(lc, root->minmax_aggs)
+	{
+		MinMaxAggInfo *mminfo = (MinMaxAggInfo *) lfirst(lc);
+		PathKey    *mmpathkey;
+
+		/* Ignore minmax agg if its pathkey turned out to be redundant */
+		if (mminfo->pathkeys == NIL)
+			continue;
+
+		Assert(list_length(mminfo->pathkeys) == 1);
+		mmpathkey = (PathKey *) linitial(mminfo->pathkeys);
+
+		if (mmpathkey->pk_eclass == pathkey->pk_eclass &&
+			mmpathkey->pk_opfamily == pathkey->pk_opfamily &&
+			mmpathkey->pk_strategy == pathkey->pk_strategy)
+			return 1;
+	}
+
+	return 0;					/* path ordering not useful */
+}
+
+/*
  * truncate_useless_pathkeys
  *		Shorten the given pathkey list to just the useful pathkeys.
  */
@@ -1461,11 +1652,15 @@ truncate_useless_pathkeys(PlannerInfo *root,
 {
 	int			nuseful;
 	int			nuseful2;
+	int			nuseful3;
 
 	nuseful = pathkeys_useful_for_merging(root, rel, pathkeys);
 	nuseful2 = pathkeys_useful_for_ordering(root, pathkeys);
 	if (nuseful2 > nuseful)
 		nuseful = nuseful2;
+	nuseful3 = pathkeys_useful_for_minmax(root, pathkeys);
+	if (nuseful3 > nuseful)
+		nuseful = nuseful3;
 
 	/*
 	 * Note: not safe to modify input list destructively, but we can avoid
@@ -1491,8 +1686,8 @@ truncate_useless_pathkeys(PlannerInfo *root,
  *
  * We could make the test more complex, for example checking to see if any of
  * the joinclauses are really mergejoinable, but that likely wouldn't win
- * often enough to repay the extra cycles.	Queries with neither a join nor
- * a sort are reasonably common, though, so this much work seems worthwhile.
+ * often enough to repay the extra cycles.	Queries with no join, sort, or
+ * aggregate at all are reasonably common, so this much work seems worthwhile.
  */
 bool
 has_useful_pathkeys(PlannerInfo *root, RelOptInfo *rel)
@@ -1501,5 +1696,7 @@ has_useful_pathkeys(PlannerInfo *root, RelOptInfo *rel)
 		return true;			/* might be able to use pathkeys for merging */
 	if (root->query_pathkeys != NIL)
 		return true;			/* might be able to use them for ordering */
+	if (root->minmax_aggs != NIL)
+		return true;			/* might be able to use them for MIN/MAX */
 	return false;				/* definitely useless */
 }

@@ -3,7 +3,7 @@
  * execQual.c
  *	  Routines to evaluate qualification and targetlist expressions
  *
- * Portions Copyright (c) 1996-2010, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2011, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -166,6 +166,9 @@ static Datum ExecEvalFieldStore(FieldStoreState *fstate,
 static Datum ExecEvalRelabelType(GenericExprState *exprstate,
 					ExprContext *econtext,
 					bool *isNull, ExprDoneCond *isDone);
+static Datum ExecEvalCollateClause(GenericExprState *exprstate,
+					ExprContext *econtext,
+					bool *isNull, ExprDoneCond *isDone);
 static Datum ExecEvalCoerceViaIO(CoerceViaIOState *iostate,
 					ExprContext *econtext,
 					bool *isNull, ExprDoneCond *isDone);
@@ -296,7 +299,7 @@ ExecEvalArrayRef(ArrayRefExprState *astate,
 			ereport(ERROR,
 					(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
 					 errmsg("number of array dimensions (%d) exceeds the maximum allowed (%d)",
-							i, MAXDIM)));
+							i + 1, MAXDIM)));
 
 		upper.indx[i++] = DatumGetInt32(ExecEvalExpr(eltstate,
 													 econtext,
@@ -324,7 +327,7 @@ ExecEvalArrayRef(ArrayRefExprState *astate,
 				ereport(ERROR,
 						(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
 						 errmsg("number of array dimensions (%d) exceeds the maximum allowed (%d)",
-								i, MAXDIM)));
+								j + 1, MAXDIM)));
 
 			lower.indx[j++] = DatumGetInt32(ExecEvalExpr(eltstate,
 														 econtext,
@@ -1202,7 +1205,11 @@ init_fcache(Oid foid, FuncExprState *fcache,
 
 	/* Set up the primary fmgr lookup information */
 	fmgr_info_cxt(foid, &(fcache->func), fcacheCxt);
-	fcache->func.fn_expr = (Node *) fcache->xprstate.expr;
+	fmgr_info_expr((Node *) fcache->xprstate.expr, &(fcache->func));
+
+	/* Initialize the function call parameter struct as well */
+	InitFunctionCallInfoData(fcache->fcinfo_data, &(fcache->func),
+							 list_length(fcache->args), NULL, NULL);
 
 	/* If function returns set, prepare expected tuple descriptor */
 	if (fcache->func.fn_retset && needDescForSets)
@@ -1385,7 +1392,7 @@ ExecEvalFuncArgs(FunctionCallInfo fcinfo,
 		i++;
 	}
 
-	fcinfo->nargs = i;
+	Assert(i == fcinfo->nargs);
 
 	return argIsDone;
 }
@@ -1535,7 +1542,6 @@ ExecMakeFunctionResult(FuncExprState *fcache,
 {
 	List	   *arguments;
 	Datum		result;
-	FunctionCallInfoData fcinfo_data;
 	FunctionCallInfo fcinfo;
 	PgStat_FunctionCallUsage fcusage;
 	ReturnSetInfo rsinfo;		/* for functions returning sets */
@@ -1587,30 +1593,15 @@ restart:
 	}
 
 	/*
-	 * For non-set-returning functions, we just use a local-variable
-	 * FunctionCallInfoData.  For set-returning functions we keep the callinfo
-	 * record in fcache->setArgs so that it can survive across multiple
-	 * value-per-call invocations.	(The reason we don't just do the latter
-	 * all the time is that plpgsql expects to be able to use simple
-	 * expression trees re-entrantly.  Which might not be a good idea, but the
-	 * penalty for not doing so is high.)
-	 */
-	if (fcache->func.fn_retset)
-		fcinfo = &fcache->setArgs;
-	else
-		fcinfo = &fcinfo_data;
-
-	/*
 	 * arguments is a list of expressions to evaluate before passing to the
 	 * function manager.  We skip the evaluation if it was already done in the
 	 * previous call (ie, we are continuing the evaluation of a set-valued
 	 * function).  Otherwise, collect the current argument values into fcinfo.
 	 */
+	fcinfo = &fcache->fcinfo_data;
 	arguments = fcache->args;
 	if (!fcache->setArgsValid)
 	{
-		/* Need to prep callinfo structure */
-		InitFunctionCallInfoData(*fcinfo, &(fcache->func), 0, NULL, NULL);
 		argDone = ExecEvalFuncArgs(fcinfo, arguments, econtext);
 		if (argDone == ExprEndResult)
 		{
@@ -1726,7 +1717,6 @@ restart:
 					if (fcache->func.fn_retset &&
 						*isDone == ExprMultipleResult)
 					{
-						Assert(fcinfo == &fcache->setArgs);
 						fcache->setHasSetArg = hasSetArg;
 						fcache->setArgsValid = true;
 						/* Register cleanup callback if we didn't already */
@@ -1856,7 +1846,7 @@ ExecMakeFunctionResultNoSets(FuncExprState *fcache,
 {
 	ListCell   *arg;
 	Datum		result;
-	FunctionCallInfoData fcinfo;
+	FunctionCallInfo fcinfo;
 	PgStat_FunctionCallUsage fcusage;
 	int			i;
 
@@ -1867,19 +1857,18 @@ ExecMakeFunctionResultNoSets(FuncExprState *fcache,
 		*isDone = ExprSingleResult;
 
 	/* inlined, simplified version of ExecEvalFuncArgs */
+	fcinfo = &fcache->fcinfo_data;
 	i = 0;
 	foreach(arg, fcache->args)
 	{
 		ExprState  *argstate = (ExprState *) lfirst(arg);
 
-		fcinfo.arg[i] = ExecEvalExpr(argstate,
-									 econtext,
-									 &fcinfo.argnull[i],
-									 NULL);
+		fcinfo->arg[i] = ExecEvalExpr(argstate,
+									  econtext,
+									  &fcinfo->argnull[i],
+									  NULL);
 		i++;
 	}
-
-	InitFunctionCallInfoData(fcinfo, &(fcache->func), i, NULL, NULL);
 
 	/*
 	 * If function is strict, and there are any NULL arguments, skip calling
@@ -1889,7 +1878,7 @@ ExecMakeFunctionResultNoSets(FuncExprState *fcache,
 	{
 		while (--i >= 0)
 		{
-			if (fcinfo.argnull[i])
+			if (fcinfo->argnull[i])
 			{
 				*isNull = true;
 				return (Datum) 0;
@@ -1897,11 +1886,11 @@ ExecMakeFunctionResultNoSets(FuncExprState *fcache,
 		}
 	}
 
-	pgstat_init_function_usage(&fcinfo, &fcusage);
+	pgstat_init_function_usage(fcinfo, &fcusage);
 
-	/* fcinfo.isnull = false; */	/* handled by InitFunctionCallInfoData */
-	result = FunctionCallInvoke(&fcinfo);
-	*isNull = fcinfo.isnull;
+	fcinfo->isnull = false;
+	result = FunctionCallInvoke(fcinfo);
+	*isNull = fcinfo->isnull;
 
 	pgstat_end_function_usage(&fcusage, true);
 
@@ -1948,7 +1937,6 @@ ExecMakeTableFunctionResult(ExprState *funcexpr,
 	 * resultinfo, but set it up anyway because we use some of the fields as
 	 * our own state variables.
 	 */
-	InitFunctionCallInfoData(fcinfo, NULL, 0, NULL, (Node *) &rsinfo);
 	rsinfo.type = T_ReturnSetInfo;
 	rsinfo.econtext = econtext;
 	rsinfo.expectedDesc = expectedDesc;
@@ -1992,6 +1980,9 @@ ExecMakeTableFunctionResult(ExprState *funcexpr,
 						econtext->ecxt_per_query_memory, false);
 		}
 		returnsSet = fcache->func.fn_retset;
+		InitFunctionCallInfoData(fcinfo, &(fcache->func),
+								 list_length(fcache->args),
+								 NULL, (Node *) &rsinfo);
 
 		/*
 		 * Evaluate the function's argument list.
@@ -2001,7 +1992,6 @@ ExecMakeTableFunctionResult(ExprState *funcexpr,
 		 * inner loop.	So do it in caller context.  Perhaps we should make a
 		 * separate context just to hold the evaluated arguments?
 		 */
-		fcinfo.flinfo = &(fcache->func);
 		argDone = ExecEvalFuncArgs(&fcinfo, fcache->args, econtext);
 		/* We don't allow sets in the arguments of the table function */
 		if (argDone != ExprSingleResult)
@@ -2029,6 +2019,7 @@ ExecMakeTableFunctionResult(ExprState *funcexpr,
 	{
 		/* Treat funcexpr as a generic expression */
 		direct_function_call = false;
+		InitFunctionCallInfoData(fcinfo, NULL, 0, NULL, NULL);
 	}
 
 	/*
@@ -2312,9 +2303,8 @@ ExecEvalDistinct(FuncExprState *fcache,
 				 ExprDoneCond *isDone)
 {
 	Datum		result;
-	FunctionCallInfoData fcinfo;
+	FunctionCallInfo fcinfo;
 	ExprDoneCond argDone;
-	List	   *argList;
 
 	/* Set default values for result flags: non-null, not a set result */
 	*isNull = false;
@@ -2334,34 +2324,31 @@ ExecEvalDistinct(FuncExprState *fcache,
 	}
 
 	/*
-	 * extract info from fcache
+	 * Evaluate arguments
 	 */
-	argList = fcache->args;
-
-	/* Need to prep callinfo structure */
-	InitFunctionCallInfoData(fcinfo, &(fcache->func), 0, NULL, NULL);
-	argDone = ExecEvalFuncArgs(&fcinfo, argList, econtext);
+	fcinfo = &fcache->fcinfo_data;
+	argDone = ExecEvalFuncArgs(fcinfo, fcache->args, econtext);
 	if (argDone != ExprSingleResult)
 		ereport(ERROR,
 				(errcode(ERRCODE_DATATYPE_MISMATCH),
 				 errmsg("IS DISTINCT FROM does not support set arguments")));
-	Assert(fcinfo.nargs == 2);
+	Assert(fcinfo->nargs == 2);
 
-	if (fcinfo.argnull[0] && fcinfo.argnull[1])
+	if (fcinfo->argnull[0] && fcinfo->argnull[1])
 	{
 		/* Both NULL? Then is not distinct... */
 		result = BoolGetDatum(FALSE);
 	}
-	else if (fcinfo.argnull[0] || fcinfo.argnull[1])
+	else if (fcinfo->argnull[0] || fcinfo->argnull[1])
 	{
 		/* Only one is NULL? Then is distinct... */
 		result = BoolGetDatum(TRUE);
 	}
 	else
 	{
-		fcinfo.isnull = false;
-		result = FunctionCallInvoke(&fcinfo);
-		*isNull = fcinfo.isnull;
+		fcinfo->isnull = false;
+		result = FunctionCallInvoke(fcinfo);
+		*isNull = fcinfo->isnull;
 		/* Must invert result of "=" */
 		result = BoolGetDatum(!DatumGetBool(result));
 	}
@@ -2388,7 +2375,7 @@ ExecEvalScalarArrayOp(ScalarArrayOpExprState *sstate,
 	int			nitems;
 	Datum		result;
 	bool		resultnull;
-	FunctionCallInfoData fcinfo;
+	FunctionCallInfo fcinfo;
 	ExprDoneCond argDone;
 	int			i;
 	int16		typlen;
@@ -2413,26 +2400,28 @@ ExecEvalScalarArrayOp(ScalarArrayOpExprState *sstate,
 		Assert(!sstate->fxprstate.func.fn_retset);
 	}
 
-	/* Need to prep callinfo structure */
-	InitFunctionCallInfoData(fcinfo, &(sstate->fxprstate.func), 0, NULL, NULL);
-	argDone = ExecEvalFuncArgs(&fcinfo, sstate->fxprstate.args, econtext);
+	/*
+	 * Evaluate arguments
+	 */
+	fcinfo = &sstate->fxprstate.fcinfo_data;
+	argDone = ExecEvalFuncArgs(fcinfo, sstate->fxprstate.args, econtext);
 	if (argDone != ExprSingleResult)
 		ereport(ERROR,
 				(errcode(ERRCODE_DATATYPE_MISMATCH),
 			   errmsg("op ANY/ALL (array) does not support set arguments")));
-	Assert(fcinfo.nargs == 2);
+	Assert(fcinfo->nargs == 2);
 
 	/*
 	 * If the array is NULL then we return NULL --- it's not very meaningful
 	 * to do anything else, even if the operator isn't strict.
 	 */
-	if (fcinfo.argnull[1])
+	if (fcinfo->argnull[1])
 	{
 		*isNull = true;
 		return (Datum) 0;
 	}
 	/* Else okay to fetch and detoast the array */
-	arr = DatumGetArrayTypeP(fcinfo.arg[1]);
+	arr = DatumGetArrayTypeP(fcinfo->arg[1]);
 
 	/*
 	 * If the array is empty, we return either FALSE or TRUE per the useOr
@@ -2448,7 +2437,7 @@ ExecEvalScalarArrayOp(ScalarArrayOpExprState *sstate,
 	 * If the scalar is NULL, and the function is strict, return NULL; no
 	 * point in iterating the loop.
 	 */
-	if (fcinfo.argnull[0] && sstate->fxprstate.func.fn_strict)
+	if (fcinfo->argnull[0] && sstate->fxprstate.func.fn_strict)
 	{
 		*isNull = true;
 		return (Datum) 0;
@@ -2486,32 +2475,32 @@ ExecEvalScalarArrayOp(ScalarArrayOpExprState *sstate,
 		/* Get array element, checking for NULL */
 		if (bitmap && (*bitmap & bitmask) == 0)
 		{
-			fcinfo.arg[1] = (Datum) 0;
-			fcinfo.argnull[1] = true;
+			fcinfo->arg[1] = (Datum) 0;
+			fcinfo->argnull[1] = true;
 		}
 		else
 		{
 			elt = fetch_att(s, typbyval, typlen);
 			s = att_addlength_pointer(s, typlen, s);
 			s = (char *) att_align_nominal(s, typalign);
-			fcinfo.arg[1] = elt;
-			fcinfo.argnull[1] = false;
+			fcinfo->arg[1] = elt;
+			fcinfo->argnull[1] = false;
 		}
 
 		/* Call comparison function */
-		if (fcinfo.argnull[1] && sstate->fxprstate.func.fn_strict)
+		if (fcinfo->argnull[1] && sstate->fxprstate.func.fn_strict)
 		{
-			fcinfo.isnull = true;
+			fcinfo->isnull = true;
 			thisresult = (Datum) 0;
 		}
 		else
 		{
-			fcinfo.isnull = false;
-			thisresult = FunctionCallInvoke(&fcinfo);
+			fcinfo->isnull = false;
+			thisresult = FunctionCallInvoke(fcinfo);
 		}
 
 		/* Combine results per OR or AND semantics */
-		if (fcinfo.isnull)
+		if (fcinfo->isnull)
 			resultnull = true;
 		else if (useOr)
 		{
@@ -3526,9 +3515,8 @@ ExecEvalNullIf(FuncExprState *nullIfExpr,
 			   bool *isNull, ExprDoneCond *isDone)
 {
 	Datum		result;
-	FunctionCallInfoData fcinfo;
+	FunctionCallInfo fcinfo;
 	ExprDoneCond argDone;
-	List	   *argList;
 
 	if (isDone)
 		*isDone = ExprSingleResult;
@@ -3546,26 +3534,23 @@ ExecEvalNullIf(FuncExprState *nullIfExpr,
 	}
 
 	/*
-	 * extract info from nullIfExpr
+	 * Evaluate arguments
 	 */
-	argList = nullIfExpr->args;
-
-	/* Need to prep callinfo structure */
-	InitFunctionCallInfoData(fcinfo, &(nullIfExpr->func), 0, NULL, NULL);
-	argDone = ExecEvalFuncArgs(&fcinfo, argList, econtext);
+	fcinfo = &nullIfExpr->fcinfo_data;
+	argDone = ExecEvalFuncArgs(fcinfo, nullIfExpr->args, econtext);
 	if (argDone != ExprSingleResult)
 		ereport(ERROR,
 				(errcode(ERRCODE_DATATYPE_MISMATCH),
 				 errmsg("NULLIF does not support set arguments")));
-	Assert(fcinfo.nargs == 2);
+	Assert(fcinfo->nargs == 2);
 
 	/* if either argument is NULL they can't be equal */
-	if (!fcinfo.argnull[0] && !fcinfo.argnull[1])
+	if (!fcinfo->argnull[0] && !fcinfo->argnull[1])
 	{
-		fcinfo.isnull = false;
-		result = FunctionCallInvoke(&fcinfo);
+		fcinfo->isnull = false;
+		result = FunctionCallInvoke(fcinfo);
 		/* if the arguments are equal return null */
-		if (!fcinfo.isnull && DatumGetBool(result))
+		if (!fcinfo->isnull && DatumGetBool(result))
 		{
 			*isNull = true;
 			return (Datum) 0;
@@ -3573,8 +3558,8 @@ ExecEvalNullIf(FuncExprState *nullIfExpr,
 	}
 
 	/* else return first argument */
-	*isNull = fcinfo.argnull[0];
-	return fcinfo.arg[0];
+	*isNull = fcinfo->argnull[0];
+	return fcinfo->arg[0];
 }
 
 /* ----------------------------------------------------------------
@@ -4044,6 +4029,20 @@ ExecEvalRelabelType(GenericExprState *exprstate,
 }
 
 /* ----------------------------------------------------------------
+ *		ExecEvalCollateClause
+ *
+ *		Evaluate a CollateClause node.
+ * ----------------------------------------------------------------
+ */
+static Datum
+ExecEvalCollateClause(GenericExprState *exprstate,
+					ExprContext *econtext,
+					bool *isNull, ExprDoneCond *isDone)
+{
+	return ExecEvalExpr(exprstate->arg, econtext, isNull, isDone);
+}
+
+/* ----------------------------------------------------------------
  *		ExecEvalCoerceViaIO
  *
  *		Evaluate a CoerceViaIO node.
@@ -4132,7 +4131,7 @@ ExecEvalArrayCoerceExpr(ArrayCoerceExprState *astate,
 					  econtext->ecxt_per_query_memory);
 
 		/* Initialize additional info */
-		astate->elemfunc.fn_expr = (Node *) acoerce;
+		fmgr_info_expr((Node *) acoerce, &(astate->elemfunc));
 	}
 
 	/*
@@ -4502,6 +4501,16 @@ ExecInitExpr(Expr *node, PlanState *parent)
 				state = (ExprState *) gstate;
 			}
 			break;
+		case T_CollateClause:
+			{
+				CollateClause *collate = (CollateClause *) node;
+				GenericExprState *gstate = makeNode(GenericExprState);
+
+				gstate->xprstate.evalfunc = (ExprStateEvalFunc) ExecEvalCollateClause;
+				gstate->arg = ExecInitExpr(collate->arg, parent);
+				state = (ExprState *) gstate;
+			}
+			break;
 		case T_CoerceViaIO:
 			{
 				CoerceViaIO *iocoerce = (CoerceViaIO *) node;
@@ -4675,6 +4684,7 @@ ExecInitExpr(Expr *node, PlanState *parent)
 				List	   *outlist;
 				ListCell   *l;
 				ListCell   *l2;
+				ListCell   *l3;
 				int			i;
 
 				rstate->xprstate.evalfunc = (ExprStateEvalFunc) ExecEvalRowCompare;
@@ -4703,16 +4713,17 @@ ExecInitExpr(Expr *node, PlanState *parent)
 				Assert(list_length(rcexpr->opfamilies) == nopers);
 				rstate->funcs = (FmgrInfo *) palloc(nopers * sizeof(FmgrInfo));
 				i = 0;
-				forboth(l, rcexpr->opnos, l2, rcexpr->opfamilies)
+				forthree(l, rcexpr->opnos, l2, rcexpr->opfamilies, l3, rcexpr->collids)
 				{
 					Oid			opno = lfirst_oid(l);
 					Oid			opfamily = lfirst_oid(l2);
+					Oid			collid = lfirst_oid(l3);
 					int			strategy;
 					Oid			lefttype;
 					Oid			righttype;
 					Oid			proc;
 
-					get_op_opfamily_properties(opno, opfamily,
+					get_op_opfamily_properties(opno, opfamily, false,
 											   &strategy,
 											   &lefttype,
 											   &righttype);
@@ -4728,6 +4739,7 @@ ExecInitExpr(Expr *node, PlanState *parent)
 					 * does this code.
 					 */
 					fmgr_info(proc, &(rstate->funcs[i]));
+					fmgr_info_collation(collid, &(rstate->funcs[i]));
 					i++;
 				}
 				state = (ExprState *) rstate;
@@ -4787,6 +4799,7 @@ ExecInitExpr(Expr *node, PlanState *parent)
 				 * code.
 				 */
 				fmgr_info(typentry->cmp_proc, &(mstate->cfunc));
+				fmgr_info_collation(minmaxexpr->collid, &(mstate->cfunc));
 				state = (ExprState *) mstate;
 			}
 			break;

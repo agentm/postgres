@@ -4,7 +4,7 @@
  *	  prototypes for functions in backend/catalog/catalog.c
  *
  *
- * Portions Copyright (c) 1996-2010, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2011, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/catalog/catalog.h
@@ -25,7 +25,7 @@
 
 extern const char *forkNames[];
 extern ForkNumber forkname_to_number(char *forkName);
-extern int forkname_chars(const char *str);
+extern int forkname_chars(const char *str, ForkNumber *);
 
 extern char *relpathbackend(RelFileNode rnode, BackendId backend,
 			  ForkNumber forknum);
@@ -56,6 +56,6 @@ extern Oid	GetNewOid(Relation relation);
 extern Oid GetNewOidWithIndex(Relation relation, Oid indexId,
 				   AttrNumber oidcolumn);
 extern Oid	GetNewRelFileNode(Oid reltablespace, Relation pg_class,
-				  BackendId backend);
+				  char relpersistence);
 
 #endif   /* CATALOG_H */

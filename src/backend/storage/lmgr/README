@@ -3,7 +3,7 @@ src/backend/storage/lmgr/README
 Locking Overview
 ================
 
-Postgres uses three types of interprocess locks:
+Postgres uses four types of interprocess locks:
 
 * Spinlocks.  These are intended for *very* short-term locks.  If a lock
 is to be held more than a few dozen instructions, or across any sort of
@@ -31,8 +31,10 @@ arrival order.  There is no timeout.
 
 * Regular locks (a/k/a heavyweight locks).  The regular lock manager
 supports a variety of lock modes with table-driven semantics, and it has
-full deadlock detection and automatic release at transaction end. 
+full deadlock detection and automatic release at transaction end.
 Regular locks should be used for all user-driven lock requests.
+
+* SIReadLock predicate locks.  See separate README-SSI file for details.
 
 Acquisition of either a spinlock or a lightweight lock causes query
 cancel and die() interrupts to be held off until all such locks are
@@ -260,7 +262,7 @@ A key design consideration is that we want to make routine operations
 (lock grant and release) run quickly when there is no deadlock, and
 avoid the overhead of deadlock handling as much as possible.  We do this
 using an "optimistic waiting" approach: if a process cannot acquire the
-lock it wants immediately, it goes to sleep without any deadlock check. 
+lock it wants immediately, it goes to sleep without any deadlock check.
 But it also sets a delay timer, with a delay of DeadlockTimeout
 milliseconds (typically set to one second).  If the delay expires before
 the process is granted the lock it wants, it runs the deadlock

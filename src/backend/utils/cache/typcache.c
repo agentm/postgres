@@ -10,10 +10,10 @@
  * be used for grouping and sorting the type (GROUP BY, ORDER BY ASC/DESC).
  *
  * Several seemingly-odd choices have been made to support use of the type
- * cache by the generic array comparison routines array_eq() and array_cmp().
- * Because those routines are used as index support operations, they cannot
- * leak memory.  To allow them to execute efficiently, all information that
- * either of them would like to re-use across calls is made available in the
+ * cache by the generic array handling routines array_eq(), array_cmp(),
+ * and hash_array().  Because those routines are used as index support
+ * operations, they cannot leak memory.  To allow them to execute efficiently,
+ * all information that they would like to re-use across calls is kept in the
  * type cache.
  *
  * Once created, a type cache entry lives as long as the backend does, so
@@ -32,7 +32,7 @@
  * entry, since that may need to change as a consequence of ALTER TABLE.
  *
  *
- * Portions Copyright (c) 1996-2010, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2011, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -42,21 +42,43 @@
  */
 #include "postgres.h"
 
+#include <limits.h>
+
 #include "access/hash.h"
 #include "access/heapam.h"
 #include "access/nbtree.h"
+#include "catalog/indexing.h"
+#include "catalog/pg_enum.h"
 #include "catalog/pg_type.h"
 #include "commands/defrem.h"
 #include "utils/builtins.h"
+#include "utils/fmgroids.h"
 #include "utils/inval.h"
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
+#include "utils/snapmgr.h"
 #include "utils/syscache.h"
+#include "utils/tqual.h"
 #include "utils/typcache.h"
 
 
 /* The main type cache hashtable searched by lookup_type_cache */
 static HTAB *TypeCacheHash = NULL;
+
+/* Private information to support comparisons of enum values */
+typedef struct
+{
+	Oid			enum_oid;		/* OID of one enum value */
+	float4		sort_order;		/* its sort position */
+} EnumItem;
+
+typedef struct TypeCacheEnumData
+{
+	Oid			bitmap_base;	/* OID corresponding to bit 0 of bitmapset */
+	Bitmapset  *sorted_values;	/* Set of OIDs known to be in order */
+	int			num_values;		/* total number of values in enum */
+	EnumItem	enum_values[1];	/* VARIABLE LENGTH ARRAY */
+} TypeCacheEnumData;
 
 /*
  * We use a separate table for storing the definitions of non-anonymous
@@ -88,6 +110,9 @@ static int32 RecordCacheArrayLen = 0;	/* allocated length of array */
 static int32 NextRecordTypmod = 0;		/* number of entries used */
 
 static void TypeCacheRelCallback(Datum arg, Oid relid);
+static void load_enum_cache_data(TypeCacheEntry *tcache);
+static EnumItem *find_enumitem(TypeCacheEnumData *enumdata, Oid arg);
+static int	enum_oid_cmp(const void *left, const void *right);
 
 
 /*
@@ -168,7 +193,9 @@ lookup_type_cache(Oid type_id, int flags)
 		ReleaseSysCache(tp);
 	}
 
-	/* If we haven't already found the opclass, try to do so */
+	/*
+	 * If we haven't already found the opclasses, try to do so
+	 */
 	if ((flags & (TYPECACHE_EQ_OPR | TYPECACHE_LT_OPR | TYPECACHE_GT_OPR |
 				  TYPECACHE_CMP_PROC |
 				  TYPECACHE_EQ_OPR_FINFO | TYPECACHE_CMP_PROC_FINFO |
@@ -183,7 +210,7 @@ lookup_type_cache(Oid type_id, int flags)
 			typentry->btree_opf = get_opclass_family(opclass);
 			typentry->btree_opintype = get_opclass_input_type(opclass);
 		}
-		/* Only care about hash opclass if no btree opclass... */
+		/* If no btree opclass, we force lookup of the hash opclass */
 		if (typentry->btree_opf == InvalidOid)
 		{
 			if (typentry->hash_opf == InvalidOid)
@@ -199,12 +226,30 @@ lookup_type_cache(Oid type_id, int flags)
 		else
 		{
 			/*
-			 * If we find a btree opclass where previously we only found a
-			 * hash opclass, forget the hash equality operator so we can use
-			 * the btree operator instead.
+			 * In case we find a btree opclass where previously we only found
+			 * a hash opclass, reset eq_opr and derived information so that
+			 * we can fetch the btree equality operator instead of the hash
+			 * equality operator.  (They're probably the same operator, but
+			 * we don't assume that here.)
 			 */
 			typentry->eq_opr = InvalidOid;
 			typentry->eq_opr_finfo.fn_oid = InvalidOid;
+			typentry->hash_proc = InvalidOid;
+			typentry->hash_proc_finfo.fn_oid = InvalidOid;
+		}
+	}
+
+	if ((flags & (TYPECACHE_HASH_PROC | TYPECACHE_HASH_PROC_FINFO |
+				  TYPECACHE_HASH_OPFAMILY)) &&
+		typentry->hash_opf == InvalidOid)
+	{
+		Oid			opclass;
+
+		opclass = GetDefaultOpClass(type_id, HASH_AM_OID);
+		if (OidIsValid(opclass))
+		{
+			typentry->hash_opf = get_opclass_family(opclass);
+			typentry->hash_opintype = get_opclass_input_type(opclass);
 		}
 	}
 
@@ -223,6 +268,14 @@ lookup_type_cache(Oid type_id, int flags)
 												   typentry->hash_opintype,
 												   typentry->hash_opintype,
 												   HTEqualStrategyNumber);
+
+		/*
+		 * Reset info about hash function whenever we pick up new info about
+		 * equality operator.  This is so we can ensure that the hash function
+		 * matches the operator.
+		 */
+		typentry->hash_proc = InvalidOid;
+		typentry->hash_proc_finfo.fn_oid = InvalidOid;
 	}
 	if ((flags & TYPECACHE_LT_OPR) && typentry->lt_opr == InvalidOid)
 	{
@@ -249,6 +302,24 @@ lookup_type_cache(Oid type_id, int flags)
 												   typentry->btree_opintype,
 												   BTORDER_PROC);
 	}
+	if ((flags & (TYPECACHE_HASH_PROC | TYPECACHE_HASH_PROC_FINFO)) &&
+		typentry->hash_proc == InvalidOid)
+	{
+		/*
+		 * We insist that the eq_opr, if one has been determined, match the
+		 * hash opclass; else report there is no hash function.
+		 */
+		if (typentry->hash_opf != InvalidOid &&
+			(!OidIsValid(typentry->eq_opr) ||
+			 typentry->eq_opr == get_opfamily_member(typentry->hash_opf,
+													 typentry->hash_opintype,
+													 typentry->hash_opintype,
+													 HTEqualStrategyNumber)))
+			typentry->hash_proc = get_opfamily_proc(typentry->hash_opf,
+													typentry->hash_opintype,
+													typentry->hash_opintype,
+													HASHPROC);
+	}
 
 	/*
 	 * Set up fmgr lookup info as requested
@@ -273,6 +344,13 @@ lookup_type_cache(Oid type_id, int flags)
 		typentry->cmp_proc != InvalidOid)
 	{
 		fmgr_info_cxt(typentry->cmp_proc, &typentry->cmp_proc_finfo,
+					  CacheMemoryContext);
+	}
+	if ((flags & TYPECACHE_HASH_PROC_FINFO) &&
+		typentry->hash_proc_finfo.fn_oid == InvalidOid &&
+		typentry->hash_proc != InvalidOid)
+	{
+		fmgr_info_cxt(typentry->hash_proc, &typentry->hash_proc_finfo,
 					  CacheMemoryContext);
 	}
 
@@ -550,4 +628,301 @@ TypeCacheRelCallback(Datum arg, Oid relid)
 			typentry->tupDesc = NULL;
 		}
 	}
+}
+
+
+/*
+ * Check if given OID is part of the subset that's sortable by comparisons
+ */
+static inline bool
+enum_known_sorted(TypeCacheEnumData *enumdata, Oid arg)
+{
+	Oid			offset;
+
+	if (arg < enumdata->bitmap_base)
+		return false;
+	offset = arg - enumdata->bitmap_base;
+	if (offset > (Oid) INT_MAX)
+		return false;
+	return bms_is_member((int) offset, enumdata->sorted_values);
+}
+
+
+/*
+ * compare_values_of_enum
+ *		Compare two members of an enum type.
+ *		Return <0, 0, or >0 according as arg1 <, =, or > arg2.
+ *
+ * Note: currently, the enumData cache is refreshed only if we are asked
+ * to compare an enum value that is not already in the cache.  This is okay
+ * because there is no support for re-ordering existing values, so comparisons
+ * of previously cached values will return the right answer even if other
+ * values have been added since we last loaded the cache.
+ *
+ * Note: the enum logic has a special-case rule about even-numbered versus
+ * odd-numbered OIDs, but we take no account of that rule here; this
+ * routine shouldn't even get called when that rule applies.
+ */
+int
+compare_values_of_enum(TypeCacheEntry *tcache, Oid arg1, Oid arg2)
+{
+	TypeCacheEnumData *enumdata;
+	EnumItem   *item1;
+	EnumItem   *item2;
+
+	/*
+	 * Equal OIDs are certainly equal --- this case was probably handled
+	 * by our caller, but we may as well check.
+	 */
+	if (arg1 == arg2)
+		return 0;
+
+	/* Load up the cache if first time through */
+	if (tcache->enumData == NULL)
+		load_enum_cache_data(tcache);
+	enumdata = tcache->enumData;
+
+	/*
+	 * If both OIDs are known-sorted, we can just compare them directly.
+	 */
+	if (enum_known_sorted(enumdata, arg1) &&
+		enum_known_sorted(enumdata, arg2))
+	{
+		if (arg1 < arg2)
+			return -1;
+		else
+			return 1;
+	}
+
+	/*
+	 * Slow path: we have to identify their actual sort-order positions.
+	 */
+	item1 = find_enumitem(enumdata, arg1);
+	item2 = find_enumitem(enumdata, arg2);
+
+	if (item1 == NULL || item2 == NULL)
+	{
+		/*
+		 * We couldn't find one or both values.  That means the enum has
+		 * changed under us, so re-initialize the cache and try again.
+		 * We don't bother retrying the known-sorted case in this path.
+		 */
+		load_enum_cache_data(tcache);
+		enumdata = tcache->enumData;
+
+		item1 = find_enumitem(enumdata, arg1);
+		item2 = find_enumitem(enumdata, arg2);
+
+		/*
+		 * If we still can't find the values, complain: we must have
+		 * corrupt data.
+		 */
+		if (item1 == NULL)
+			elog(ERROR, "enum value %u not found in cache for enum %s",
+				 arg1, format_type_be(tcache->type_id));
+		if (item2 == NULL)
+			elog(ERROR, "enum value %u not found in cache for enum %s",
+				 arg2, format_type_be(tcache->type_id));
+	}
+
+	if (item1->sort_order < item2->sort_order)
+		return -1;
+	else if (item1->sort_order > item2->sort_order)
+		return 1;
+	else
+		return 0;
+}
+
+/*
+ * Load (or re-load) the enumData member of the typcache entry.
+ */
+static void
+load_enum_cache_data(TypeCacheEntry *tcache)
+{
+	TypeCacheEnumData *enumdata;
+	Relation	enum_rel;
+	SysScanDesc enum_scan;
+	HeapTuple	enum_tuple;
+	ScanKeyData skey;
+	EnumItem   *items;
+	int			numitems;
+	int			maxitems;
+	Oid			bitmap_base;
+	Bitmapset  *bitmap;
+	MemoryContext oldcxt;
+	int			bm_size,
+				start_pos;
+
+	/* Check that this is actually an enum */
+	if (tcache->typtype != TYPTYPE_ENUM)
+		ereport(ERROR,
+				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+				 errmsg("%s is not an enum",
+						format_type_be(tcache->type_id))));
+
+	/*
+	 * Read all the information for members of the enum type.  We collect
+	 * the info in working memory in the caller's context, and then transfer
+	 * it to permanent memory in CacheMemoryContext.  This minimizes the risk
+	 * of leaking memory from CacheMemoryContext in the event of an error
+	 * partway through.
+	 */
+	maxitems = 64;
+	items = (EnumItem *) palloc(sizeof(EnumItem) * maxitems);
+	numitems = 0;
+
+	/*
+	 * Scan pg_enum for the members of the target enum type.  We use a
+	 * current MVCC snapshot, *not* SnapshotNow, so that we see a consistent
+	 * set of rows even if someone commits a renumbering of the enum meanwhile.
+	 * See comments for RenumberEnumType in catalog/pg_enum.c for more info.
+	 */
+	ScanKeyInit(&skey,
+				Anum_pg_enum_enumtypid,
+				BTEqualStrategyNumber, F_OIDEQ,
+				ObjectIdGetDatum(tcache->type_id));
+
+	enum_rel = heap_open(EnumRelationId, AccessShareLock);
+	enum_scan = systable_beginscan(enum_rel,
+								   EnumTypIdLabelIndexId,
+								   true, GetTransactionSnapshot(),
+								   1, &skey);
+
+	while (HeapTupleIsValid(enum_tuple = systable_getnext(enum_scan)))
+	{
+		Form_pg_enum en = (Form_pg_enum) GETSTRUCT(enum_tuple);
+
+		if (numitems >= maxitems)
+		{
+			maxitems *= 2;
+			items = (EnumItem *) repalloc(items, sizeof(EnumItem) * maxitems);
+		}
+		items[numitems].enum_oid = HeapTupleGetOid(enum_tuple);
+		items[numitems].sort_order = en->enumsortorder;
+		numitems++;
+	}
+
+	systable_endscan(enum_scan);
+	heap_close(enum_rel, AccessShareLock);
+
+	/* Sort the items into OID order */
+	qsort(items, numitems, sizeof(EnumItem), enum_oid_cmp);
+
+	/*
+	 * Here, we create a bitmap listing a subset of the enum's OIDs that are
+	 * known to be in order and can thus be compared with just OID comparison.
+	 *
+	 * The point of this is that the enum's initial OIDs were certainly in
+	 * order, so there is some subset that can be compared via OID comparison;
+	 * and we'd rather not do binary searches unnecessarily.
+	 *
+	 * This is somewhat heuristic, and might identify a subset of OIDs that
+	 * isn't exactly what the type started with.  That's okay as long as
+	 * the subset is correctly sorted.
+	 */
+	bitmap_base = InvalidOid;
+	bitmap = NULL;
+	bm_size = 1;				/* only save sets of at least 2 OIDs */
+
+	for (start_pos = 0; start_pos < numitems - 1; start_pos++)
+	{
+		/*
+		 * Identify longest sorted subsequence starting at start_pos
+		 */
+		Bitmapset *this_bitmap = bms_make_singleton(0);
+		int		this_bm_size = 1;
+		Oid		start_oid = items[start_pos].enum_oid;
+		float4	prev_order = items[start_pos].sort_order;
+		int		i;
+
+		for (i = start_pos + 1; i < numitems; i++)
+		{
+			Oid		offset;
+
+			offset = items[i].enum_oid - start_oid;
+			/* quit if bitmap would be too large; cutoff is arbitrary */
+			if (offset >= 8192)
+				break;
+			/* include the item if it's in-order */
+			if (items[i].sort_order > prev_order)
+			{
+				prev_order = items[i].sort_order;
+				this_bitmap = bms_add_member(this_bitmap, (int) offset);
+				this_bm_size++;
+			}
+		}
+
+		/* Remember it if larger than previous best */
+		if (this_bm_size > bm_size)
+		{
+			bms_free(bitmap);
+			bitmap_base = start_oid;
+			bitmap = this_bitmap;
+			bm_size = this_bm_size;
+		}
+		else
+			bms_free(this_bitmap);
+
+		/*
+		 * Done if it's not possible to find a longer sequence in the rest
+		 * of the list.  In typical cases this will happen on the first
+		 * iteration, which is why we create the bitmaps on the fly instead
+		 * of doing a second pass over the list.
+		 */
+		if (bm_size >= (numitems - start_pos - 1))
+			break;
+	}
+
+	/* OK, copy the data into CacheMemoryContext */
+	oldcxt = MemoryContextSwitchTo(CacheMemoryContext);
+	enumdata = (TypeCacheEnumData *)
+		palloc(offsetof(TypeCacheEnumData, enum_values) +
+			   numitems * sizeof(EnumItem));
+	enumdata->bitmap_base = bitmap_base;
+	enumdata->sorted_values = bms_copy(bitmap);
+	enumdata->num_values = numitems;
+	memcpy(enumdata->enum_values, items, numitems * sizeof(EnumItem));
+	MemoryContextSwitchTo(oldcxt);
+
+	pfree(items);
+	bms_free(bitmap);
+
+	/* And link the finished cache struct into the typcache */
+	if (tcache->enumData != NULL)
+		pfree(tcache->enumData);
+	tcache->enumData = enumdata;
+}
+
+/*
+ * Locate the EnumItem with the given OID, if present
+ */
+static EnumItem *
+find_enumitem(TypeCacheEnumData *enumdata, Oid arg)
+{
+	EnumItem	srch;
+
+	/* On some versions of Solaris, bsearch of zero items dumps core */
+	if (enumdata->num_values <= 0)
+		return NULL;
+
+	srch.enum_oid = arg;
+	return bsearch(&srch, enumdata->enum_values, enumdata->num_values,
+				   sizeof(EnumItem), enum_oid_cmp);
+}
+
+/*
+ * qsort comparison function for OID-ordered EnumItems
+ */
+static int
+enum_oid_cmp(const void *left, const void *right)
+{
+	const EnumItem *l = (const EnumItem *) left;
+	const EnumItem *r = (const EnumItem *) right;
+
+	if (l->enum_oid < r->enum_oid)
+		return -1;
+	else if (l->enum_oid > r->enum_oid)
+		return 1;
+	else
+		return 0;
 }

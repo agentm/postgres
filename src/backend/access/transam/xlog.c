@@ -4,7 +4,7 @@
  *		PostgreSQL transaction log manager
  *
  *
- * Portions Copyright (c) 1996-2010, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2011, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/backend/access/transam/xlog.c
@@ -49,6 +49,7 @@
 #include "storage/latch.h"
 #include "storage/pmsignal.h"
 #include "storage/procarray.h"
+#include "storage/reinit.h"
 #include "storage/smgr.h"
 #include "storage/spin.h"
 #include "utils/builtins.h"
@@ -59,8 +60,6 @@
 
 
 /* File path names (all relative to $PGDATA) */
-#define BACKUP_LABEL_FILE		"backup_label"
-#define BACKUP_LABEL_OLD		"backup_label.old"
 #define RECOVERY_COMMAND_FILE	"recovery.conf"
 #define RECOVERY_COMMAND_DONE	"recovery.done"
 
@@ -68,7 +67,7 @@
 /* User-settable parameters */
 int			CheckPointSegments = 3;
 int			wal_keep_segments = 0;
-int			XLOGbuffers = 8;
+int			XLOGbuffers = -1;
 int			XLogArchiveTimeout = 0;
 bool		XLogArchiveMode = false;
 char	   *XLogArchiveCommand = NULL;
@@ -183,17 +182,20 @@ static char *recoveryEndCommand = NULL;
 static char *archiveCleanupCommand = NULL;
 static RecoveryTargetType recoveryTarget = RECOVERY_TARGET_UNSET;
 static bool recoveryTargetInclusive = true;
+static bool recoveryPauseAtTarget = true;
 static TransactionId recoveryTargetXid;
 static TimestampTz recoveryTargetTime;
+static char *recoveryTargetName;
 
 /* options taken from recovery.conf for XLOG streaming */
 static bool StandbyMode = false;
 static char *PrimaryConnInfo = NULL;
 static char *TriggerFile = NULL;
 
-/* if recoveryStopsHere returns true, it saves actual stop xid/time here */
+/* if recoveryStopsHere returns true, it saves actual stop xid/time/name here */
 static TransactionId recoveryStopXid;
 static TimestampTz recoveryStopTime;
+static char recoveryStopName[MAXFNAMELEN];
 static bool recoveryStopAfter;
 
 /*
@@ -338,6 +340,15 @@ typedef struct XLogCtlInsert
 	char	   *currpos;		/* current insertion point in cache */
 	XLogRecPtr	RedoRecPtr;		/* current redo point for insertions */
 	bool		forcePageWrites;	/* forcing full-page writes for PITR? */
+
+	/*
+	 * exclusiveBackup is true if a backup started with pg_start_backup() is
+	 * in progress, and nonExclusiveBackups is a counter indicating the number
+	 * of streaming base backups currently in progress. forcePageWrites is
+	 * set to true when either of these is non-zero.
+	 */
+	bool		exclusiveBackup;
+	int			nonExclusiveBackups;
 } XLogCtlInsert;
 
 /*
@@ -415,6 +426,8 @@ typedef struct XLogCtlData
 	XLogRecPtr	recoveryLastRecPtr;
 	/* timestamp of last COMMIT/ABORT record replayed (or being replayed) */
 	TimestampTz recoveryLastXTime;
+	/* Are we requested to pause recovery? */
+	bool		recoveryPause;
 
 	slock_t		info_lck;		/* locks shared variables shown above */
 } XLogCtlData;
@@ -540,6 +553,13 @@ typedef struct xl_parameter_change
 	int			wal_level;
 } xl_parameter_change;
 
+/* logs restore point */
+typedef struct xl_restore_point
+{
+	TimestampTz	rp_time;
+	char		rp_name[MAXFNAMELEN];
+} xl_restore_point;
+
 /*
  * Flags set by interrupt handlers for later service in the redo loop.
  */
@@ -562,6 +582,9 @@ static void readRecoveryCommandFile(void);
 static void exitArchiveRecovery(TimeLineID endTLI,
 					uint32 endLogId, uint32 endLogSeg);
 static bool recoveryStopsHere(XLogRecord *record, bool *includeThis);
+static void recoveryPausesHere(void);
+static bool RecoveryIsPaused(void);
+static void SetRecoveryPause(bool recoveryPause);
 static void SetLatestXTime(TimestampTz xtime);
 static TimestampTz GetLatestXTime(void);
 static void CheckRequiredParameterValues(void);
@@ -3087,10 +3110,10 @@ not_available:
  *
  * 'command' is the shell command to be executed, 'commandName' is a
  * human-readable name describing the command emitted in the logs. If
- * 'failonSignal' is true and the command is killed by a signal, a FATAL
+ * 'failOnSignal' is true and the command is killed by a signal, a FATAL
  * error is thrown. Otherwise a WARNING is emitted.
  *
- * This is currently used for restore_end_command and archive_cleanup_command.
+ * This is currently used for recovery_end_command and archive_cleanup_command.
  */
 static void
 ExecuteRecoveryCommand(char *command, char *commandName, bool failOnSignal)
@@ -3219,7 +3242,7 @@ PreallocXlogFiles(XLogRecPtr endptr)
 
 /*
  * Get the log/seg of the latest removed or recycled WAL segment.
- * Returns 0 if no WAL segments have been removed since startup.
+ * Returns 0/0 if no WAL segments have been removed since startup.
  */
 void
 XLogGetLastRemoved(uint32 *log, uint32 *seg)
@@ -3451,7 +3474,7 @@ ValidateXLOGDirectoryStructure(void)
 	{
 		ereport(LOG,
 				(errmsg("creating missing WAL directory \"%s\"", path)));
-		if (mkdir(path, 0700) < 0)
+		if (mkdir(path, S_IRWXU) < 0)
 			ereport(FATAL,
 					(errmsg("could not create missing directory \"%s\": %m",
 							path)));
@@ -4377,6 +4400,13 @@ writeTimeLineHistory(TimeLineID newTLI, TimeLineID parentTLI,
 				 xlogfname,
 				 recoveryStopAfter ? "after" : "before",
 				 timestamptz_to_str(recoveryStopTime));
+	else if (recoveryTarget == RECOVERY_TARGET_NAME)
+		snprintf(buffer, sizeof(buffer),
+				"%s%u\t%s\tat restore point \"%s\"\n",
+				 (srcfd < 0) ? "" : "\n",
+				 parentTLI,
+				 xlogfname,
+				 recoveryStopName);
 	else
 		snprintf(buffer, sizeof(buffer),
 				 "%s%u\t%s\tno recovery target specified\n",
@@ -4777,12 +4807,51 @@ GetSystemIdentifier(void)
 }
 
 /*
+ * Auto-tune the number of XLOG buffers.
+ *
+ * If the user-set value of wal_buffers is -1, we auto-tune to about 3% of
+ * shared_buffers, with a maximum of one XLOG segment and a minimum of 8
+ * blocks (8 was the default value prior to PostgreSQL 9.1, when auto-tuning
+ * was added).  We also clamp manually-set values to at least 4 blocks; prior
+ * to PostgreSQL 9.1, a minimum of 4 was enforced by guc.c, but since that
+ * is no longer possible, we just silently treat such values as a request for
+ * the minimum.
+ */
+static void
+XLOGTuneNumBuffers(void)
+{
+	int			xbuffers = XLOGbuffers;
+	char		buf[32];
+
+	if (xbuffers == -1)
+	{
+		xbuffers = NBuffers / 32;
+		if (xbuffers > XLOG_SEG_SIZE / XLOG_BLCKSZ)
+			xbuffers = XLOG_SEG_SIZE / XLOG_BLCKSZ;
+		if (xbuffers < 8)
+			xbuffers = 8;
+	}
+	else if (xbuffers < 4)
+		xbuffers = 4;
+
+	if (xbuffers != XLOGbuffers)
+	{
+		snprintf(buf, sizeof(buf), "%d", xbuffers);
+		SetConfigOption("wal_buffers", buf, PGC_POSTMASTER, PGC_S_OVERRIDE);
+	}
+}
+
+/*
  * Initialization of shared memory for XLOG
  */
 Size
 XLOGShmemSize(void)
 {
 	Size		size;
+
+	/* Figure out how many XLOG buffers we need. */
+	XLOGTuneNumBuffers();
+	Assert(XLOGbuffers > 0);
 
 	/* XLogCtl */
 	size = sizeof(XLogCtlData);
@@ -4900,9 +4969,15 @@ BootStrapXLOG(void)
 	page = (XLogPageHeader) TYPEALIGN(ALIGNOF_XLOG_BUFFER, buffer);
 	memset(page, 0, XLOG_BLCKSZ);
 
-	/* Set up information for the initial checkpoint record */
+	/*
+	 * Set up information for the initial checkpoint record
+	 *
+	 * The initial checkpoint record is written to the beginning of the
+	 * WAL segment with logid=0 logseg=1. The very first WAL segment, 0/0, is
+	 * not used, so that we can use 0/0 to mean "before any valid WAL segment".
+	 */
 	checkPoint.redo.xlogid = 0;
-	checkPoint.redo.xrecoff = SizeOfXLogLongPHD;
+	checkPoint.redo.xrecoff = XLogSegSize + SizeOfXLogLongPHD;
 	checkPoint.ThisTimeLineID = ThisTimeLineID;
 	checkPoint.nextXidEpoch = 0;
 	checkPoint.nextXid = FirstNormalTransactionId;
@@ -4925,7 +5000,7 @@ BootStrapXLOG(void)
 	page->xlp_info = XLP_LONG_HEADER;
 	page->xlp_tli = ThisTimeLineID;
 	page->xlp_pageaddr.xlogid = 0;
-	page->xlp_pageaddr.xrecoff = 0;
+	page->xlp_pageaddr.xrecoff = XLogSegSize;
 	longpage = (XLogLongPageHeader) page;
 	longpage->xlp_sysid = sysidentifier;
 	longpage->xlp_seg_size = XLogSegSize;
@@ -4951,7 +5026,7 @@ BootStrapXLOG(void)
 
 	/* Create first XLOG segment file */
 	use_existent = false;
-	openLogFile = XLogFileInit(0, 0, &use_existent, false);
+	openLogFile = XLogFileInit(0, 1, &use_existent, false);
 
 	/* Write the first page with the initial record */
 	errno = 0;
@@ -5018,115 +5093,20 @@ str_time(pg_time_t tnow)
 }
 
 /*
- * Parse one line from recovery.conf. 'cmdline' is the raw line from the
- * file. If the line is parsed successfully, returns true, false indicates
- * syntax error. On success, *key_p and *value_p are set to the parameter
- * name and value on the line, respectively. If the line is an empty line,
- * consisting entirely of whitespace and comments, function returns true
- * and *keyp_p and *value_p are set to NULL.
- *
- * The pointers returned in *key_p and *value_p point to an internal buffer
- * that is valid only until the next call of parseRecoveryCommandFile().
- */
-static bool
-parseRecoveryCommandFileLine(char *cmdline, char **key_p, char **value_p)
-{
-	char	   *ptr;
-	char	   *bufp;
-	char	   *key;
-	char	   *value;
-	static char *buf = NULL;
-
-	*key_p = *value_p = NULL;
-
-	/*
-	 * Allocate the buffer on first use. It's used to hold both the parameter
-	 * name and value.
-	 */
-	if (buf == NULL)
-		buf = malloc(MAXPGPATH + 1);
-	bufp = buf;
-
-	/* Skip any whitespace at the beginning of line */
-	for (ptr = cmdline; *ptr; ptr++)
-	{
-		if (!isspace((unsigned char) *ptr))
-			break;
-	}
-	/* Ignore empty lines */
-	if (*ptr == '\0' || *ptr == '#')
-		return true;
-
-	/* Read the parameter name */
-	key = bufp;
-	while (*ptr && !isspace((unsigned char) *ptr) &&
-		   *ptr != '=' && *ptr != '\'')
-		*(bufp++) = *(ptr++);
-	*(bufp++) = '\0';
-
-	/* Skip to the beginning quote of the parameter value */
-	ptr = strchr(ptr, '\'');
-	if (!ptr)
-		return false;
-	ptr++;
-
-	/* Read the parameter value to *bufp. Collapse any '' escapes as we go. */
-	value = bufp;
-	for (;;)
-	{
-		if (*ptr == '\'')
-		{
-			ptr++;
-			if (*ptr == '\'')
-				*(bufp++) = '\'';
-			else
-			{
-				/* end of parameter */
-				*bufp = '\0';
-				break;
-			}
-		}
-		else if (*ptr == '\0')
-			return false;		/* unterminated quoted string */
-		else
-			*(bufp++) = *ptr;
-
-		ptr++;
-	}
-	*(bufp++) = '\0';
-
-	/* Check that there's no garbage after the value */
-	while (*ptr)
-	{
-		if (*ptr == '#')
-			break;
-		if (!isspace((unsigned char) *ptr))
-			return false;
-		ptr++;
-	}
-
-	/* Success! */
-	*key_p = key;
-	*value_p = value;
-	return true;
-}
-
-/*
  * See if there is a recovery command file (recovery.conf), and if so
  * read in parameters for archive recovery and XLOG streaming.
  *
- * XXX longer term intention is to expand this to
- * cater for additional parameters and controls
- * possibly use a flex lexer similar to the GUC one
+ * The file is parsed using the main configuration parser.
  */
 static void
 readRecoveryCommandFile(void)
 {
 	FILE	   *fd;
-	char		cmdline[MAXPGPATH];
 	TimeLineID	rtli = 0;
 	bool		rtliGiven = false;
-	bool		syntaxError = false;
+	ConfigVariable *item,
+				   *head = NULL,
+				   *tail = NULL;
 
 	fd = AllocateFile(RECOVERY_COMMAND_FILE, "r");
 	if (fd == NULL)
@@ -5140,55 +5120,56 @@ readRecoveryCommandFile(void)
 	}
 
 	/*
-	 * Parse the file...
-	 */
-	while (fgets(cmdline, sizeof(cmdline), fd) != NULL)
+	 * Since we're asking ParseConfigFp() to error out at FATAL, there's no
+	 * need to check the return value.
+	 */ 
+	ParseConfigFp(fd, RECOVERY_COMMAND_FILE, 0, FATAL, &head, &tail);
+
+	for (item = head; item; item = item->next)
 	{
-		char	   *tok1;
-		char	   *tok2;
-
-		if (!parseRecoveryCommandFileLine(cmdline, &tok1, &tok2))
+		if (strcmp(item->name, "restore_command") == 0)
 		{
-			syntaxError = true;
-			break;
-		}
-		if (tok1 == NULL)
-			continue;
-
-		if (strcmp(tok1, "restore_command") == 0)
-		{
-			recoveryRestoreCommand = pstrdup(tok2);
+			recoveryRestoreCommand = pstrdup(item->value);
 			ereport(DEBUG2,
 					(errmsg("restore_command = '%s'",
 							recoveryRestoreCommand)));
 		}
-		else if (strcmp(tok1, "recovery_end_command") == 0)
+		else if (strcmp(item->name, "recovery_end_command") == 0)
 		{
-			recoveryEndCommand = pstrdup(tok2);
+			recoveryEndCommand = pstrdup(item->value);
 			ereport(DEBUG2,
 					(errmsg("recovery_end_command = '%s'",
 							recoveryEndCommand)));
 		}
-		else if (strcmp(tok1, "archive_cleanup_command") == 0)
+		else if (strcmp(item->name, "archive_cleanup_command") == 0)
 		{
-			archiveCleanupCommand = pstrdup(tok2);
+			archiveCleanupCommand = pstrdup(item->value);
 			ereport(DEBUG2,
 					(errmsg("archive_cleanup_command = '%s'",
 							archiveCleanupCommand)));
 		}
-		else if (strcmp(tok1, "recovery_target_timeline") == 0)
+		else if (strcmp(item->name, "pause_at_recovery_target") == 0)
+		{
+			if (!parse_bool(item->value, &recoveryPauseAtTarget))
+				ereport(ERROR,
+						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						 errmsg("parameter \"%s\" requires a Boolean value", "pause_at_recovery_target")));
+			ereport(DEBUG2,
+					(errmsg("pause_at_recovery_target = '%s'", item->value)));
+		}
+		else if (strcmp(item->name, "recovery_target_timeline") == 0)
 		{
 			rtliGiven = true;
-			if (strcmp(tok2, "latest") == 0)
+			if (strcmp(item->value, "latest") == 0)
 				rtli = 0;
 			else
 			{
 				errno = 0;
-				rtli = (TimeLineID) strtoul(tok2, NULL, 0);
+				rtli = (TimeLineID) strtoul(item->value, NULL, 0);
 				if (errno == EINVAL || errno == ERANGE)
 					ereport(FATAL,
 							(errmsg("recovery_target_timeline is not a valid number: \"%s\"",
-									tok2)));
+									item->value)));
 			}
 			if (rtli)
 				ereport(DEBUG2,
@@ -5197,26 +5178,27 @@ readRecoveryCommandFile(void)
 				ereport(DEBUG2,
 						(errmsg("recovery_target_timeline = latest")));
 		}
-		else if (strcmp(tok1, "recovery_target_xid") == 0)
+		else if (strcmp(item->name, "recovery_target_xid") == 0)
 		{
 			errno = 0;
-			recoveryTargetXid = (TransactionId) strtoul(tok2, NULL, 0);
+			recoveryTargetXid = (TransactionId) strtoul(item->value, NULL, 0);
 			if (errno == EINVAL || errno == ERANGE)
 				ereport(FATAL,
 				 (errmsg("recovery_target_xid is not a valid number: \"%s\"",
-						 tok2)));
+						 item->value)));
 			ereport(DEBUG2,
 					(errmsg("recovery_target_xid = %u",
 							recoveryTargetXid)));
 			recoveryTarget = RECOVERY_TARGET_XID;
 		}
-		else if (strcmp(tok1, "recovery_target_time") == 0)
+		else if (strcmp(item->name, "recovery_target_time") == 0)
 		{
 			/*
-			 * if recovery_target_xid specified, then this overrides
-			 * recovery_target_time
+			 * if recovery_target_xid or recovery_target_name specified, then
+			 * this overrides recovery_target_time
 			 */
-			if (recoveryTarget == RECOVERY_TARGET_XID)
+			if (recoveryTarget == RECOVERY_TARGET_XID ||
+					recoveryTarget == RECOVERY_TARGET_NAME)
 				continue;
 			recoveryTarget = RECOVERY_TARGET_TIME;
 
@@ -5225,44 +5207,64 @@ readRecoveryCommandFile(void)
 			 */
 			recoveryTargetTime =
 				DatumGetTimestampTz(DirectFunctionCall3(timestamptz_in,
-														CStringGetDatum(tok2),
+														CStringGetDatum(item->value),
 												ObjectIdGetDatum(InvalidOid),
 														Int32GetDatum(-1)));
 			ereport(DEBUG2,
 					(errmsg("recovery_target_time = '%s'",
 							timestamptz_to_str(recoveryTargetTime))));
 		}
-		else if (strcmp(tok1, "recovery_target_inclusive") == 0)
+		else if (strcmp(item->name, "recovery_target_name") == 0)
+		{
+			/*
+			 * if recovery_target_xid specified, then this overrides
+			 * recovery_target_name
+			 */
+			if (recoveryTarget == RECOVERY_TARGET_XID)
+				continue;
+			recoveryTarget = RECOVERY_TARGET_NAME;
+
+			recoveryTargetName = pstrdup(item->value);
+			if (strlen(recoveryTargetName) >= MAXFNAMELEN)
+				ereport(FATAL,
+						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						 errmsg("recovery_target_name is too long")));
+
+			ereport(DEBUG2,
+					(errmsg("recovery_target_name = '%s'",
+							recoveryTargetName)));
+		}
+		else if (strcmp(item->name, "recovery_target_inclusive") == 0)
 		{
 			/*
 			 * does nothing if a recovery_target is not also set
 			 */
-			if (!parse_bool(tok2, &recoveryTargetInclusive))
+			if (!parse_bool(item->value, &recoveryTargetInclusive))
 				ereport(ERROR,
 						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 						 errmsg("parameter \"%s\" requires a Boolean value", "recovery_target_inclusive")));
 			ereport(DEBUG2,
-					(errmsg("recovery_target_inclusive = %s", tok2)));
+					(errmsg("recovery_target_inclusive = %s", item->value)));
 		}
-		else if (strcmp(tok1, "standby_mode") == 0)
+		else if (strcmp(item->name, "standby_mode") == 0)
 		{
-			if (!parse_bool(tok2, &StandbyMode))
+			if (!parse_bool(item->value, &StandbyMode))
 				ereport(ERROR,
 						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 						 errmsg("parameter \"%s\" requires a Boolean value", "standby_mode")));
 			ereport(DEBUG2,
-					(errmsg("standby_mode = '%s'", tok2)));
+					(errmsg("standby_mode = '%s'", item->value)));
 		}
-		else if (strcmp(tok1, "primary_conninfo") == 0)
+		else if (strcmp(item->name, "primary_conninfo") == 0)
 		{
-			PrimaryConnInfo = pstrdup(tok2);
+			PrimaryConnInfo = pstrdup(item->value);
 			ereport(DEBUG2,
 					(errmsg("primary_conninfo = '%s'",
 							PrimaryConnInfo)));
 		}
-		else if (strcmp(tok1, "trigger_file") == 0)
+		else if (strcmp(item->name, "trigger_file") == 0)
 		{
-			TriggerFile = pstrdup(tok2);
+			TriggerFile = pstrdup(item->value);
 			ereport(DEBUG2,
 					(errmsg("trigger_file = '%s'",
 							TriggerFile)));
@@ -5270,16 +5272,8 @@ readRecoveryCommandFile(void)
 		else
 			ereport(FATAL,
 					(errmsg("unrecognized recovery parameter \"%s\"",
-							tok1)));
+							item->name)));
 	}
-
-	FreeFile(fd);
-
-	if (syntaxError)
-		ereport(FATAL,
-				(errmsg("syntax error in recovery command file: %s",
-						cmdline),
-			  errhint("Lines should have the format parameter = 'value'.")));
 
 	/*
 	 * Check for compulsory parameters
@@ -5326,6 +5320,9 @@ readRecoveryCommandFile(void)
 			recoveryTargetTLI = findNewestTimeLine(recoveryTargetTLI);
 		}
 	}
+
+	FreeConfigVariables(head);
+	FreeFile(fd);
 }
 
 /*
@@ -5451,8 +5448,8 @@ exitArchiveRecovery(TimeLineID endTLI, uint32 endLogId, uint32 endLogSeg)
  * Returns TRUE if we are stopping, FALSE otherwise.  On TRUE return,
  * *includeThis is set TRUE if we should apply this record before stopping.
  *
- * We also track the timestamp of the latest applied COMMIT/ABORT record
- * in XLogCtl->recoveryLastXTime, for logging purposes.
+ * We also track the timestamp of the latest applied COMMIT/ABORT/RESTORE POINT
+ * record in XLogCtl->recoveryLastXTime, for logging purposes.
  * Also, some information is saved in recoveryStopXid et al for use in
  * annotating the new timeline's history file.
  */
@@ -5462,9 +5459,10 @@ recoveryStopsHere(XLogRecord *record, bool *includeThis)
 	bool		stopsHere;
 	uint8		record_info;
 	TimestampTz recordXtime;
+	char		recordRPName[MAXFNAMELEN];
 
-	/* We only consider stopping at COMMIT or ABORT records */
-	if (record->xl_rmid != RM_XACT_ID)
+	/* We only consider stopping at COMMIT, ABORT or RESTORE POINT records */
+	if (record->xl_rmid != RM_XACT_ID && record->xl_rmid != RM_XLOG_ID)
 		return false;
 	record_info = record->xl_info & ~XLR_INFO_MASK;
 	if (record_info == XLOG_XACT_COMMIT)
@@ -5480,6 +5478,14 @@ recoveryStopsHere(XLogRecord *record, bool *includeThis)
 
 		recordXactAbortData = (xl_xact_abort *) XLogRecGetData(record);
 		recordXtime = recordXactAbortData->xact_time;
+	}
+	else if (record_info == XLOG_RESTORE_POINT)
+	{
+		xl_restore_point *recordRestorePointData;
+
+		recordRestorePointData = (xl_restore_point *) XLogRecGetData(record);
+		recordXtime = recordRestorePointData->rp_time;
+		strncpy(recordRPName, recordRestorePointData->rp_name, MAXFNAMELEN);
 	}
 	else
 		return false;
@@ -5505,6 +5511,20 @@ recoveryStopsHere(XLogRecord *record, bool *includeThis)
 		stopsHere = (record->xl_xid == recoveryTargetXid);
 		if (stopsHere)
 			*includeThis = recoveryTargetInclusive;
+	}
+	else if (recoveryTarget == RECOVERY_TARGET_NAME)
+	{
+		/*
+		 * there can be many restore points that share the same name, so we stop
+		 * at the first one
+		 */
+		stopsHere = (strcmp(recordRPName, recoveryTargetName) == 0);
+
+		/*
+		 * ignore recoveryTargetInclusive because this is not a transaction
+		 * record
+		 */
+		*includeThis = false;
 	}
 	else
 	{
@@ -5540,7 +5560,7 @@ recoveryStopsHere(XLogRecord *record, bool *includeThis)
 								recoveryStopXid,
 								timestamptz_to_str(recoveryStopTime))));
 		}
-		else
+		else if (record_info == XLOG_XACT_ABORT)
 		{
 			if (recoveryStopAfter)
 				ereport(LOG,
@@ -5553,6 +5573,15 @@ recoveryStopsHere(XLogRecord *record, bool *includeThis)
 								recoveryStopXid,
 								timestamptz_to_str(recoveryStopTime))));
 		}
+		else
+		{
+			strncpy(recoveryStopName, recordRPName, MAXFNAMELEN);
+
+			ereport(LOG,
+					(errmsg("recovery stopping at restore point \"%s\", time %s",
+								recoveryStopName,
+								timestamptz_to_str(recoveryStopTime))));
+		}
 
 		if (recoveryStopAfter)
 			SetLatestXTime(recordXtime);
@@ -5561,6 +5590,110 @@ recoveryStopsHere(XLogRecord *record, bool *includeThis)
 		SetLatestXTime(recordXtime);
 
 	return stopsHere;
+}
+
+/*
+ * Recheck shared recoveryPause by polling.
+ *
+ * XXX Can also be done with shared latch.
+ */
+static void
+recoveryPausesHere(void)
+{
+	while (RecoveryIsPaused());
+	{
+		pg_usleep(1000000L);		/* 1000 ms */
+		HandleStartupProcInterrupts();
+	};
+}
+
+static bool
+RecoveryIsPaused(void)
+{
+	/* use volatile pointer to prevent code rearrangement */
+	volatile XLogCtlData *xlogctl = XLogCtl;
+	bool recoveryPause;
+
+	SpinLockAcquire(&xlogctl->info_lck);
+	recoveryPause = xlogctl->recoveryPause;
+	SpinLockRelease(&xlogctl->info_lck);
+
+	return recoveryPause;
+}
+
+static void
+SetRecoveryPause(bool recoveryPause)
+{
+	/* use volatile pointer to prevent code rearrangement */
+	volatile XLogCtlData *xlogctl = XLogCtl;
+
+	SpinLockAcquire(&xlogctl->info_lck);
+	xlogctl->recoveryPause = recoveryPause;
+	SpinLockRelease(&xlogctl->info_lck);
+}
+
+/*
+ * pg_xlog_replay_pause - pause recovery now
+ */
+Datum
+pg_xlog_replay_pause(PG_FUNCTION_ARGS)
+{
+	if (!superuser())
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+			 (errmsg("must be superuser to control recovery"))));
+
+	if (!RecoveryInProgress())
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("recovery is not in progress"),
+				 errhint("Recovery control functions can only be executed during recovery.")));
+
+	SetRecoveryPause(true);
+
+	PG_RETURN_VOID();
+}
+
+/*
+ * pg_xlog_replay_resume - resume recovery now
+ */
+Datum
+pg_xlog_replay_resume(PG_FUNCTION_ARGS)
+{
+	if (!superuser())
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+			 (errmsg("must be superuser to control recovery"))));
+
+	if (!RecoveryInProgress())
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("recovery is not in progress"),
+				 errhint("Recovery control functions can only be executed during recovery.")));
+
+	SetRecoveryPause(false);
+
+	PG_RETURN_VOID();
+}
+
+/*
+ * pg_is_xlog_replay_paused
+ */
+Datum
+pg_is_xlog_replay_paused(PG_FUNCTION_ARGS)
+{
+	if (!superuser())
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+			 (errmsg("must be superuser to control recovery"))));
+
+	if (!RecoveryInProgress())
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("recovery is not in progress"),
+				 errhint("Recovery control functions can only be executed during recovery.")));
+
+	PG_RETURN_BOOL(RecoveryIsPaused());
 }
 
 /*
@@ -5596,6 +5729,24 @@ GetLatestXTime(void)
 	SpinLockRelease(&xlogctl->info_lck);
 
 	return xtime;
+}
+
+/*
+ * Returns timestamp of latest processed commit/abort record.
+ *
+ * When the server has been started normally without recovery the function
+ * returns NULL.
+ */
+Datum
+pg_last_xact_replay_timestamp(PG_FUNCTION_ARGS)
+{
+	TimestampTz	xtime;
+
+	xtime = GetLatestXTime();
+	if (xtime == 0)
+		PG_RETURN_NULL();
+
+	PG_RETURN_TIMESTAMPTZ(xtime);
 }
 
 /*
@@ -5818,6 +5969,10 @@ StartupXLOG(void)
 			ereport(LOG,
 					(errmsg("starting point-in-time recovery to %s",
 							timestamptz_to_str(recoveryTargetTime))));
+		else if (recoveryTarget == RECOVERY_TARGET_NAME)
+			ereport(LOG,
+					(errmsg("starting point-in-time recovery to \"%s\"",
+							recoveryTargetName)));
 		else
 			ereport(LOG,
 					(errmsg("starting archive recovery")));
@@ -5839,16 +5994,33 @@ StartupXLOG(void)
 		record = ReadCheckpointRecord(checkPointLoc, 0);
 		if (record != NULL)
 		{
+			memcpy(&checkPoint, XLogRecGetData(record), sizeof(CheckPoint));
+			wasShutdown = (record->xl_info == XLOG_CHECKPOINT_SHUTDOWN);
 			ereport(DEBUG1,
 					(errmsg("checkpoint record is at %X/%X",
 							checkPointLoc.xlogid, checkPointLoc.xrecoff)));
 			InRecovery = true;	/* force recovery even if SHUTDOWNED */
+
+			/*
+			 * Make sure that REDO location exists. This may not be
+			 * the case if there was a crash during an online backup,
+			 * which left a backup_label around that references a WAL
+			 * segment that's already been archived.
+			 */
+			if (XLByteLT(checkPoint.redo, checkPointLoc))
+			{
+				if (!ReadRecord(&(checkPoint.redo), LOG, false))
+					ereport(FATAL,
+							(errmsg("could not find redo location referenced by checkpoint record"),
+							 errhint("If you are not restoring from a backup, try removing the file \"%s/backup_label\".", DataDir)));
+			}
 		}
 		else
 		{
-			ereport(PANIC,
+			ereport(FATAL,
 					(errmsg("could not locate required checkpoint record"),
 					 errhint("If you are not restoring from a backup, try removing the file \"%s/backup_label\".", DataDir)));
+			wasShutdown = false; /* keep compiler quiet */
 		}
 		/* set flag to delete it later */
 		haveBackupLabel = true;
@@ -5892,11 +6064,11 @@ StartupXLOG(void)
 				ereport(PANIC,
 					 (errmsg("could not locate a valid checkpoint record")));
 		}
+		memcpy(&checkPoint, XLogRecGetData(record), sizeof(CheckPoint));
+		wasShutdown = (record->xl_info == XLOG_CHECKPOINT_SHUTDOWN);
 	}
 
 	LastRec = RecPtr = checkPointLoc;
-	memcpy(&checkPoint, XLogRecGetData(record), sizeof(CheckPoint));
-	wasShutdown = (record->xl_info == XLOG_CHECKPOINT_SHUTDOWN);
 
 	ereport(DEBUG1,
 			(errmsg("redo record is at %X/%X; shutdown %s",
@@ -6028,6 +6200,14 @@ StartupXLOG(void)
 		CheckRequiredParameterValues();
 
 		/*
+		 * We're in recovery, so unlogged relations relations may be trashed
+		 * and must be reset.  This should be done BEFORE allowing Hot
+		 * Standby connections, so that read-only backends don't try to
+		 * read whatever garbage is left over from before.
+		 */
+		ResetUnloggedRelations(UNLOGGED_RELATION_CLEANUP);
+
+		/*
 		 * Initialize for Hot Standby, if enabled. We won't let backends in
 		 * yet, not until we've reached the min recovery point specified in
 		 * control file and we've established a recovery snapshot from a
@@ -6053,8 +6233,6 @@ StartupXLOG(void)
 			StartupCLOG();
 			StartupSUBTRANS(oldestActiveXID);
 			StartupMultiXact();
-
-			ProcArrayInitRecoveryInfo(oldestActiveXID);
 
 			/*
 			 * If we're beginning at a shutdown checkpoint, we know that
@@ -6088,6 +6266,13 @@ StartupXLOG(void)
 				StandbyRecoverPreparedTransactions(false);
 			}
 		}
+		else
+		{
+			/*
+			 * Must not pause unless we are going to enter Hot Standby.
+			 */
+			recoveryPauseAtTarget = false;
+		}
 
 		/* Initialize resource managers */
 		for (rmid = 0; rmid <= RM_MAX_ID; rmid++)
@@ -6112,6 +6297,7 @@ StartupXLOG(void)
 		xlogctl->replayEndRecPtr = ReadRecPtr;
 		xlogctl->recoveryLastRecPtr = ReadRecPtr;
 		xlogctl->recoveryLastXTime = 0;
+		xlogctl->recoveryPause = false;
 		SpinLockRelease(&xlogctl->info_lck);
 
 		/* Also ensure XLogReceiptTime has a sane value */
@@ -6160,6 +6346,7 @@ StartupXLOG(void)
 		{
 			bool		recoveryContinue = true;
 			bool		recoveryApply = true;
+			bool		recoveryPause = false;
 			ErrorContextCallback errcontext;
 			TimestampTz xtime;
 
@@ -6206,6 +6393,11 @@ StartupXLOG(void)
 				 */
 				if (recoveryStopsHere(record, &recoveryApply))
 				{
+					if (recoveryPauseAtTarget)
+					{
+						SetRecoveryPause(true);
+						recoveryPausesHere();
+					}
 					reachedStopPoint = true;	/* see below */
 					recoveryContinue = false;
 					if (!recoveryApply)
@@ -6232,7 +6424,11 @@ StartupXLOG(void)
 				 */
 				SpinLockAcquire(&xlogctl->info_lck);
 				xlogctl->replayEndRecPtr = EndRecPtr;
+				recoveryPause = xlogctl->recoveryPause;
 				SpinLockRelease(&xlogctl->info_lck);
+
+				if (recoveryPause)
+					recoveryPausesHere();
 
 				/*
 				 * If we are attempting to enter Hot Standby mode, process
@@ -6481,6 +6677,14 @@ StartupXLOG(void)
 	 * Preallocate additional log files, if wanted.
 	 */
 	PreallocXlogFiles(EndOfLog);
+
+	/*
+	 * Reset initial contents of unlogged relations.  This has to be done
+	 * AFTER recovery is complete so that any unlogged relations created
+	 * during recovery also get picked up.
+	 */
+	if (InRecovery)
+		ResetUnloggedRelations(UNLOGGED_RELATION_INIT);
 
 	/*
 	 * Okay, we're officially UP.
@@ -7022,10 +7226,15 @@ LogCheckpointEnd(bool restartpoint)
 {
 	long		write_secs,
 				sync_secs,
-				total_secs;
+				total_secs,
+				longest_secs,
+				average_secs;
 	int			write_usecs,
 				sync_usecs,
-				total_usecs;
+				total_usecs,
+				longest_usecs,
+				average_usecs;
+	uint64		average_sync_time;
 
 	CheckpointStats.ckpt_end_t = GetCurrentTimestamp();
 
@@ -7041,18 +7250,27 @@ LogCheckpointEnd(bool restartpoint)
 						CheckpointStats.ckpt_sync_end_t,
 						&sync_secs, &sync_usecs);
 
+	/*
+	 * Timing values returned from CheckpointStats are in microseconds.
+	 * Convert to the second plus microsecond form that TimestampDifference
+	 * returns for homogeneous printing.
+	 */
+	longest_secs = (long) (CheckpointStats.ckpt_longest_sync / 1000000);
+	longest_usecs = CheckpointStats.ckpt_longest_sync -
+		(uint64) longest_secs * 1000000;
+
+	average_sync_time = 0;
+	if (CheckpointStats.ckpt_sync_rels > 0) 
+		average_sync_time = CheckpointStats.ckpt_agg_sync_time /
+			CheckpointStats.ckpt_sync_rels;
+	average_secs = (long) (average_sync_time / 1000000);
+	average_usecs = average_sync_time - (uint64) average_secs * 1000000;
+
 	if (restartpoint)
 		elog(LOG, "restartpoint complete: wrote %d buffers (%.1f%%); "
-			 "write=%ld.%03d s, sync=%ld.%03d s, total=%ld.%03d s",
-			 CheckpointStats.ckpt_bufs_written,
-			 (double) CheckpointStats.ckpt_bufs_written * 100 / NBuffers,
-			 write_secs, write_usecs / 1000,
-			 sync_secs, sync_usecs / 1000,
-			 total_secs, total_usecs / 1000);
-	else
-		elog(LOG, "checkpoint complete: wrote %d buffers (%.1f%%); "
 			 "%d transaction log file(s) added, %d removed, %d recycled; "
-			 "write=%ld.%03d s, sync=%ld.%03d s, total=%ld.%03d s",
+			 "write=%ld.%03d s, sync=%ld.%03d s, total=%ld.%03d s; "
+			 "sync files=%d, longest=%ld.%03d s, average=%ld.%03d s",
 			 CheckpointStats.ckpt_bufs_written,
 			 (double) CheckpointStats.ckpt_bufs_written * 100 / NBuffers,
 			 CheckpointStats.ckpt_segs_added,
@@ -7060,7 +7278,26 @@ LogCheckpointEnd(bool restartpoint)
 			 CheckpointStats.ckpt_segs_recycled,
 			 write_secs, write_usecs / 1000,
 			 sync_secs, sync_usecs / 1000,
-			 total_secs, total_usecs / 1000);
+			 total_secs, total_usecs / 1000,
+			 CheckpointStats.ckpt_sync_rels,
+			 longest_secs, longest_usecs / 1000,
+			 average_secs, average_usecs / 1000);
+	else
+		elog(LOG, "checkpoint complete: wrote %d buffers (%.1f%%); "
+			 "%d transaction log file(s) added, %d removed, %d recycled; "
+			 "write=%ld.%03d s, sync=%ld.%03d s, total=%ld.%03d s; "
+			 "sync files=%d, longest=%ld.%03d s, average=%ld.%03d s",
+			 CheckpointStats.ckpt_bufs_written,
+			 (double) CheckpointStats.ckpt_bufs_written * 100 / NBuffers,
+			 CheckpointStats.ckpt_segs_added,
+			 CheckpointStats.ckpt_segs_removed,
+			 CheckpointStats.ckpt_segs_recycled,
+			 write_secs, write_usecs / 1000,
+			 sync_secs, sync_usecs / 1000,
+			 total_secs, total_usecs / 1000,
+			 CheckpointStats.ckpt_sync_rels,
+			 longest_secs, longest_usecs / 1000,
+			 average_secs, average_usecs / 1000);
 }
 
 /*
@@ -7665,16 +7902,18 @@ CreateRestartPoint(int flags)
 	SpinLockRelease(&xlogctl->info_lck);
 	LWLockRelease(WALInsertLock);
 
-	if (log_checkpoints)
-	{
-		/*
-		 * Prepare to accumulate statistics.
-		 */
-		MemSet(&CheckpointStats, 0, sizeof(CheckpointStats));
-		CheckpointStats.ckpt_start_t = GetCurrentTimestamp();
+	/*
+	 * Prepare to accumulate statistics.
+	 *
+	 * Note: because it is possible for log_checkpoints to change while a
+	 * checkpoint proceeds, we always accumulate stats, even if
+	 * log_checkpoints is currently off.
+	 */
+	MemSet(&CheckpointStats, 0, sizeof(CheckpointStats));
+	CheckpointStats.ckpt_start_t = GetCurrentTimestamp();
 
+	if (log_checkpoints)
 		LogCheckpointStart(flags, true);
-	}
 
 	CheckPointGuts(lastCheckPoint.redo, flags);
 
@@ -7819,6 +8058,29 @@ RequestXLogSwitch(void)
 	rdata.next = NULL;
 
 	RecPtr = XLogInsert(RM_XLOG_ID, XLOG_SWITCH, &rdata);
+
+	return RecPtr;
+}
+
+/*
+ * Write a RESTORE POINT record
+ */
+XLogRecPtr
+XLogRestorePoint(const char *rpName)
+{
+	XLogRecPtr				RecPtr;
+	XLogRecData				rdata;
+	xl_restore_point		xlrec;
+
+	xlrec.rp_time = GetCurrentTimestamp();
+	strncpy(xlrec.rp_name, rpName, MAXFNAMELEN);
+
+	rdata.buffer = InvalidBuffer;
+	rdata.data = (char *) &xlrec;
+	rdata.len = sizeof(xl_restore_point);
+	rdata.next = NULL;
+
+	RecPtr = XLogInsert(RM_XLOG_ID, XLOG_RESTORE_POINT, &rdata);
 
 	return RecPtr;
 }
@@ -8015,6 +8277,10 @@ xlog_redo(XLogRecPtr lsn, XLogRecord *record)
 	{
 		/* nothing to do here */
 	}
+	else if (info == XLOG_RESTORE_POINT)
+	{
+		/* nothing to do here */
+	}
 	else if (info == XLOG_BACKUP_END)
 	{
 		XLogRecPtr	startpoint;
@@ -8116,6 +8382,13 @@ xlog_desc(StringInfo buf, uint8 xl_info, char *rec)
 	else if (info == XLOG_SWITCH)
 	{
 		appendStringInfo(buf, "xlog switch");
+	}
+	else if (info == XLOG_RESTORE_POINT)
+	{
+		xl_restore_point *xlrec = (xl_restore_point *) rec;
+
+		appendStringInfo(buf, "restore point: %s", xlrec->rp_name);
+
 	}
 	else if (info == XLOG_BACKUP_END)
 	{
@@ -8331,6 +8604,43 @@ pg_start_backup(PG_FUNCTION_ARGS)
 	text	   *backupid = PG_GETARG_TEXT_P(0);
 	bool		fast = PG_GETARG_BOOL(1);
 	char	   *backupidstr;
+	XLogRecPtr  startpoint;
+	char		startxlogstr[MAXFNAMELEN];
+
+	backupidstr = text_to_cstring(backupid);
+
+	startpoint = do_pg_start_backup(backupidstr, fast, NULL);
+
+	snprintf(startxlogstr, sizeof(startxlogstr), "%X/%X",
+			 startpoint.xlogid, startpoint.xrecoff);
+	PG_RETURN_TEXT_P(cstring_to_text(startxlogstr));
+}
+
+/*
+ * do_pg_start_backup is the workhorse of the user-visible pg_start_backup()
+ * function. It creates the necessary starting checkpoint and constructs the
+ * backup label file.
+ * 
+ * There are two kind of backups: exclusive and non-exclusive. An exclusive
+ * backup is started with pg_start_backup(), and there can be only one active
+ * at a time. The backup label file of an exclusive backup is written to
+ * $PGDATA/backup_label, and it is removed by pg_stop_backup().
+ *
+ * A non-exclusive backup is used for the streaming base backups (see
+ * src/backend/replication/basebackup.c). The difference to exclusive backups
+ * is that the backup label file is not written to disk. Instead, its would-be
+ * contents are returned in *labelfile, and the caller is responsible for
+ * including it in the backup archive as 'backup_label'. There can be many
+ * non-exclusive backups active at the same time, and they don't conflict
+ * with an exclusive backup either.
+ *
+ * Every successfully started non-exclusive backup must be stopped by calling
+ * do_pg_stop_backup() or do_pg_abort_backup().
+ */
+XLogRecPtr
+do_pg_start_backup(const char *backupidstr, bool fast, char **labelfile)
+{
+	bool		exclusive = (labelfile == NULL);
 	XLogRecPtr	checkpointloc;
 	XLogRecPtr	startpoint;
 	pg_time_t	stamp_time;
@@ -8340,11 +8650,12 @@ pg_start_backup(PG_FUNCTION_ARGS)
 	uint32		_logSeg;
 	struct stat stat_buf;
 	FILE	   *fp;
+	StringInfoData labelfbuf;
 
-	if (!superuser())
+	if (!superuser() && !is_authenticated_user_replication_role())
 		ereport(ERROR,
 				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
-				 errmsg("must be superuser to run a backup")));
+				 errmsg("must be superuser or replication role to run a backup")));
 
 	if (RecoveryInProgress())
 		ereport(ERROR,
@@ -8358,7 +8669,11 @@ pg_start_backup(PG_FUNCTION_ARGS)
 			  errmsg("WAL level not sufficient for making an online backup"),
 				 errhint("wal_level must be set to \"archive\" or \"hot_standby\" at server start.")));
 
-	backupidstr = text_to_cstring(backupid);
+	if (strlen(backupidstr) > MAXPGPATH)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("backup label too long (max %d bytes)",
+						MAXPGPATH)));
 
 	/*
 	 * Mark backup active in shared memory.  We must do full-page WAL writes
@@ -8378,14 +8693,20 @@ pg_start_backup(PG_FUNCTION_ARGS)
 	 * ensure adequate interlocking against XLogInsert().
 	 */
 	LWLockAcquire(WALInsertLock, LW_EXCLUSIVE);
-	if (XLogCtl->Insert.forcePageWrites)
+	if (exclusive)
 	{
-		LWLockRelease(WALInsertLock);
-		ereport(ERROR,
-				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-				 errmsg("a backup is already in progress"),
-				 errhint("Run pg_stop_backup() and try again.")));
+		if (XLogCtl->Insert.exclusiveBackup)
+		{
+			LWLockRelease(WALInsertLock);
+			ereport(ERROR,
+					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					 errmsg("a backup is already in progress"),
+					 errhint("Run pg_stop_backup() and try again.")));
+		}
+		XLogCtl->Insert.exclusiveBackup = true;
 	}
+	else
+		XLogCtl->Insert.nonExclusiveBackups++;
 	XLogCtl->Insert.forcePageWrites = true;
 	LWLockRelease(WALInsertLock);
 
@@ -8403,7 +8724,7 @@ pg_start_backup(PG_FUNCTION_ARGS)
 	RequestXLogSwitch();
 
 	/* Ensure we release forcePageWrites if fail below */
-	PG_ENSURE_ERROR_CLEANUP(pg_start_backup_callback, (Datum) 0);
+	PG_ENSURE_ERROR_CLEANUP(pg_start_backup_callback, (Datum) BoolGetDatum(exclusive));
 	{
 		/*
 		 * Force a CHECKPOINT.	Aside from being necessary to prevent torn
@@ -8430,70 +8751,98 @@ pg_start_backup(PG_FUNCTION_ARGS)
 		XLByteToSeg(startpoint, _logId, _logSeg);
 		XLogFileName(xlogfilename, ThisTimeLineID, _logId, _logSeg);
 
+		/*
+		 * Construct backup label file 
+		 */
+		initStringInfo(&labelfbuf);
+
 		/* Use the log timezone here, not the session timezone */
 		stamp_time = (pg_time_t) time(NULL);
 		pg_strftime(strfbuf, sizeof(strfbuf),
 					"%Y-%m-%d %H:%M:%S %Z",
 					pg_localtime(&stamp_time, log_timezone));
+		appendStringInfo(&labelfbuf, "START WAL LOCATION: %X/%X (file %s)\n",
+						 startpoint.xlogid, startpoint.xrecoff, xlogfilename);
+		appendStringInfo(&labelfbuf, "CHECKPOINT LOCATION: %X/%X\n",
+						 checkpointloc.xlogid, checkpointloc.xrecoff);
+		appendStringInfo(&labelfbuf, "START TIME: %s\n", strfbuf);
+		appendStringInfo(&labelfbuf, "LABEL: %s\n", backupidstr);
 
 		/*
-		 * Check for existing backup label --- implies a backup is already
-		 * running.  (XXX given that we checked forcePageWrites above, maybe
-		 * it would be OK to just unlink any such label file?)
+		 * Okay, write the file, or return its contents to caller.
 		 */
-		if (stat(BACKUP_LABEL_FILE, &stat_buf) != 0)
+		if (exclusive)
 		{
-			if (errno != ENOENT)
+			/*
+			 * Check for existing backup label --- implies a backup is already
+			 * running.  (XXX given that we checked exclusiveBackup above, maybe
+			 * it would be OK to just unlink any such label file?)
+			 */
+			if (stat(BACKUP_LABEL_FILE, &stat_buf) != 0)
+			{
+				if (errno != ENOENT)
+					ereport(ERROR,
+							(errcode_for_file_access(),
+							 errmsg("could not stat file \"%s\": %m",
+									BACKUP_LABEL_FILE)));
+			}
+			else
+				ereport(ERROR,
+						(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+						 errmsg("a backup is already in progress"),
+						 errhint("If you're sure there is no backup in progress, remove file \"%s\" and try again.",
+								 BACKUP_LABEL_FILE)));
+
+			fp = AllocateFile(BACKUP_LABEL_FILE, "w");
+
+			if (!fp)
 				ereport(ERROR,
 						(errcode_for_file_access(),
-						 errmsg("could not stat file \"%s\": %m",
+						 errmsg("could not create file \"%s\": %m",
 								BACKUP_LABEL_FILE)));
+			fwrite(labelfbuf.data, labelfbuf.len, 1, fp);
+			if (fflush(fp) || ferror(fp) || FreeFile(fp))
+				ereport(ERROR,
+						(errcode_for_file_access(),
+						 errmsg("could not write file \"%s\": %m",
+								BACKUP_LABEL_FILE)));
+			pfree(labelfbuf.data);
 		}
 		else
-			ereport(ERROR,
-					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-					 errmsg("a backup is already in progress"),
-					 errhint("If you're sure there is no backup in progress, remove file \"%s\" and try again.",
-							 BACKUP_LABEL_FILE)));
-
-		/*
-		 * Okay, write the file
-		 */
-		fp = AllocateFile(BACKUP_LABEL_FILE, "w");
-		if (!fp)
-			ereport(ERROR,
-					(errcode_for_file_access(),
-					 errmsg("could not create file \"%s\": %m",
-							BACKUP_LABEL_FILE)));
-		fprintf(fp, "START WAL LOCATION: %X/%X (file %s)\n",
-				startpoint.xlogid, startpoint.xrecoff, xlogfilename);
-		fprintf(fp, "CHECKPOINT LOCATION: %X/%X\n",
-				checkpointloc.xlogid, checkpointloc.xrecoff);
-		fprintf(fp, "START TIME: %s\n", strfbuf);
-		fprintf(fp, "LABEL: %s\n", backupidstr);
-		if (fflush(fp) || ferror(fp) || FreeFile(fp))
-			ereport(ERROR,
-					(errcode_for_file_access(),
-					 errmsg("could not write file \"%s\": %m",
-							BACKUP_LABEL_FILE)));
+			*labelfile = labelfbuf.data;
 	}
-	PG_END_ENSURE_ERROR_CLEANUP(pg_start_backup_callback, (Datum) 0);
+	PG_END_ENSURE_ERROR_CLEANUP(pg_start_backup_callback, (Datum) BoolGetDatum(exclusive));
 
 	/*
 	 * We're done.  As a convenience, return the starting WAL location.
 	 */
-	snprintf(xlogfilename, sizeof(xlogfilename), "%X/%X",
-			 startpoint.xlogid, startpoint.xrecoff);
-	PG_RETURN_TEXT_P(cstring_to_text(xlogfilename));
+	return startpoint;
 }
 
 /* Error cleanup callback for pg_start_backup */
 static void
 pg_start_backup_callback(int code, Datum arg)
 {
-	/* Turn off forcePageWrites on failure */
+	bool exclusive = DatumGetBool(arg);
+
+	/* Update backup counters and forcePageWrites on failure */
 	LWLockAcquire(WALInsertLock, LW_EXCLUSIVE);
-	XLogCtl->Insert.forcePageWrites = false;
+	if (exclusive)
+	{
+		Assert(XLogCtl->Insert.exclusiveBackup);
+		XLogCtl->Insert.exclusiveBackup = false;
+	}
+	else
+	{
+		Assert(XLogCtl->Insert.nonExclusiveBackups > 0);
+		XLogCtl->Insert.nonExclusiveBackups--;
+	}
+
+	if (!XLogCtl->Insert.exclusiveBackup &&
+		XLogCtl->Insert.nonExclusiveBackups == 0)
+	{
+		XLogCtl->Insert.forcePageWrites = false;
+	}
 	LWLockRelease(WALInsertLock);
 }
 
@@ -8513,6 +8862,27 @@ pg_start_backup_callback(int code, Datum arg)
 Datum
 pg_stop_backup(PG_FUNCTION_ARGS)
 {
+	XLogRecPtr	stoppoint;
+	char		stopxlogstr[MAXFNAMELEN];
+
+	stoppoint = do_pg_stop_backup(NULL, true);
+
+	snprintf(stopxlogstr, sizeof(stopxlogstr), "%X/%X",
+			 stoppoint.xlogid, stoppoint.xrecoff);
+	PG_RETURN_TEXT_P(cstring_to_text(stopxlogstr));
+}
+
+/*
+ * do_pg_stop_backup is the workhorse of the user-visible pg_stop_backup()
+ * function.
+
+ * If labelfile is NULL, this stops an exclusive backup. Otherwise this stops
+ * the non-exclusive backup specified by 'labelfile'.
+ */
+XLogRecPtr
+do_pg_stop_backup(char *labelfile, bool waitforarchive)
+{
+	bool		exclusive = (labelfile == NULL);
 	XLogRecPtr	startpoint;
 	XLogRecPtr	stoppoint;
 	XLogRecData rdata;
@@ -8528,15 +8898,15 @@ pg_stop_backup(PG_FUNCTION_ARGS)
 	FILE	   *lfp;
 	FILE	   *fp;
 	char		ch;
-	int			ich;
 	int			seconds_before_warning;
 	int			waits = 0;
 	bool		reported_waiting = false;
+	char	   *remaining;
 
-	if (!superuser())
+	if (!superuser() && !is_authenticated_user_replication_role())
 		ereport(ERROR,
 				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
-				 (errmsg("must be superuser to run a backup"))));
+				 (errmsg("must be superuser or replication role to run a backup"))));
 
 	if (RecoveryInProgress())
 		ereport(ERROR,
@@ -8551,38 +8921,88 @@ pg_stop_backup(PG_FUNCTION_ARGS)
 				 errhint("wal_level must be set to \"archive\" or \"hot_standby\" at server start.")));
 
 	/*
-	 * OK to clear forcePageWrites
+	 * OK to update backup counters and forcePageWrites
 	 */
 	LWLockAcquire(WALInsertLock, LW_EXCLUSIVE);
-	XLogCtl->Insert.forcePageWrites = false;
+	if (exclusive)
+		XLogCtl->Insert.exclusiveBackup = false;
+	else
+	{
+		/*
+		 * The user-visible pg_start/stop_backup() functions that operate on
+		 * exclusive backups can be called at any time, but for non-exclusive
+		 * backups, it is expected that each do_pg_start_backup() call is
+		 * matched by exactly one do_pg_stop_backup() call.
+		 */
+		Assert(XLogCtl->Insert.nonExclusiveBackups > 0);
+		XLogCtl->Insert.nonExclusiveBackups--;
+	}
+
+	if (!XLogCtl->Insert.exclusiveBackup &&
+		XLogCtl->Insert.nonExclusiveBackups == 0)
+	{
+		XLogCtl->Insert.forcePageWrites = false;
+	}
 	LWLockRelease(WALInsertLock);
 
-	/*
-	 * Open the existing label file
-	 */
-	lfp = AllocateFile(BACKUP_LABEL_FILE, "r");
-	if (!lfp)
+	if (exclusive)
 	{
-		if (errno != ENOENT)
+		/*
+		 * Read the existing label file into memory.
+		 */
+		struct	stat statbuf;
+		int		r;
+
+		if (stat(BACKUP_LABEL_FILE, &statbuf))
+		{
+			if (errno != ENOENT)
+				ereport(ERROR,
+						(errcode_for_file_access(),
+						 errmsg("could not stat file \"%s\": %m",
+								BACKUP_LABEL_FILE)));
+			ereport(ERROR,
+					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					 errmsg("a backup is not in progress")));
+		}
+
+		lfp = AllocateFile(BACKUP_LABEL_FILE, "r");
+		if (!lfp)
+		{
 			ereport(ERROR,
 					(errcode_for_file_access(),
 					 errmsg("could not read file \"%s\": %m",
 							BACKUP_LABEL_FILE)));
-		ereport(ERROR,
-				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-				 errmsg("a backup is not in progress")));
+		}
+		labelfile = palloc(statbuf.st_size + 1);
+		r = fread(labelfile, statbuf.st_size, 1, lfp);
+		labelfile[statbuf.st_size] = '\0';
+
+		/*
+		 * Close and remove the backup label file
+		 */
+		if (r != 1 || ferror(lfp) || FreeFile(lfp))
+			ereport(ERROR,
+					(errcode_for_file_access(),
+					 errmsg("could not read file \"%s\": %m",
+							BACKUP_LABEL_FILE)));
+		if (unlink(BACKUP_LABEL_FILE) != 0)
+			ereport(ERROR,
+					(errcode_for_file_access(),
+					 errmsg("could not remove file \"%s\": %m",
+							BACKUP_LABEL_FILE)));
 	}
 
 	/*
 	 * Read and parse the START WAL LOCATION line (this code is pretty crude,
 	 * but we are not expecting any variability in the file format).
 	 */
-	if (fscanf(lfp, "START WAL LOCATION: %X/%X (file %24s)%c",
+	if (sscanf(labelfile, "START WAL LOCATION: %X/%X (file %24s)%c",
 			   &startpoint.xlogid, &startpoint.xrecoff, startxlogfilename,
 			   &ch) != 4 || ch != '\n')
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 				 errmsg("invalid data in file \"%s\"", BACKUP_LABEL_FILE)));
+	remaining = strchr(labelfile, '\n') + 1; /* %n is not portable enough */
 
 	/*
 	 * Write the backup-end xlog record
@@ -8625,28 +9045,13 @@ pg_stop_backup(PG_FUNCTION_ARGS)
 	fprintf(fp, "STOP WAL LOCATION: %X/%X (file %s)\n",
 			stoppoint.xlogid, stoppoint.xrecoff, stopxlogfilename);
 	/* transfer remaining lines from label to history file */
-	while ((ich = fgetc(lfp)) != EOF)
-		fputc(ich, fp);
+	fprintf(fp, "%s", remaining);
 	fprintf(fp, "STOP TIME: %s\n", strfbuf);
 	if (fflush(fp) || ferror(fp) || FreeFile(fp))
 		ereport(ERROR,
 				(errcode_for_file_access(),
 				 errmsg("could not write file \"%s\": %m",
 						histfilepath)));
-
-	/*
-	 * Close and remove the backup label file
-	 */
-	if (ferror(lfp) || FreeFile(lfp))
-		ereport(ERROR,
-				(errcode_for_file_access(),
-				 errmsg("could not read file \"%s\": %m",
-						BACKUP_LABEL_FILE)));
-	if (unlink(BACKUP_LABEL_FILE) != 0)
-		ereport(ERROR,
-				(errcode_for_file_access(),
-				 errmsg("could not remove file \"%s\": %m",
-						BACKUP_LABEL_FILE)));
 
 	/*
 	 * Clean out any no-longer-needed history files.  As a side effect, this
@@ -8674,7 +9079,7 @@ pg_stop_backup(PG_FUNCTION_ARGS)
 	 * wish to wait, you can set statement_timeout.  Also, some notices are
 	 * issued to clue in anyone who might be doing this interactively.
 	 */
-	if (XLogArchivingActive())
+	if (waitforarchive && XLogArchivingActive())
 	{
 		XLByteToPrevSeg(stoppoint, _logId, _logSeg);
 		XLogFileName(lastxlogfilename, ThisTimeLineID, _logId, _logSeg);
@@ -8715,16 +9120,41 @@ pg_stop_backup(PG_FUNCTION_ARGS)
 		ereport(NOTICE,
 				(errmsg("pg_stop_backup complete, all required WAL segments have been archived")));
 	}
-	else
+	else if (waitforarchive)
 		ereport(NOTICE,
 				(errmsg("WAL archiving is not enabled; you must ensure that all required WAL segments are copied through other means to complete the backup")));
 
 	/*
 	 * We're done.  As a convenience, return the ending WAL location.
 	 */
-	snprintf(stopxlogfilename, sizeof(stopxlogfilename), "%X/%X",
-			 stoppoint.xlogid, stoppoint.xrecoff);
-	PG_RETURN_TEXT_P(cstring_to_text(stopxlogfilename));
+	return stoppoint;
+}
+
+
+/*
+ * do_pg_abort_backup: abort a running backup
+ *
+ * This does just the most basic steps of do_pg_stop_backup(), by taking the
+ * system out of backup mode, thus making it a lot more safe to call from
+ * an error handler.
+ *
+ * NB: This is only for aborting a non-exclusive backup that doesn't write
+ * backup_label. A backup started with pg_stop_backup() needs to be finished
+ * with pg_stop_backup().
+ */
+void
+do_pg_abort_backup(void)
+{
+	LWLockAcquire(WALInsertLock, LW_EXCLUSIVE);
+	Assert(XLogCtl->Insert.nonExclusiveBackups > 0);
+	XLogCtl->Insert.nonExclusiveBackups--;
+
+	if (!XLogCtl->Insert.exclusiveBackup &&
+		XLogCtl->Insert.nonExclusiveBackups == 0)
+	{
+		XLogCtl->Insert.forcePageWrites = false;
+	}
+	LWLockRelease(WALInsertLock);
 }
 
 /*
@@ -8754,6 +9184,51 @@ pg_switch_xlog(PG_FUNCTION_ARGS)
 	 */
 	snprintf(location, sizeof(location), "%X/%X",
 			 switchpoint.xlogid, switchpoint.xrecoff);
+	PG_RETURN_TEXT_P(cstring_to_text(location));
+}
+
+/*
+ * pg_create_restore_point: a named point for restore
+ */
+Datum
+pg_create_restore_point(PG_FUNCTION_ARGS)
+{
+	text		*restore_name = PG_GETARG_TEXT_P(0);
+	char		*restore_name_str;
+	XLogRecPtr	restorepoint;
+	char		location[MAXFNAMELEN];
+
+	if (!superuser())
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 (errmsg("must be superuser to create a restore point"))));
+
+	if (RecoveryInProgress())
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 (errmsg("recovery is in progress"),
+				  errhint("WAL control functions cannot be executed during recovery."))));
+
+	if (!XLogIsNeeded())
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+			  errmsg("WAL level not sufficient for creating a restore point"),
+				 errhint("wal_level must be set to \"archive\" or \"hot_standby\" at server start.")));
+
+	restore_name_str = text_to_cstring(restore_name);
+
+	if (strlen(restore_name_str) >= MAXFNAMELEN)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("value too long for restore point")));
+
+	restorepoint = XLogRestorePoint(restore_name_str);
+
+	/*
+	 * As a convenience, return the WAL location of the restore point record
+	 */
+	snprintf(location, sizeof(location), "%X/%X",
+			restorepoint.xlogid, restorepoint.xrecoff);
 	PG_RETURN_TEXT_P(cstring_to_text(location));
 }
 
@@ -8843,6 +9318,25 @@ pg_last_xlog_receive_location(PG_FUNCTION_ARGS)
 }
 
 /*
+ * Get latest redo apply position.
+ *
+ * Exported to allow WALReceiver to read the pointer directly.
+ */
+XLogRecPtr
+GetXLogReplayRecPtr(void)
+{
+	/* use volatile pointer to prevent code rearrangement */
+	volatile XLogCtlData *xlogctl = XLogCtl;
+	XLogRecPtr	recptr;
+
+	SpinLockAcquire(&xlogctl->info_lck);
+	recptr = xlogctl->recoveryLastRecPtr;
+	SpinLockRelease(&xlogctl->info_lck);
+
+	return recptr;
+}
+
+/*
  * Report the last WAL replay location (same format as pg_start_backup etc)
  *
  * This is useful for determining how much of WAL is visible to read-only
@@ -8851,14 +9345,10 @@ pg_last_xlog_receive_location(PG_FUNCTION_ARGS)
 Datum
 pg_last_xlog_replay_location(PG_FUNCTION_ARGS)
 {
-	/* use volatile pointer to prevent code rearrangement */
-	volatile XLogCtlData *xlogctl = XLogCtl;
 	XLogRecPtr	recptr;
 	char		location[MAXFNAMELEN];
 
-	SpinLockAcquire(&xlogctl->info_lck);
-	recptr = xlogctl->recoveryLastRecPtr;
-	SpinLockRelease(&xlogctl->info_lck);
+	recptr = GetXLogReplayRecPtr();
 
 	if (recptr.xlogid == 0 && recptr.xrecoff == 0)
 		PG_RETURN_NULL();
@@ -9433,7 +9923,7 @@ retry:
 					 * five seconds like in the WAL file polling case below.
 					 */
 					if (CheckForStandbyTrigger())
-						goto triggered;
+						goto retry;
 
 					/*
 					 * Wait for more WAL to arrive, or timeout to be reached
@@ -9700,6 +10190,10 @@ static bool
 CheckForStandbyTrigger(void)
 {
 	struct stat stat_buf;
+	static bool	triggered = false;
+
+	if (triggered)
+		return true;
 
 	if (TriggerFile == NULL)
 		return false;
@@ -9710,6 +10204,7 @@ CheckForStandbyTrigger(void)
 				(errmsg("trigger file found: %s", TriggerFile)));
 		ShutdownWalRcv();
 		unlink(TriggerFile);
+		triggered = true;
 		return true;
 	}
 	return false;

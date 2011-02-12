@@ -4,7 +4,7 @@
  *	  prototypes for tablecmds.c.
  *
  *
- * Portions Copyright (c) 1996-2010, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2011, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/commands/tablecmds.h
@@ -42,11 +42,7 @@ extern void CheckTableNotInUse(Relation rel, const char *stmt);
 
 extern void ExecuteTruncate(TruncateStmt *stmt);
 
-extern void renameatt(Oid myrelid,
-		  const char *oldattname,
-		  const char *newattname,
-		  bool recurse,
-		  int expected_parents);
+extern void renameatt(Oid myrelid, RenameStmt *stmt);
 
 extern void RenameRelation(Oid myrelid,
 			   const char *newrelname,
@@ -57,7 +53,7 @@ extern void RenameRelationInternal(Oid myrelid,
 					   Oid namespaceId);
 
 extern void find_composite_type_dependencies(Oid typeOid,
-								 const char *origTblName,
+								 Relation origRelation,
 								 const char *origTypeName);
 
 extern AttrNumber *varattnos_map(TupleDesc olddesc, TupleDesc newdesc);

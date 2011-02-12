@@ -31,7 +31,7 @@
 
   <sect1 id="archive-recovery-settings">
 
-    <title>Archive recovery settings</title>
+    <title>Archive Recovery Settings</title>
      <variablelist>
 
      <varlistentry id="restore-command" xreflabel="restore_command">
@@ -92,9 +92,8 @@ restore_command = 'copy "C:\\server\\archivedir\\%f" "%p"'  # Windows
         may be safely removed.
         This information can be used to truncate the archive to just the
         minimum required to support restart from the current restore.
-        The <application>pg_archivecleanup</> utility provided in
-        <literal>contrib</> (see <xref linkend="pgarchivecleanup">) serves as a
-        convenient target for <varname>archive_cleanup_command</> in typical
+        The <xref linkend="pgarchivecleanup"> module
+        is often used in <varname>archive_cleanup_command</> for
         single-standby configurations, for example:
 <programlisting> archive_cleanup_command = 'pg_archivecleanup /mnt/server/archivedir %r' </programlisting>
         Note however that if multiple standby servers are restoring from the
@@ -141,8 +140,27 @@ restore_command = 'copy "C:\\server\\archivedir\\%f" "%p"'  # Windows
 
   <sect1 id="recovery-target-settings">
 
-    <title>Recovery target settings</title>
+    <title>Recovery Target Settings</title>
      <variablelist>
+
+     <varlistentry id="recovery-target-name" xreflabel="recovery_target_name">
+      <term><varname>recovery_target_name</varname>
+           (<type>string</type>)
+      </term>
+      <indexterm>
+        <primary><varname>recovery_target_name</> recovery parameter</primary>
+      </indexterm>
+      <listitem>
+       <para>
+        This parameter specifies the named restore point, created with
+        <function>pg_create_restore_point()</> to which recovery will proceed.
+        At most one of <varname>recovery_target_name</>,
+        <xref linkend="recovery-target-time"> or
+        <xref linkend="recovery-target-xid"> can be specified.  The default is to
+        recover to the end of the WAL log.
+       </para>
+      </listitem>
+     </varlistentry>
 
      <varlistentry id="recovery-target-time" xreflabel="recovery_target_time">
       <term><varname>recovery_target_time</varname>
@@ -155,7 +173,8 @@ restore_command = 'copy "C:\\server\\archivedir\\%f" "%p"'  # Windows
        <para>
         This parameter specifies the time stamp up to which recovery
         will proceed.
-        At most one of <varname>recovery_target_time</> and
+        At most one of <varname>recovery_target_time</>,
+        <xref linkend="recovery-target-name"> or
         <xref linkend="recovery-target-xid"> can be specified.
         The default is to recover to the end of the WAL log.
         The precise stopping point is also influenced by
@@ -177,7 +196,8 @@ restore_command = 'copy "C:\\server\\archivedir\\%f" "%p"'  # Windows
         start, transactions can complete in a different numeric order.
         The transactions that will be recovered are those that committed
         before (and optionally including) the specified one.
-        At most one of <varname>recovery_target_xid</> and
+        At most one of <varname>recovery_target_xid</>,
+        <xref linkend="recovery-target-name"> or
         <xref linkend="recovery-target-time"> can be specified.
         The default is to recover to the end of the WAL log.
         The precise stopping point is also influenced by
@@ -228,12 +248,37 @@ restore_command = 'copy "C:\\server\\archivedir\\%f" "%p"'  # Windows
       </listitem>
      </varlistentry>
 
+     <varlistentry id="pause-at-recovery-target"
+                   xreflabel="pause_at_recovery_target">
+      <term><varname>pause_at_recovery_target</varname>
+        (<type>boolean</type>)
+      </term>
+      <indexterm>
+        <primary><varname>pause_at_recovery_target</> recovery parameter</primary>
+      </indexterm>
+      <listitem>
+       <para>
+        Specifies whether recovery should pause when the recovery target
+        is reached. The default is true, if a recovery target is set.
+        This is intended to allow queries to be executed against the
+        database to check if this recovery target is the most desirable
+        point for recovery. The paused state can be resumed by using
+        <function>pg_xlog_replay_resume()</> (See
+        <xref linkend="functions-recovery-control-table">), which then
+        causes recovery to end. If this recovery target is not the
+        desired stopping point, then shutdown the server, change the
+        recovery target settings to a later target and restart to
+        continue recovery.
+       </para>
+      </listitem>
+     </varlistentry>
+
      </variablelist>
    </sect1>
 
   <sect1 id="standby-settings">
 
-    <title>Standby server settings</title>
+    <title>Standby Server Settings</title>
      <variablelist>
 
        <varlistentry id="standby-mode" xreflabel="standby_mode">

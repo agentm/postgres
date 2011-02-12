@@ -3,7 +3,7 @@
  * md.c
  *	  This code manages relations that reside on magnetic disk.
  *
- * Portions Copyright (c) 1996-2010, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2011, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -20,6 +20,7 @@
 
 #include "catalog/catalog.h"
 #include "miscadmin.h"
+#include "portability/instr_time.h"
 #include "postmaster/bgwriter.h"
 #include "storage/fd.h"
 #include "storage/bufmgr.h"
@@ -33,7 +34,13 @@
 /* interval for calling AbsorbFsyncRequests in mdsync */
 #define FSYNCS_PER_ABSORB		10
 
-/* special values for the segno arg to RememberFsyncRequest */
+/*
+ * Special values for the segno arg to RememberFsyncRequest.
+ *
+ * Note that CompactBgwriterRequestQueue assumes that it's OK to remove an
+ * fsync request from the queue if an identical, subsequent request is found.
+ * See comments there before making changes here.
+ */
 #define FORGET_RELATION_FSYNC	(InvalidBlockNumber)
 #define FORGET_DATABASE_FSYNC	(InvalidBlockNumber-1)
 #define UNLINK_RELATION_REQUEST (InvalidBlockNumber-2)
@@ -927,6 +934,15 @@ mdsync(void)
 	PendingOperationEntry *entry;
 	int			absorb_counter;
 
+	/* Statistics on sync times */
+	int			processed = 0;
+	instr_time	sync_start,
+				sync_end,
+				sync_diff; 
+	uint64		elapsed;
+	uint64		longest = 0;
+	uint64		total_elapsed = 0;
+
 	/*
 	 * This is only called during checkpoints, and checkpoints should only
 	 * occur in processes that have created a pendingOpsTable.
@@ -1069,9 +1085,31 @@ mdsync(void)
 				seg = _mdfd_getseg(reln, entry->tag.forknum,
 							  entry->tag.segno * ((BlockNumber) RELSEG_SIZE),
 								   false, EXTENSION_RETURN_NULL);
+
+				if (log_checkpoints)
+					INSTR_TIME_SET_CURRENT(sync_start);
+				else
+					INSTR_TIME_SET_ZERO(sync_start);
+
 				if (seg != NULL &&
 					FileSync(seg->mdfd_vfd) >= 0)
+				{
+					if (log_checkpoints && (! INSTR_TIME_IS_ZERO(sync_start)))
+					{
+						INSTR_TIME_SET_CURRENT(sync_end);
+						sync_diff = sync_end;
+						INSTR_TIME_SUBTRACT(sync_diff, sync_start);
+						elapsed = INSTR_TIME_GET_MICROSEC(sync_diff);
+						if (elapsed > longest)
+							longest = elapsed;
+						total_elapsed += elapsed;
+						processed++;
+						elog(DEBUG1, "checkpoint sync: number=%d file=%s time=%.3f msec", 
+							processed, FilePathName(seg->mdfd_vfd), (double) elapsed / 1000);
+					}
+
 					break;		/* success; break out of retry loop */
+				}
 
 				/*
 				 * XXX is there any point in allowing more than one retry?
@@ -1112,6 +1150,11 @@ mdsync(void)
 						HASH_REMOVE, NULL) == NULL)
 			elog(ERROR, "pendingOpsTable corrupted");
 	}							/* end loop over hashtable entries */
+
+	/* Return sync performance metrics for report at checkpoint end */
+	CheckpointStats.ckpt_sync_rels = processed;
+	CheckpointStats.ckpt_longest_sync = longest;
+	CheckpointStats.ckpt_agg_sync_time = total_elapsed;
 
 	/* Flag successful completion of mdsync */
 	mdsync_in_progress = false;
@@ -1223,6 +1266,9 @@ register_dirty_segment(SMgrRelation reln, ForkNumber forknum, MdfdVec *seg)
 	{
 		if (ForwardFsyncRequest(reln->smgr_rnode, forknum, seg->mdfd_segno))
 			return;				/* passed it off successfully */
+
+		ereport(DEBUG1,
+			(errmsg("could not forward fsync request because request queue is full")));
 
 		if (FileSync(seg->mdfd_vfd) < 0)
 			ereport(ERROR,

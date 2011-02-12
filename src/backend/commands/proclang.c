@@ -3,7 +3,7 @@
  * proclang.c
  *	  PostgreSQL PROCEDURAL LANGUAGE support code.
  *
- * Portions Copyright (c) 1996-2010, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2011, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -17,6 +17,7 @@
 #include "access/heapam.h"
 #include "catalog/dependency.h"
 #include "catalog/indexing.h"
+#include "catalog/objectaccess.h"
 #include "catalog/pg_language.h"
 #include "catalog/pg_namespace.h"
 #include "catalog/pg_pltemplate.h"
@@ -387,19 +388,24 @@ create_proc_lang(const char *languageName, bool replace,
 	 * Create dependencies for the new language.  If we are updating an
 	 * existing language, first delete any existing pg_depend entries.
 	 * (However, since we are not changing ownership or permissions, the
-	 * shared dependencies do *not* need to change, and we leave them alone.)
+	 * shared dependencies do *not* need to change, and we leave them alone.
+	 * We also don't change any pre-existing extension-membership dependency.)
 	 */
 	myself.classId = LanguageRelationId;
 	myself.objectId = HeapTupleGetOid(tup);
 	myself.objectSubId = 0;
 
 	if (is_update)
-		deleteDependencyRecordsFor(myself.classId, myself.objectId);
+		deleteDependencyRecordsFor(myself.classId, myself.objectId, true);
 
 	/* dependency on owner of language */
 	if (!is_update)
 		recordDependencyOnOwner(myself.classId, myself.objectId,
 								languageOwner);
+
+	/* dependency on extension */
+	if (!is_update)
+		recordDependencyOnCurrentExtension(&myself);
 
 	/* dependency on the PL handler function */
 	referenced.classId = ProcedureRelationId;
@@ -424,6 +430,10 @@ create_proc_lang(const char *languageName, bool replace,
 		referenced.objectSubId = 0;
 		recordDependencyOn(&myself, &referenced, DEPENDENCY_NORMAL);
 	}
+
+	/* Post creation hook for new procedural language */
+	InvokeObjectAccessHook(OAT_POST_CREATE,
+						   LanguageRelationId, myself.objectId, 0);
 
 	heap_close(rel, RowExclusiveLock);
 }

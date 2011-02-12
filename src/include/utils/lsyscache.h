@@ -3,7 +3,7 @@
  * lsyscache.h
  *	  Convenience routines for common queries in the system catalog cache.
  *
- * Portions Copyright (c) 1996-2010, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2011, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/utils/lsyscache.h
@@ -32,7 +32,8 @@ extern PGDLLIMPORT get_attavgwidth_hook_type get_attavgwidth_hook;
 
 extern bool op_in_opfamily(Oid opno, Oid opfamily);
 extern int	get_op_opfamily_strategy(Oid opno, Oid opfamily);
-extern void get_op_opfamily_properties(Oid opno, Oid opfamily,
+extern Oid	get_op_opfamily_sortfamily(Oid opno, Oid opfamily);
+extern void get_op_opfamily_properties(Oid opno, Oid opfamily, bool ordering_op,
 						   int *strategy,
 						   Oid *lefttype,
 						   Oid *righttype);
@@ -59,16 +60,18 @@ extern char *get_relid_attribute_name(Oid relid, AttrNumber attnum);
 extern AttrNumber get_attnum(Oid relid, const char *attname);
 extern Oid	get_atttype(Oid relid, AttrNumber attnum);
 extern int32 get_atttypmod(Oid relid, AttrNumber attnum);
+extern Oid	get_attcollation(Oid relid, AttrNumber attnum);
 extern void get_atttypetypmod(Oid relid, AttrNumber attnum,
 				  Oid *typid, int32 *typmod);
+extern char *get_collation_name(Oid colloid);
 extern char *get_constraint_name(Oid conoid);
 extern Oid	get_opclass_family(Oid opclass);
 extern Oid	get_opclass_input_type(Oid opclass);
 extern RegProcedure get_opcode(Oid opno);
 extern char *get_opname(Oid opno);
 extern void op_input_types(Oid opno, Oid *lefttype, Oid *righttype);
-extern bool op_mergejoinable(Oid opno);
-extern bool op_hashjoinable(Oid opno);
+extern bool op_mergejoinable(Oid opno, Oid inputtype);
+extern bool op_hashjoinable(Oid opno, Oid inputtype);
 extern bool op_strict(Oid opno);
 extern char op_volatile(Oid opno);
 extern Oid	get_commutator(Oid opno);
@@ -117,11 +120,14 @@ extern void get_type_category_preferred(Oid typid,
 extern Oid	get_typ_typrelid(Oid typid);
 extern Oid	get_element_type(Oid typid);
 extern Oid	get_array_type(Oid typid);
+extern Oid	get_base_element_type(Oid typid);
 extern void getTypeInputInfo(Oid type, Oid *typInput, Oid *typIOParam);
 extern void getTypeOutputInfo(Oid type, Oid *typOutput, bool *typIsVarlena);
 extern void getTypeBinaryInputInfo(Oid type, Oid *typReceive, Oid *typIOParam);
 extern void getTypeBinaryOutputInfo(Oid type, Oid *typSend, bool *typIsVarlena);
 extern Oid	get_typmodin(Oid typid);
+extern Oid get_typcollation(Oid typid);
+extern bool type_is_collatable(Oid typid);
 extern Oid	getBaseType(Oid typid);
 extern Oid	getBaseTypeAndTypmod(Oid typid, int32 *typmod);
 extern int32 get_typavgwidth(Oid typid, int32 typmod);
@@ -138,6 +144,8 @@ extern void free_attstatsslot(Oid atttype,
 extern char *get_namespace_name(Oid nspid);
 
 #define type_is_array(typid)  (get_element_type(typid) != InvalidOid)
+/* type_is_array_domain accepts both plain arrays and domains over arrays */
+#define type_is_array_domain(typid)  (get_base_element_type(typid) != InvalidOid)
 
 #define TypeIsToastable(typid)	(get_typstorage(typid) != 'p')
 

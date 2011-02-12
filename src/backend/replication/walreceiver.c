@@ -12,7 +12,7 @@
  * in the primary server), and then keeps receiving XLOG records and
  * writing them to the disk as long as the connection is alive. As XLOG
  * records are received and flushed to disk, it updates the
- * WalRcv->receivedUpTo variable in shared memory, to inform the startup
+ * WalRcv->receivedUpto variable in shared memory, to inform the startup
  * process of how far it can proceed with XLOG replay.
  *
  * Normal termination is by SIGTERM, which instructs the walreceiver to
@@ -25,7 +25,7 @@
  * specific parts are in the libpqwalreceiver module. It's loaded
  * dynamically to avoid linking the server with libpq.
  *
- * Portions Copyright (c) 2010-2010, PostgreSQL Global Development Group
+ * Portions Copyright (c) 2010-2011, PostgreSQL Global Development Group
  *
  *
  * IDENTIFICATION
@@ -54,9 +54,13 @@
 /* Global variable to indicate if this process is a walreceiver process */
 bool		am_walreceiver;
 
+/* GUC variable */
+int			wal_receiver_status_interval;
+
 /* libpqreceiver hooks to these when loaded */
 walrcv_connect_type walrcv_connect = NULL;
 walrcv_receive_type walrcv_receive = NULL;
+walrcv_send_type walrcv_send = NULL;
 walrcv_disconnect_type walrcv_disconnect = NULL;
 
 #define NAPTIME_PER_CYCLE 100	/* max sleep time between cycles (100ms) */
@@ -87,6 +91,8 @@ static struct
 	XLogRecPtr	Flush;			/* last byte + 1 flushed in the standby */
 }	LogstreamResult;
 
+static StandbyReplyMessage	reply_message;
+
 /*
  * About SIGTERM handling:
  *
@@ -113,6 +119,7 @@ static void WalRcvDie(int code, Datum arg);
 static void XLogWalRcvProcessMsg(unsigned char type, char *buf, Size len);
 static void XLogWalRcvWrite(char *buf, Size nbytes, XLogRecPtr recptr);
 static void XLogWalRcvFlush(void);
+static void XLogWalRcvSendReply(void);
 
 /* Signal handlers */
 static void WalRcvSigHupHandler(SIGNAL_ARGS);
@@ -247,7 +254,7 @@ WalReceiverMain(void)
 	/* Load the libpq-specific functions */
 	load_file("libpqwalreceiver", false);
 	if (walrcv_connect == NULL || walrcv_receive == NULL ||
-		walrcv_disconnect == NULL)
+		walrcv_send == NULL || walrcv_disconnect == NULL)
 		elog(ERROR, "libpqwalreceiver didn't initialize correctly");
 
 	/*
@@ -305,11 +312,22 @@ WalReceiverMain(void)
 			while (walrcv_receive(0, &type, &buf, &len))
 				XLogWalRcvProcessMsg(type, buf, len);
 
+			/* Let the master know that we received some data. */
+			XLogWalRcvSendReply();
+
 			/*
 			 * If we've written some records, flush them to disk and let the
 			 * startup process know about them.
 			 */
 			XLogWalRcvFlush();
+		}
+		else
+		{
+			/*
+			 * We didn't receive anything new, but send a status update to
+			 * the master anyway, to report any progress in applying WAL.
+			 */
+			XLogWalRcvSendReply();
 		}
 	}
 }
@@ -322,6 +340,9 @@ WalRcvDie(int code, Datum arg)
 {
 	/* use volatile pointer to prevent code rearrangement */
 	volatile WalRcvData *walrcv = WalRcv;
+
+	/* Ensure that all WAL records received are flushed to disk */
+	XLogWalRcvFlush();
 
 	SpinLockAcquire(&walrcv->mutex);
 	Assert(walrcv->walRcvState == WALRCV_RUNNING ||
@@ -542,5 +563,60 @@ XLogWalRcvFlush(void)
 					 LogstreamResult.Write.xrecoff);
 			set_ps_display(activitymsg, false);
 		}
+
+		/* Also let the master know that we made some progress */
+		XLogWalRcvSendReply();
 	}
+}
+
+/*
+ * Send reply message to primary, indicating our current XLOG positions and
+ * the current time.
+ */
+static void
+XLogWalRcvSendReply(void)
+{
+	char		buf[sizeof(StandbyReplyMessage) + 1];
+	TimestampTz	now;
+
+	/*
+	 * If the user doesn't want status to be reported to the master, be sure
+	 * to exit before doing anything at all.
+	 */
+	if (wal_receiver_status_interval <= 0)
+		return;
+
+	/* Get current timestamp. */
+	now = GetCurrentTimestamp();
+
+	/*
+	 * We can compare the write and flush positions to the last message we
+	 * sent without taking any lock, but the apply position requires a spin
+	 * lock, so we don't check that unless something else has changed or 10
+	 * seconds have passed.  This means that the apply log position will
+	 * appear, from the master's point of view, to lag slightly, but since
+	 * this is only for reporting purposes and only on idle systems, that's
+	 * probably OK.
+	 */
+	if (XLByteEQ(reply_message.write, LogstreamResult.Write)
+		&& XLByteEQ(reply_message.flush, LogstreamResult.Flush)
+		&& !TimestampDifferenceExceeds(reply_message.sendTime, now,
+			wal_receiver_status_interval * 1000))
+		return;
+
+	/* Construct a new message. */
+	reply_message.write = LogstreamResult.Write;
+	reply_message.flush = LogstreamResult.Flush;
+	reply_message.apply = GetXLogReplayRecPtr();
+	reply_message.sendTime = now;
+
+	elog(DEBUG2, "sending write %X/%X flush %X/%X apply %X/%X",
+				 reply_message.write.xlogid, reply_message.write.xrecoff,
+				 reply_message.flush.xlogid, reply_message.flush.xrecoff,
+				 reply_message.apply.xlogid, reply_message.apply.xrecoff);
+
+	/* Prepend with the message type and send it. */
+	buf[0] = 'r';
+	memcpy(&buf[1], &reply_message, sizeof(StandbyReplyMessage));
+	walrcv_send(buf, sizeof(StandbyReplyMessage) + 1);
 }

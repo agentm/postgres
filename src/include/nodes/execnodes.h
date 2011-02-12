@@ -4,7 +4,7 @@
  *	  definitions for executor state nodes
  *
  *
- * Portions Copyright (c) 1996-2010, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2011, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/nodes/execnodes.h
@@ -407,25 +407,41 @@ typedef struct EState
  * When doing UPDATE, DELETE, or SELECT FOR UPDATE/SHARE, we should have an
  * ExecRowMark for each non-target relation in the query (except inheritance
  * parent RTEs, which can be ignored at runtime).  See PlanRowMark for details
- * about most of the fields.
+ * about most of the fields.  In addition to fields directly derived from
+ * PlanRowMark, we store curCtid, which is used by the WHERE CURRENT OF code.
  *
- * es_rowMarks is a list of these structs.	Each LockRows node has its own
- * list, which is the subset of locks that it is supposed to enforce; note
- * that the per-node lists point to the same structs that are in the global
- * list.
+ * EState->es_rowMarks is a list of these structs.
  */
 typedef struct ExecRowMark
 {
 	Relation	relation;		/* opened and suitably locked relation */
 	Index		rti;			/* its range table index */
 	Index		prti;			/* parent range table index, if child */
+	Index		rowmarkId;		/* unique identifier for resjunk columns */
 	RowMarkType markType;		/* see enum in nodes/plannodes.h */
 	bool		noWait;			/* NOWAIT option */
+	ItemPointerData curCtid;	/* ctid of currently locked tuple, if any */
+} ExecRowMark;
+
+/*
+ * ExecAuxRowMark -
+ *	   additional runtime representation of FOR UPDATE/SHARE clauses
+ *
+ * Each LockRows and ModifyTable node keeps a list of the rowmarks it needs to
+ * deal with.  In addition to a pointer to the related entry in es_rowMarks,
+ * this struct carries the column number(s) of the resjunk columns associated
+ * with the rowmark (see comments for PlanRowMark for more detail).  In the
+ * case of ModifyTable, there has to be a separate ExecAuxRowMark list for
+ * each child plan, because the resjunk columns could be at different physical
+ * column positions in different subplans.
+ */
+typedef struct ExecAuxRowMark
+{
+	ExecRowMark *rowmark;		/* related entry in es_rowMarks */
 	AttrNumber	ctidAttNo;		/* resno of ctid junk attribute, if any */
 	AttrNumber	toidAttNo;		/* resno of tableoid junk attribute, if any */
 	AttrNumber	wholeAttNo;		/* resno of whole-row junk attribute, if any */
-	ItemPointerData curCtid;	/* ctid of currently locked tuple, if any */
-} ExecRowMark;
+} ExecAuxRowMark;
 
 
 /* ----------------------------------------------------------------
@@ -623,13 +639,11 @@ typedef struct FuncExprState
 										 * NULL */
 
 	/*
-	 * We need to store argument values across calls when evaluating a SRF
-	 * that uses value-per-call mode.
-	 *
-	 * setArgsValid is true when we are evaluating a set-valued function and
-	 * we are in the middle of a call series; we want to pass the same
-	 * argument values to the function again (and again, until it returns
-	 * ExprEndResult).
+	 * setArgsValid is true when we are evaluating a set-returning function
+	 * that uses value-per-call mode and we are in the middle of a call
+	 * series; we want to pass the same argument values to the function again
+	 * (and again, until it returns ExprEndResult).  This indicates that
+	 * fcinfo_data already contains valid argument data.
 	 */
 	bool		setArgsValid;
 
@@ -649,10 +663,11 @@ typedef struct FuncExprState
 	bool		shutdown_reg;	/* a shutdown callback is registered */
 
 	/*
-	 * Current argument data for a set-valued function; contains valid data
-	 * only if setArgsValid is true.
+	 * Call parameter structure for the function.  This has been initialized
+	 * (by InitFunctionCallInfoData) if func.fn_oid is valid.  It also saves
+	 * argument values between calls, when setArgsValid is true.
 	 */
-	FunctionCallInfoData setArgs;
+	FunctionCallInfoData fcinfo_data;
 } FuncExprState;
 
 /* ----------------
@@ -982,7 +997,7 @@ typedef struct PlanState
 } PlanState;
 
 /* ----------------
- *	these are are defined to avoid confusion problems with "left"
+ *	these are defined to avoid confusion problems with "left"
  *	and "right" and "inner" and "outer".  The convention is that
  *	the "left" plan is the "outer" plan and the "right" plan is
  *	the inner plan, but these make the code more readable.
@@ -1002,7 +1017,7 @@ typedef struct EPQState
 	PlanState  *planstate;		/* plan state tree ready to be executed */
 	TupleTableSlot *origslot;	/* original output tuple to be rechecked */
 	Plan	   *plan;			/* plan tree to be executed */
-	List	   *rowMarks;		/* ExecRowMarks (non-locking only) */
+	List	   *arowMarks;		/* ExecAuxRowMarks (non-locking only) */
 	int			epqParam;		/* ID of Param to force scan node re-eval */
 } EPQState;
 
@@ -1030,6 +1045,7 @@ typedef struct ModifyTableState
 	PlanState **mt_plans;		/* subplans (one per target rel) */
 	int			mt_nplans;		/* number of plans in the array */
 	int			mt_whichplan;	/* which one is being executed (0..n-1) */
+	List	  **mt_arowmarks;	/* per-subplan ExecAuxRowMark lists */
 	EPQState	mt_epqstate;	/* for evaluating EvalPlanQual rechecks */
 	bool		fireBSTriggers; /* do we need to fire stmt triggers? */
 } ModifyTableState;
@@ -1183,10 +1199,12 @@ typedef struct
  *	 IndexScanState information
  *
  *		indexqualorig	   execution state for indexqualorig expressions
- *		ScanKeys		   Skey structures to scan index rel
- *		NumScanKeys		   number of Skey structs
+ *		ScanKeys		   Skey structures for index quals
+ *		NumScanKeys		   number of ScanKeys
+ *		OrderByKeys		   Skey structures for index ordering operators
+ *		NumOrderByKeys	   number of OrderByKeys
  *		RuntimeKeys		   info about Skeys that must be evaluated at runtime
- *		NumRuntimeKeys	   number of RuntimeKeys structs
+ *		NumRuntimeKeys	   number of RuntimeKeys
  *		RuntimeKeysReady   true if runtime Skeys have been computed
  *		RuntimeContext	   expr context for evaling runtime Skeys
  *		RelationDesc	   index relation descriptor
@@ -1199,6 +1217,8 @@ typedef struct IndexScanState
 	List	   *indexqualorig;
 	ScanKey		iss_ScanKeys;
 	int			iss_NumScanKeys;
+	ScanKey		iss_OrderByKeys;
+	int			iss_NumOrderByKeys;
 	IndexRuntimeKeyInfo *iss_RuntimeKeys;
 	int			iss_NumRuntimeKeys;
 	bool		iss_RuntimeKeysReady;
@@ -1211,12 +1231,12 @@ typedef struct IndexScanState
  *	 BitmapIndexScanState information
  *
  *		result			   bitmap to return output into, or NULL
- *		ScanKeys		   Skey structures to scan index rel
- *		NumScanKeys		   number of Skey structs
+ *		ScanKeys		   Skey structures for index quals
+ *		NumScanKeys		   number of ScanKeys
  *		RuntimeKeys		   info about Skeys that must be evaluated at runtime
- *		NumRuntimeKeys	   number of RuntimeKeys structs
+ *		NumRuntimeKeys	   number of RuntimeKeys
  *		ArrayKeys		   info about Skeys that come from ScalarArrayOpExprs
- *		NumArrayKeys	   number of ArrayKeys structs
+ *		NumArrayKeys	   number of ArrayKeys
  *		RuntimeKeysReady   true if runtime Skeys have been computed
  *		RuntimeContext	   expr context for evaling runtime Skeys
  *		RelationDesc	   index relation descriptor
@@ -1422,7 +1442,7 @@ typedef struct NestLoopState
  *
  *		NumClauses		   number of mergejoinable join clauses
  *		Clauses			   info for each mergejoinable clause
- *		JoinState		   current "state" of join.  see execdefs.h
+ *		JoinState		   current state of ExecMergeJoin state machine
  *		ExtraMarks		   true to issue extra Mark operations on inner scan
  *		ConstFalseJoin	   true if we have a constant-false joinqual
  *		FillOuter		   true if should emit unjoined outer tuples anyway
@@ -1465,6 +1485,10 @@ typedef struct MergeJoinState
 /* ----------------
  *	 HashJoinState information
  *
+ *		hashclauses				original form of the hashjoin condition
+ *		hj_OuterHashKeys		the outer hash keys in the hashjoin condition
+ *		hj_InnerHashKeys		the inner hash keys in the hashjoin condition
+ *		hj_HashOperators		the join operators in the hashjoin condition
  *		hj_HashTable			hash table for the hashjoin
  *								(NULL if table not built yet)
  *		hj_CurHashValue			hash value for current outer tuple
@@ -1474,14 +1498,12 @@ typedef struct MergeJoinState
  *								tuple, or NULL if starting search
  *								(hj_CurXXX variables are undefined if
  *								OuterTupleSlot is empty!)
- *		hj_OuterHashKeys		the outer hash keys in the hashjoin condition
- *		hj_InnerHashKeys		the inner hash keys in the hashjoin condition
- *		hj_HashOperators		the join operators in the hashjoin condition
  *		hj_OuterTupleSlot		tuple slot for outer tuples
- *		hj_HashTupleSlot		tuple slot for hashed tuples
- *		hj_NullInnerTupleSlot	prepared null tuple for left outer joins
+ *		hj_HashTupleSlot		tuple slot for inner (hashed) tuples
+ *		hj_NullOuterTupleSlot	prepared null tuple for right/full outer joins
+ *		hj_NullInnerTupleSlot	prepared null tuple for left/full outer joins
  *		hj_FirstOuterTupleSlot	first tuple retrieved from outer plan
- *		hj_NeedNewOuter			true if need new outer tuple on next call
+ *		hj_JoinState			current state of ExecHashJoin state machine
  *		hj_MatchedOuter			true if found a join match for current outer
  *		hj_OuterNotEmpty		true if outer relation known not empty
  * ----------------
@@ -1495,19 +1517,20 @@ typedef struct HashJoinState
 {
 	JoinState	js;				/* its first field is NodeTag */
 	List	   *hashclauses;	/* list of ExprState nodes */
+	List	   *hj_OuterHashKeys;		/* list of ExprState nodes */
+	List	   *hj_InnerHashKeys;		/* list of ExprState nodes */
+	List	   *hj_HashOperators;		/* list of operator OIDs */
 	HashJoinTable hj_HashTable;
 	uint32		hj_CurHashValue;
 	int			hj_CurBucketNo;
 	int			hj_CurSkewBucketNo;
 	HashJoinTuple hj_CurTuple;
-	List	   *hj_OuterHashKeys;		/* list of ExprState nodes */
-	List	   *hj_InnerHashKeys;		/* list of ExprState nodes */
-	List	   *hj_HashOperators;		/* list of operator OIDs */
 	TupleTableSlot *hj_OuterTupleSlot;
 	TupleTableSlot *hj_HashTupleSlot;
+	TupleTableSlot *hj_NullOuterTupleSlot;
 	TupleTableSlot *hj_NullInnerTupleSlot;
 	TupleTableSlot *hj_FirstOuterTupleSlot;
-	bool		hj_NeedNewOuter;
+	int			hj_JoinState;
 	bool		hj_MatchedOuter;
 	bool		hj_OuterNotEmpty;
 } HashJoinState;
@@ -1733,7 +1756,7 @@ typedef struct SetOpState
 typedef struct LockRowsState
 {
 	PlanState	ps;				/* its first field is NodeTag */
-	List	   *lr_rowMarks;	/* List of ExecRowMarks */
+	List	   *lr_arowMarks;	/* List of ExecAuxRowMarks */
 	EPQState	lr_epqstate;	/* for evaluating EvalPlanQual rechecks */
 } LockRowsState;
 

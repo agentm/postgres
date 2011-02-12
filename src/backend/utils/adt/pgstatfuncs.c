@@ -3,7 +3,7 @@
  * pgstatfuncs.c
  *	  Functions for accessing the statistics collector data
  *
- * Portions Copyright (c) 1996-2010, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2011, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -71,13 +71,22 @@ extern Datum pg_stat_get_db_tuples_fetched(PG_FUNCTION_ARGS);
 extern Datum pg_stat_get_db_tuples_inserted(PG_FUNCTION_ARGS);
 extern Datum pg_stat_get_db_tuples_updated(PG_FUNCTION_ARGS);
 extern Datum pg_stat_get_db_tuples_deleted(PG_FUNCTION_ARGS);
+extern Datum pg_stat_get_db_conflict_tablespace(PG_FUNCTION_ARGS);
+extern Datum pg_stat_get_db_conflict_lock(PG_FUNCTION_ARGS);
+extern Datum pg_stat_get_db_conflict_snapshot(PG_FUNCTION_ARGS);
+extern Datum pg_stat_get_db_conflict_bufferpin(PG_FUNCTION_ARGS);
+extern Datum pg_stat_get_db_conflict_startup_deadlock(PG_FUNCTION_ARGS);
+extern Datum pg_stat_get_db_conflict_all(PG_FUNCTION_ARGS);
+extern Datum pg_stat_get_db_stat_reset_time(PG_FUNCTION_ARGS);
 
 extern Datum pg_stat_get_bgwriter_timed_checkpoints(PG_FUNCTION_ARGS);
 extern Datum pg_stat_get_bgwriter_requested_checkpoints(PG_FUNCTION_ARGS);
 extern Datum pg_stat_get_bgwriter_buf_written_checkpoints(PG_FUNCTION_ARGS);
 extern Datum pg_stat_get_bgwriter_buf_written_clean(PG_FUNCTION_ARGS);
 extern Datum pg_stat_get_bgwriter_maxwritten_clean(PG_FUNCTION_ARGS);
+extern Datum pg_stat_get_bgwriter_stat_reset_time(PG_FUNCTION_ARGS);
 extern Datum pg_stat_get_buf_written_backend(PG_FUNCTION_ARGS);
+extern Datum pg_stat_get_buf_fsync_backend(PG_FUNCTION_ARGS);
 extern Datum pg_stat_get_buf_alloc(PG_FUNCTION_ARGS);
 
 extern Datum pg_stat_get_xact_numscans(PG_FUNCTION_ARGS);
@@ -1129,6 +1138,119 @@ pg_stat_get_db_tuples_deleted(PG_FUNCTION_ARGS)
 }
 
 Datum
+pg_stat_get_db_stat_reset_time(PG_FUNCTION_ARGS)
+{
+	Oid			dbid = PG_GETARG_OID(0);
+	TimestampTz result;
+	PgStat_StatDBEntry *dbentry;
+
+	if ((dbentry = pgstat_fetch_stat_dbentry(dbid)) == NULL)
+		result = 0;
+	else
+		result = dbentry->stat_reset_timestamp;
+
+	if (result == 0)
+		PG_RETURN_NULL();
+	else
+		PG_RETURN_TIMESTAMPTZ(result);
+}
+
+Datum
+pg_stat_get_db_conflict_tablespace(PG_FUNCTION_ARGS)
+{
+	Oid			dbid = PG_GETARG_OID(0);
+	int64		result;
+	PgStat_StatDBEntry *dbentry;
+
+	if ((dbentry = pgstat_fetch_stat_dbentry(dbid)) == NULL)
+		result = 0;
+	else
+		result = (int64) (dbentry->n_conflict_tablespace);
+
+	PG_RETURN_INT64(result);
+}
+
+Datum
+pg_stat_get_db_conflict_lock(PG_FUNCTION_ARGS)
+{
+	Oid			dbid = PG_GETARG_OID(0);
+	int64		result;
+	PgStat_StatDBEntry *dbentry;
+
+	if ((dbentry = pgstat_fetch_stat_dbentry(dbid)) == NULL)
+		result = 0;
+	else
+		result = (int64) (dbentry->n_conflict_lock);
+
+	PG_RETURN_INT64(result);
+}
+
+Datum
+pg_stat_get_db_conflict_snapshot(PG_FUNCTION_ARGS)
+{
+	Oid			dbid = PG_GETARG_OID(0);
+	int64		result;
+	PgStat_StatDBEntry *dbentry;
+
+	if ((dbentry = pgstat_fetch_stat_dbentry(dbid)) == NULL)
+		result = 0;
+	else
+		result = (int64) (dbentry->n_conflict_snapshot);
+
+	PG_RETURN_INT64(result);
+}
+
+Datum
+pg_stat_get_db_conflict_bufferpin(PG_FUNCTION_ARGS)
+{
+	Oid			dbid = PG_GETARG_OID(0);
+	int64		result;
+	PgStat_StatDBEntry *dbentry;
+
+	if ((dbentry = pgstat_fetch_stat_dbentry(dbid)) == NULL)
+		result = 0;
+	else
+		result = (int64) (dbentry->n_conflict_bufferpin);
+
+	PG_RETURN_INT64(result);
+}
+
+Datum
+pg_stat_get_db_conflict_startup_deadlock(PG_FUNCTION_ARGS)
+{
+	Oid			dbid = PG_GETARG_OID(0);
+	int64		result;
+	PgStat_StatDBEntry *dbentry;
+
+	if ((dbentry = pgstat_fetch_stat_dbentry(dbid)) == NULL)
+		result = 0;
+	else
+		result = (int64) (dbentry->n_conflict_startup_deadlock);
+
+	PG_RETURN_INT64(result);
+}
+
+Datum
+pg_stat_get_db_conflict_all(PG_FUNCTION_ARGS)
+{
+	Oid			dbid = PG_GETARG_OID(0);
+	int64		result;
+	PgStat_StatDBEntry *dbentry;
+
+	if ((dbentry = pgstat_fetch_stat_dbentry(dbid)) == NULL)
+		result = 0;
+	else
+		result = (int64) (
+			dbentry->n_conflict_tablespace +
+			dbentry->n_conflict_lock +
+			dbentry->n_conflict_snapshot +
+			dbentry->n_conflict_bufferpin +
+			dbentry->n_conflict_startup_deadlock);
+
+	PG_RETURN_INT64(result);
+}
+
+Datum
 pg_stat_get_bgwriter_timed_checkpoints(PG_FUNCTION_ARGS)
 {
 	PG_RETURN_INT64(pgstat_fetch_global()->timed_checkpoints);
@@ -1159,9 +1281,21 @@ pg_stat_get_bgwriter_maxwritten_clean(PG_FUNCTION_ARGS)
 }
 
 Datum
+pg_stat_get_bgwriter_stat_reset_time(PG_FUNCTION_ARGS)
+{
+	PG_RETURN_TIMESTAMPTZ(pgstat_fetch_global()->stat_reset_timestamp);
+}
+
+Datum
 pg_stat_get_buf_written_backend(PG_FUNCTION_ARGS)
 {
 	PG_RETURN_INT64(pgstat_fetch_global()->buf_written_backend);
+}
+
+Datum
+pg_stat_get_buf_fsync_backend(PG_FUNCTION_ARGS)
+{
+	PG_RETURN_INT64(pgstat_fetch_global()->buf_fsync_backend);
 }
 
 Datum

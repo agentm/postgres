@@ -1,6 +1,6 @@
 # PGXS: PostgreSQL extensions makefile
 
-# src/makefiles/pgxs.mk 
+# src/makefiles/pgxs.mk
 
 # This file contains generic rules to build many kinds of simple
 # extension modules.  You only need to set a few variables and include
@@ -17,16 +17,18 @@
 #
 # Set one of these three variables to specify what is built:
 #
-#   MODULES -- list of shared objects to be built from source files with
-#     same stem (do not include suffix in this list)
-#   MODULE_big -- a shared object to build from multiple source files
+#   MODULES -- list of shared-library objects to be built from source files
+#     with same stem (do not include library suffixes in this list)
+#   MODULE_big -- a shared library to build from multiple source files
 #     (list object files in OBJS)
-#   PROGRAM -- a binary program to build (list object files in OBJS)
+#   PROGRAM -- an executable program to build (list object files in OBJS)
 #
 # The following variables can also be set:
 #
-#   MODULEDIR -- subdirectory into which DATA and DOCS files should be
-#     installed (if not set, default is "contrib")
+#   EXTENSION -- name of extension (there must be a $EXTENSION.control file)
+#   MODULEDIR -- subdirectory of $PREFIX/share into which DATA and DOCS files
+#     should be installed (if not set, default is "extension" if EXTENSION
+#     is set, or "contrib" if not)
 #   DATA -- random files to install into $PREFIX/share/$MODULEDIR
 #   DATA_built -- random files to install into $PREFIX/share/$MODULEDIR,
 #     which need to be built first
@@ -71,18 +73,23 @@ override CFLAGS += $(CFLAGS_SL)
 endif
 
 ifdef MODULEDIR
-datamoduledir = $(MODULEDIR)
-docmoduledir = $(MODULEDIR)
+datamoduledir := $(MODULEDIR)
+docmoduledir := $(MODULEDIR)
 else
-datamoduledir = contrib
-docmoduledir = contrib
+ifdef EXTENSION
+datamoduledir := extension
+docmoduledir := extension
+else
+datamoduledir := contrib
+docmoduledir := contrib
+endif
 endif
 
 ifdef PG_CPPFLAGS
 override CPPFLAGS := $(PG_CPPFLAGS) $(CPPFLAGS)
 endif
 
-all: $(PROGRAM) $(DATA_built) $(SCRIPTS_built) $(addsuffix $(DLSUFFIX), $(MODULES))
+all: $(PROGRAM) $(DATA_built) $(SCRIPTS_built) $(addsuffix $(DLSUFFIX), $(MODULES)) $(addsuffix .control, $(EXTENSION))
 
 ifdef MODULE_big
 # shared library parameters
@@ -95,6 +102,12 @@ endif # MODULE_big
 
 
 install: all installdirs
+ifneq (,$(EXTENSION))
+	@for file in $(addprefix $(srcdir)/, $(addsuffix .control, $(EXTENSION))); do \
+	  echo "$(INSTALL_DATA) $$file '$(DESTDIR)$(datadir)/extension'"; \
+	  $(INSTALL_DATA) $$file '$(DESTDIR)$(datadir)/extension'; \
+	done
+endif # EXTENSION
 ifneq (,$(DATA)$(DATA_built))
 	@for file in $(addprefix $(srcdir)/, $(DATA)) $(DATA_built); do \
 	  echo "$(INSTALL_DATA) $$file '$(DESTDIR)$(datadir)/$(datamoduledir)'"; \
@@ -167,6 +180,9 @@ endif # MODULE_big
 
 
 uninstall:
+ifneq (,$(EXTENSION))
+	rm -f $(addprefix '$(DESTDIR)$(datadir)/extension'/, $(notdir $(addsuffix .control, $(EXTENSION))))
+endif
 ifneq (,$(DATA)$(DATA_built))
 	rm -f $(addprefix '$(DESTDIR)$(datadir)/$(datamoduledir)'/, $(notdir $(DATA) $(DATA_built)))
 endif

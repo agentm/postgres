@@ -1,6 +1,9 @@
 @echo off
 REM src/tools/msvc/pgflex.bat
 
+REM silence flex bleatings about file path style
+SET CYGWIN=nodosfilewarning
+
 IF NOT EXIST src\tools\msvc\buildenv.pl goto nobuildenv
 perl -e "require 'src/tools/msvc/buildenv.pl'; while(($k,$v) = each %ENV) { print qq[\@SET $k=$v\n]; }" > bldenv.bat
 CALL bldenv.bat
@@ -13,6 +16,7 @@ if errorlevel 1 goto noflex
 if "%1" == "src\backend\parser\scan.l" call :generate %1 src\backend\parser\scan.c -CF
 if "%1" == "src\backend\bootstrap\bootscanner.l" call :generate %1 src\backend\bootstrap\bootscanner.c
 if "%1" == "src\backend\utils\misc\guc-file.l" call :generate %1 src\backend\utils\misc\guc-file.c
+if "%1" == "src\backend\replication\repl_scanner.l" call :generate %1 src\backend\replication\repl_scanner.c
 if "%1" == "src\interfaces\ecpg\preproc\pgc.l" call :generate %1 src\interfaces\ecpg\preproc\pgc.c
 if "%1" == "src\bin\psql\psqlscan.l" call :generate %1 src\bin\psql\psqlscan.c
 if "%1" == "contrib\cube\cubescan.l" call :generate %1 contrib\cube\cubescan.c

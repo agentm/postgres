@@ -3,7 +3,7 @@
  * view.c
  *	  use rewrite rules to construct views
  *
- * Portions Copyright (c) 1996-2010, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2011, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -68,10 +68,10 @@ isViewOnTempTable_walker(Node *node, void *context)
 			if (rte->rtekind == RTE_RELATION)
 			{
 				Relation	rel = heap_open(rte->relid, AccessShareLock);
-				bool		istemp = rel->rd_istemp;
+				char		relpersistence = rel->rd_rel->relpersistence;
 
 				heap_close(rel, AccessShareLock);
-				if (istemp)
+				if (relpersistence == RELPERSISTENCE_TEMP)
 					return true;
 			}
 		}
@@ -120,7 +120,8 @@ DefineVirtualRelation(const RangeVar *relation, List *tlist, bool replace)
 
 			def->colname = pstrdup(tle->resname);
 			def->typeName = makeTypeNameFromOid(exprType((Node *) tle->expr),
-											 exprTypmod((Node *) tle->expr));
+												exprTypmod((Node *) tle->expr),
+												exprCollation((Node *) tle->expr));
 			def->inhcount = 0;
 			def->is_local = true;
 			def->is_not_null = false;
@@ -173,9 +174,9 @@ DefineVirtualRelation(const RangeVar *relation, List *tlist, bool replace)
 		/*
 		 * Due to the namespace visibility rules for temporary objects, we
 		 * should only end up replacing a temporary view with another
-		 * temporary view, and vice versa.
+		 * temporary view, and similarly for permanent views.
 		 */
-		Assert(relation->istemp == rel->rd_istemp);
+		Assert(relation->relpersistence == rel->rd_rel->relpersistence);
 
 		/*
 		 * Create a tuple descriptor to compare against the existing view, and
@@ -454,10 +455,11 @@ DefineView(ViewStmt *stmt, const char *queryString)
 	 * schema name.
 	 */
 	view = stmt->view;
-	if (!view->istemp && isViewOnTempTable(viewParse))
+	if (view->relpersistence == RELPERSISTENCE_PERMANENT
+		&& isViewOnTempTable(viewParse))
 	{
 		view = copyObject(view);	/* don't corrupt original command */
-		view->istemp = true;
+		view->relpersistence = RELPERSISTENCE_TEMP;
 		ereport(NOTICE,
 				(errmsg("view \"%s\" will be a temporary view",
 						view->relname)));

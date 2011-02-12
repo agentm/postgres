@@ -4,7 +4,7 @@
  *	  Definitions for hot standby mode.
  *
  *
- * Portions Copyright (c) 1996-2010, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2011, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/storage/standby.h
@@ -109,6 +109,7 @@ typedef struct RunningTransactionsData
 typedef RunningTransactionsData *RunningTransactions;
 
 extern void LogAccessExclusiveLock(Oid dbOid, Oid relOid);
+extern void LogAccessExclusiveLockPrepare(void);
 
 extern void LogStandbySnapshot(TransactionId *oldestActiveXid, TransactionId *nextXid);
 

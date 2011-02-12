@@ -4,7 +4,7 @@
  *	  Declarations for operations on built-in types.
  *
  *
- * Portions Copyright (c) 1996-2010, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2011, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/utils/builtins.h
@@ -275,6 +275,7 @@ extern Datum current_schemas(PG_FUNCTION_ARGS);
 extern int32 pg_atoi(char *s, int size, int c);
 extern void pg_itoa(int16 i, char *a);
 extern void pg_ltoa(int32 l, char *a);
+extern void pg_lltoa(int64 ll, char *a);
 
 /*
  *		Per-opclass comparison functions for new btrees.  These are
@@ -439,8 +440,13 @@ extern Datum pg_relation_filenode(PG_FUNCTION_ARGS);
 extern Datum pg_relation_filepath(PG_FUNCTION_ARGS);
 
 /* genfile.c */
+extern bytea *read_binary_file(const char *filename,
+							   int64 seek_offset, int64 bytes_to_read);
 extern Datum pg_stat_file(PG_FUNCTION_ARGS);
 extern Datum pg_read_file(PG_FUNCTION_ARGS);
+extern Datum pg_read_file_all(PG_FUNCTION_ARGS);
+extern Datum pg_read_binary_file(PG_FUNCTION_ARGS);
+extern Datum pg_read_binary_file_all(PG_FUNCTION_ARGS);
 extern Datum pg_ls_dir(PG_FUNCTION_ARGS);
 
 /* misc.c */
@@ -619,6 +625,8 @@ extern List *deparse_context_for_planstate(Node *planstate, List *ancestors,
 extern const char *quote_identifier(const char *ident);
 extern char *quote_qualified_identifier(const char *qualifier,
 						   const char *ident);
+extern char *generate_collation_name(Oid collid);
+
 
 /* tid.c */
 extern Datum tidin(PG_FUNCTION_ARGS);
@@ -710,7 +718,7 @@ extern Datum textoverlay(PG_FUNCTION_ARGS);
 extern Datum textoverlay_no_len(PG_FUNCTION_ARGS);
 extern Datum name_text(PG_FUNCTION_ARGS);
 extern Datum text_name(PG_FUNCTION_ARGS);
-extern int	varstr_cmp(char *arg1, int len1, char *arg2, int len2);
+extern int	varstr_cmp(char *arg1, int len1, char *arg2, int len2, Oid collid);
 extern List *textToQualifiedNameList(text *textval);
 extern bool SplitIdentifierString(char *rawstring, char separator,
 					  List **namelist);
@@ -742,6 +750,8 @@ extern Datum text_concat_ws(PG_FUNCTION_ARGS);
 extern Datum text_left(PG_FUNCTION_ARGS);
 extern Datum text_right(PG_FUNCTION_ARGS);
 extern Datum text_reverse(PG_FUNCTION_ARGS);
+extern Datum text_format(PG_FUNCTION_ARGS);
+extern Datum text_format_nv(PG_FUNCTION_ARGS);
 
 /* version.c */
 extern Datum pgsql_version(PG_FUNCTION_ARGS);
@@ -792,9 +802,7 @@ extern Datum chr (PG_FUNCTION_ARGS);
 extern Datum repeat(PG_FUNCTION_ARGS);
 extern Datum ascii(PG_FUNCTION_ARGS);
 
-/* inet_net_ntop.c */
-extern char *inet_net_ntop(int af, const void *src, int bits,
-			  char *dst, size_t size);
+/* inet_cidr_ntop.c */
 extern char *inet_cidr_ntop(int af, const void *src, int bits,
 			   char *dst, size_t size);
 
@@ -976,6 +984,7 @@ extern int32 type_maximum_size(Oid type_oid, int32 typemod);
 /* quote.c */
 extern Datum quote_ident(PG_FUNCTION_ARGS);
 extern Datum quote_literal(PG_FUNCTION_ARGS);
+extern char *quote_literal_cstr(char *rawstr);
 extern Datum quote_nullable(PG_FUNCTION_ARGS);
 
 /* guc.c */
@@ -1042,11 +1051,23 @@ extern Datum window_first_value(PG_FUNCTION_ARGS);
 extern Datum window_last_value(PG_FUNCTION_ARGS);
 extern Datum window_nth_value(PG_FUNCTION_ARGS);
 
+/* access/gin/ginarrayproc.c */
+extern Datum ginarrayextract(PG_FUNCTION_ARGS);
+extern Datum ginqueryarrayextract(PG_FUNCTION_ARGS);
+extern Datum ginarrayconsistent(PG_FUNCTION_ARGS);
+
 /* access/transam/twophase.c */
 extern Datum pg_prepared_xact(PG_FUNCTION_ARGS);
 
+/* catalogs/dependency.c */
+extern Datum pg_describe_object(PG_FUNCTION_ARGS);
+
 /* commands/constraint.c */
 extern Datum unique_key_recheck(PG_FUNCTION_ARGS);
+
+/* commands/extension.c */
+extern Datum pg_available_extensions(PG_FUNCTION_ARGS);
+extern Datum pg_extension_config_dump(PG_FUNCTION_ARGS);
 
 /* commands/prepare.c */
 extern Datum pg_prepared_statement(PG_FUNCTION_ARGS);

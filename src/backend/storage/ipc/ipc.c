@@ -8,7 +8,7 @@
  * exit-time cleanup for either a postmaster or a backend.
  *
  *
- * Portions Copyright (c) 1996-2010, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2011, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -126,8 +126,8 @@ proc_exit(int code)
 		else
 			snprintf(gprofDirName, 32, "gprof/%d", (int) getpid());
 
-		mkdir("gprof", 0777);
-		mkdir(gprofDirName, 0777);
+		mkdir("gprof", S_IRWXU | S_IRWXG | S_IRWXO);
+		mkdir(gprofDirName, S_IRWXU | S_IRWXG | S_IRWXO);
 		chdir(gprofDirName);
 	}
 #endif

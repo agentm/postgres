@@ -12,7 +12,7 @@
  * Note that other approaches to parameters are possible using the parser
  * hooks defined in ParseState.
  *
- * Portions Copyright (c) 1996-2010, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2011, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -30,6 +30,7 @@
 #include "nodes/nodeFuncs.h"
 #include "parser/parse_param.h"
 #include "utils/builtins.h"
+#include "utils/lsyscache.h"
 
 
 typedef struct FixedParamState
@@ -113,6 +114,7 @@ fixed_paramref_hook(ParseState *pstate, ParamRef *pref)
 	param->paramid = paramno;
 	param->paramtype = parstate->paramTypes[paramno - 1];
 	param->paramtypmod = -1;
+	param->paramcollation = get_typcollation(param->paramtype);
 	param->location = pref->location;
 
 	return (Node *) param;
@@ -165,6 +167,7 @@ variable_paramref_hook(ParseState *pstate, ParamRef *pref)
 	param->paramid = paramno;
 	param->paramtype = *pptype;
 	param->paramtypmod = -1;
+	param->paramcollation = get_typcollation(param->paramtype);
 	param->location = pref->location;
 
 	return (Node *) param;

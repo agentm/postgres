@@ -3,7 +3,7 @@
  *
  *	file system operations
  *
- *	Copyright (c) 2010, PostgreSQL Global Development Group
+ *	Copyright (c) 2010-2011, PostgreSQL Global Development Group
  *	contrib/pg_upgrade/file.c
  */
 
@@ -22,7 +22,7 @@ static int	copy_dir(const char *from, const char *to, bool force);
 #endif
 
 #ifndef HAVE_SCANDIR
-static int pg_scandir_internal(migratorContext *ctx, const char *dirname,
+static int pg_scandir_internal(const char *dirname,
 					struct dirent *** namelist,
 					int (*selector) (const struct dirent *));
 #endif
@@ -35,7 +35,7 @@ static int pg_scandir_internal(migratorContext *ctx, const char *dirname,
  *	uses that pageConverter to do a page-by-page conversion.
  */
 const char *
-copyAndUpdateFile(migratorContext *ctx, pageCnvCtx *pageConverter,
+copyAndUpdateFile(pageCnvCtx *pageConverter,
 				  const char *src, const char *dst, bool force)
 {
 	if (pageConverter == NULL)
@@ -116,7 +116,7 @@ copyAndUpdateFile(migratorContext *ctx, pageCnvCtx *pageConverter,
  * instead of copying the data from the old cluster to the new cluster.
  */
 const char *
-linkAndUpdateFile(migratorContext *ctx, pageCnvCtx *pageConverter,
+linkAndUpdateFile(pageCnvCtx *pageConverter,
 				  const char *src, const char *dst)
 {
 	if (pageConverter != NULL)
@@ -173,8 +173,8 @@ copy_file(const char *srcfile, const char *dstfile, bool force)
 
 		if (nbytes < 0)
 		{
-			int save_errno = errno;
-			
+			int			save_errno = errno;
+
 			if (buffer != NULL)
 				free(buffer);
 
@@ -196,7 +196,7 @@ copy_file(const char *srcfile, const char *dstfile, bool force)
 		if (write(dest_fd, buffer, nbytes) != nbytes)
 		{
 			/* if write didn't set errno, assume problem is no disk space */
-			int save_errno = errno ? errno : ENOSPC;
+			int			save_errno = errno ? errno : ENOSPC;
 
 			if (buffer != NULL)
 				free(buffer);
@@ -231,12 +231,12 @@ copy_file(const char *srcfile, const char *dstfile, bool force)
  * Wrapper for portable scandir functionality
  */
 int
-pg_scandir(migratorContext *ctx, const char *dirname,
+pg_scandir(const char *dirname,
 		   struct dirent *** namelist,
 		   int (*selector) (const struct dirent *))
 {
 #ifndef HAVE_SCANDIR
-	return pg_scandir_internal(ctx, dirname, namelist, selector);
+	return pg_scandir_internal(dirname, namelist, selector);
 
 	/*
 	 * scandir() is originally from BSD 4.3, which had the third argument as
@@ -277,7 +277,7 @@ pg_scandir(migratorContext *ctx, const char *dirname,
  * .2, etc.) and should therefore be invoked a small number of times.
  */
 static int
-pg_scandir_internal(migratorContext *ctx, const char *dirname,
+pg_scandir_internal(const char *dirname,
 		 struct dirent *** namelist, int (*selector) (const struct dirent *))
 {
 	DIR		   *dirdesc;
@@ -287,7 +287,7 @@ pg_scandir_internal(migratorContext *ctx, const char *dirname,
 	size_t		entrysize;
 
 	if ((dirdesc = opendir(dirname)) == NULL)
-		pg_log(ctx, PG_FATAL, "Could not open directory \"%s\": %m\n", dirname);
+		pg_log(PG_FATAL, "Could not open directory \"%s\": %m\n", dirname);
 
 	*namelist = NULL;
 
@@ -342,18 +342,18 @@ dir_matching_filenames(const struct dirent * scan_ent)
 
 
 void
-check_hard_link(migratorContext *ctx)
+check_hard_link(void)
 {
 	char		existing_file[MAXPGPATH];
 	char		new_link_file[MAXPGPATH];
 
-	snprintf(existing_file, sizeof(existing_file), "%s/PG_VERSION", ctx->old.pgdata);
-	snprintf(new_link_file, sizeof(new_link_file), "%s/PG_VERSION.linktest", ctx->new.pgdata);
+	snprintf(existing_file, sizeof(existing_file), "%s/PG_VERSION", old_cluster.pgdata);
+	snprintf(new_link_file, sizeof(new_link_file), "%s/PG_VERSION.linktest", new_cluster.pgdata);
 	unlink(new_link_file);		/* might fail */
 
 	if (pg_link_file(existing_file, new_link_file) == -1)
 	{
-		pg_log(ctx, PG_FATAL,
+		pg_log(PG_FATAL,
 			   "Could not create hard link between old and new data directories:  %s\n"
 			   "In link mode the old and new data directories must be on the same file system volume.\n",
 			   getErrorText(errno));
@@ -440,13 +440,13 @@ copy_dir(const char *src, const char *dst, bool force)
 			return -1;
 		}
 
-		if (fst.st_mode & S_IFDIR)
+		if (S_ISDIR(fst.st_mode))
 		{
 			/* recurse to handle subdirectories */
 			if (force)
 				copy_dir(src_file, dest_file, true);
 		}
-		else if (fst.st_mode & S_IFREG)
+		else if (S_ISREG(fst.st_mode))
 		{
 			if ((copy_file(src_file, dest_file, 1)) == -1)
 			{

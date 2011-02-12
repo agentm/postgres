@@ -40,9 +40,9 @@ $(SUBDIROBJS): $(SUBDIRS:%=%-recursive) ;
 $(SUBDIRS:%=%-recursive):
 	$(MAKE) -C $(subst -recursive,,$@) all
 
+$(call recurse,clean)
 clean: clean-local
 clean-local:
-ifdef SUBDIRS
-	for dir in $(SUBDIRS); do $(MAKE) -C $$dir clean || exit; done
-endif
 	rm -f $(subsysfilename) $(OBJS)
+
+$(call recurse,coverage)

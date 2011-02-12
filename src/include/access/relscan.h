@@ -4,7 +4,7 @@
  *	  POSTGRES relation scan descriptor definitions.
  *
  *
- * Portions Copyright (c) 1996-2010, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2011, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/access/relscan.h
@@ -35,6 +35,7 @@ typedef struct HeapScanDescData
 	BlockNumber rs_startblock;	/* block # to start at */
 	BufferAccessStrategy rs_strategy;	/* access strategy for reads */
 	bool		rs_syncscan;	/* report location to syncscan logic? */
+	bool		rs_relpredicatelocked;	/* predicate lock on relation exists */
 
 	/* scan current state */
 	bool		rs_inited;		/* false = scan not init'd yet */
@@ -62,8 +63,10 @@ typedef struct IndexScanDescData
 	Relation	heapRelation;	/* heap relation descriptor, or NULL */
 	Relation	indexRelation;	/* index relation descriptor */
 	Snapshot	xs_snapshot;	/* snapshot to see */
-	int			numberOfKeys;	/* number of scan keys */
-	ScanKey		keyData;		/* array of scan key descriptors */
+	int			numberOfKeys;	/* number of index qualifier conditions */
+	int			numberOfOrderBys;	/* number of ordering operators */
+	ScanKey		keyData;			/* array of index qualifier descriptors */
+	ScanKey		orderByData;		/* array of ordering op descriptors */
 
 	/* signaling to index AM about killing index tuples */
 	bool		kill_prior_tuple;		/* last-returned tuple is dead */

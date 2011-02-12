@@ -3,7 +3,7 @@
  * pg_constraint.c
  *	  routines to support manipulation of the pg_constraint relation
  *
- * Portions Copyright (c) 1996-2010, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2011, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -18,6 +18,7 @@
 #include "access/heapam.h"
 #include "catalog/dependency.h"
 #include "catalog/indexing.h"
+#include "catalog/objectaccess.h"
 #include "catalog/pg_constraint.h"
 #include "catalog/pg_operator.h"
 #include "catalog/pg_type.h"
@@ -45,6 +46,7 @@ CreateConstraintEntry(const char *constraintName,
 					  char constraintType,
 					  bool isDeferrable,
 					  bool isDeferred,
+					  bool isValidated,
 					  Oid relId,
 					  const int16 *constraintKey,
 					  int constraintNKeys,
@@ -157,6 +159,7 @@ CreateConstraintEntry(const char *constraintName,
 	values[Anum_pg_constraint_contype - 1] = CharGetDatum(constraintType);
 	values[Anum_pg_constraint_condeferrable - 1] = BoolGetDatum(isDeferrable);
 	values[Anum_pg_constraint_condeferred - 1] = BoolGetDatum(isDeferred);
+	values[Anum_pg_constraint_convalidated - 1] = BoolGetDatum(isValidated);
 	values[Anum_pg_constraint_conrelid - 1] = ObjectIdGetDatum(relId);
 	values[Anum_pg_constraint_contypid - 1] = ObjectIdGetDatum(domainId);
 	values[Anum_pg_constraint_conindid - 1] = ObjectIdGetDatum(indexRelId);
@@ -359,6 +362,9 @@ CreateConstraintEntry(const char *constraintName,
 										DEPENDENCY_NORMAL,
 										DEPENDENCY_NORMAL);
 	}
+
+	/* Post creation hook for new constraint */
+	InvokeObjectAccessHook(OAT_POST_CREATE, ConstraintRelationId, conOid, 0);
 
 	return conOid;
 }

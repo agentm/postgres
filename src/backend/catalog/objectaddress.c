@@ -3,7 +3,7 @@
  * objectaddress.c
  *	  functions for working with ObjectAddresses
  *
- * Portions Copyright (c) 1996-2010, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2011, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -25,9 +25,11 @@
 #include "catalog/pg_authid.h"
 #include "catalog/pg_cast.h"
 #include "catalog/pg_class.h"
+#include "catalog/pg_collation.h"
 #include "catalog/pg_constraint.h"
 #include "catalog/pg_conversion.h"
 #include "catalog/pg_database.h"
+#include "catalog/pg_extension.h"
 #include "catalog/pg_language.h"
 #include "catalog/pg_largeobject.h"
 #include "catalog/pg_largeobject_metadata.h"
@@ -46,6 +48,7 @@
 #include "catalog/pg_type.h"
 #include "commands/dbcommands.h"
 #include "commands/defrem.h"
+#include "commands/extension.h"
 #include "commands/proclang.h"
 #include "commands/tablespace.h"
 #include "commands/trigger.h"
@@ -111,6 +114,7 @@ get_object_address(ObjectType objtype, List *objname, List *objargs,
 		case OBJECT_SEQUENCE:
 		case OBJECT_TABLE:
 		case OBJECT_VIEW:
+		case OBJECT_FOREIGN_TABLE:
 			relation =
 				get_relation_by_qualified_name(objtype, objname, lockmode);
 			address.classId = RelationRelationId;
@@ -128,6 +132,7 @@ get_object_address(ObjectType objtype, List *objname, List *objargs,
 			address = get_object_address_relobject(objtype, objname, &relation);
 			break;
 		case OBJECT_DATABASE:
+		case OBJECT_EXTENSION:
 		case OBJECT_TABLESPACE:
 		case OBJECT_ROLE:
 		case OBJECT_SCHEMA:
@@ -135,9 +140,10 @@ get_object_address(ObjectType objtype, List *objname, List *objargs,
 			address = get_object_address_unqualified(objtype, objname);
 			break;
 		case OBJECT_TYPE:
+		case OBJECT_DOMAIN:
 			address.classId = TypeRelationId;
 			address.objectId =
-				typenameTypeId(NULL, makeTypeNameFromNameList(objname), NULL);
+				typenameTypeId(NULL, makeTypeNameFromNameList(objname));
 			address.objectSubId = 0;
 			break;
 		case OBJECT_AGGREGATE:
@@ -158,6 +164,11 @@ get_object_address(ObjectType objtype, List *objname, List *objargs,
 										(TypeName *) linitial(objargs),
 										(TypeName *) lsecond(objargs),
 										false, -1);
+			address.objectSubId = 0;
+			break;
+		case OBJECT_COLLATION:
+			address.classId = CollationRelationId;
+			address.objectId = get_collation_oid(objname, false);
 			address.objectSubId = 0;
 			break;
 		case OBJECT_CONVERSION:
@@ -184,8 +195,8 @@ get_object_address(ObjectType objtype, List *objname, List *objargs,
 			{
 				TypeName *sourcetype = (TypeName *) linitial(objname);
 				TypeName *targettype = (TypeName *) linitial(objargs);
-				Oid sourcetypeid = typenameTypeId(NULL, sourcetype, NULL);
-				Oid targettypeid = typenameTypeId(NULL, targettype, NULL);
+				Oid sourcetypeid = typenameTypeId(NULL, sourcetype);
+				Oid targettypeid = typenameTypeId(NULL, targettype);
 
 				address.classId = CastRelationId;
 				address.objectId =
@@ -266,6 +277,9 @@ get_object_address_unqualified(ObjectType objtype, List *qualname)
 			case OBJECT_DATABASE:
 				msg = gettext_noop("database name cannot be qualified");
 				break;
+			case OBJECT_EXTENSION:
+				msg = gettext_noop("extension name cannot be qualified");
+				break;
 			case OBJECT_TABLESPACE:
 				msg = gettext_noop("tablespace name cannot be qualified");
 				break;
@@ -296,6 +310,11 @@ get_object_address_unqualified(ObjectType objtype, List *qualname)
 		case OBJECT_DATABASE:
 			address.classId = DatabaseRelationId;
 			address.objectId = get_database_oid(name, false);
+			address.objectSubId = 0;
+			break;
+		case OBJECT_EXTENSION:
+			address.classId = ExtensionRelationId;
+			address.objectId = get_extension_oid(name, false);
 			address.objectSubId = 0;
 			break;
 		case OBJECT_TABLESPACE:
@@ -367,6 +386,13 @@ get_relation_by_qualified_name(ObjectType objtype, List *objname,
 				ereport(ERROR,
 						(errcode(ERRCODE_WRONG_OBJECT_TYPE),
 						 errmsg("\"%s\" is not a view",
+								RelationGetRelationName(relation))));
+			break;
+		case OBJECT_FOREIGN_TABLE:
+			if (relation->rd_rel->relkind != RELKIND_FOREIGN_TABLE)
+				ereport(ERROR,
+						(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+						 errmsg("\"%s\" is not a foreign table",
 								RelationGetRelationName(relation))));
 			break;
 		default:
@@ -473,7 +499,7 @@ get_object_address_attribute(ObjectType objtype, List *objname,
 	/* Extract relation name and open relation. */
 	attname = strVal(lfirst(list_tail(objname)));
 	relname = list_truncate(list_copy(objname), list_length(objname) - 1);
-	relation = heap_openrv(makeRangeVarFromNameList(relname), lockmode);
+	relation = relation_openrv(makeRangeVarFromNameList(relname), lockmode);
 	reloid = RelationGetRelid(relation);
 
 	/* Look up attribute and construct return value. */
@@ -552,7 +578,7 @@ object_exists(ObjectAddress address)
 		else
 		{
 			found = ((Form_pg_attribute) GETSTRUCT(atttup))->attisdropped;
-			ReleaseSysCache(atttup);	
+			ReleaseSysCache(atttup);
 		}
 		return found;
 	}
@@ -601,6 +627,9 @@ object_exists(ObjectAddress address)
 		case OperatorRelationId:
 			cache = OPEROID;
 			break;
+		case CollationRelationId:
+			cache = COLLOID;
+			break;
 		case ConversionRelationId:
 			cache = CONVOID;
 			break;
@@ -635,6 +664,9 @@ object_exists(ObjectAddress address)
 		case TSConfigRelationId:
 			cache = TSCONFIGOID;
 			break;
+		case ExtensionRelationId:
+			indexoid = ExtensionOidIndexId;
+			break;
 		default:
 			elog(ERROR, "unrecognized classid: %u", address.classId);
 	}
@@ -654,5 +686,5 @@ object_exists(ObjectAddress address)
 	found = HeapTupleIsValid(systable_getnext(sd));
 	systable_endscan(sd);
 	heap_close(rel, AccessShareLock);
-	return found;	
+	return found;
 }

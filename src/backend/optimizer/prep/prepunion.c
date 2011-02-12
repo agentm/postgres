@@ -17,7 +17,7 @@
  * append relations, and thenceforth share code with the UNION ALL case.
  *
  *
- * Portions Copyright (c) 1996-2010, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2011, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -86,7 +86,7 @@ static List *generate_setop_tlist(List *colTypes, int flag,
 					 bool hack_constants,
 					 List *input_tlist,
 					 List *refnames_tlist);
-static List *generate_append_tlist(List *colTypes, bool flag,
+static List *generate_append_tlist(List *colTypes, List *colCollations, bool flag,
 					  List *input_plans,
 					  List *refnames_tlist);
 static List *generate_setop_grouplist(SetOperationStmt *op, List *targetlist);
@@ -348,7 +348,7 @@ generate_recursion_plan(SetOperationStmt *setOp, PlannerInfo *root,
 	/*
 	 * Generate tlist for RecursiveUnion plan node --- same as in Append cases
 	 */
-	tlist = generate_append_tlist(setOp->colTypes, false,
+	tlist = generate_append_tlist(setOp->colTypes, setOp->colCollations, false,
 								  list_make2(lplan, rplan),
 								  refnames_tlist);
 
@@ -443,7 +443,7 @@ generate_union_plan(SetOperationStmt *op, PlannerInfo *root,
 	 * concerned, but we must make it look real anyway for the benefit of the
 	 * next plan level up.
 	 */
-	tlist = generate_append_tlist(op->colTypes, false,
+	tlist = generate_append_tlist(op->colTypes, op->colCollations, false,
 								  planlist, refnames_tlist);
 
 	/*
@@ -534,7 +534,7 @@ generate_nonunion_plan(SetOperationStmt *op, PlannerInfo *root,
 	 * column is shown as a variable not a constant, else setrefs.c will get
 	 * confused.
 	 */
-	tlist = generate_append_tlist(op->colTypes, true,
+	tlist = generate_append_tlist(op->colTypes, op->colCollations, true,
 								  planlist, refnames_tlist);
 
 	/*
@@ -885,6 +885,7 @@ generate_setop_tlist(List *colTypes, int flag,
 									inputtle->resno,
 									exprType((Node *) inputtle->expr),
 									exprTypmod((Node *) inputtle->expr),
+									exprCollation((Node *) inputtle->expr),
 									0);
 		if (exprType(expr) != colType)
 		{
@@ -936,13 +937,14 @@ generate_setop_tlist(List *colTypes, int flag,
  * The Vars are always generated with varno 0.
  */
 static List *
-generate_append_tlist(List *colTypes, bool flag,
+generate_append_tlist(List *colTypes, List*colCollations, bool flag,
 					  List *input_plans,
 					  List *refnames_tlist)
 {
 	List	   *tlist = NIL;
 	int			resno = 1;
 	ListCell   *curColType;
+	ListCell   *curColCollation;
 	ListCell   *ref_tl_item;
 	int			colindex;
 	TargetEntry *tle;
@@ -997,10 +999,11 @@ generate_append_tlist(List *colTypes, bool flag,
 	 * Now we can build the tlist for the Append.
 	 */
 	colindex = 0;
-	forboth(curColType, colTypes, ref_tl_item, refnames_tlist)
+	forthree(curColType, colTypes, curColCollation, colCollations, ref_tl_item, refnames_tlist)
 	{
 		Oid			colType = lfirst_oid(curColType);
 		int32		colTypmod = colTypmods[colindex++];
+		Oid			colColl = lfirst_oid(curColCollation);
 		TargetEntry *reftle = (TargetEntry *) lfirst(ref_tl_item);
 
 		Assert(reftle->resno == resno);
@@ -1009,6 +1012,7 @@ generate_append_tlist(List *colTypes, bool flag,
 								resno,
 								colType,
 								colTypmod,
+								colColl,
 								0);
 		tle = makeTargetEntry((Expr *) expr,
 							  (AttrNumber) resno++,
@@ -1025,6 +1029,7 @@ generate_append_tlist(List *colTypes, bool flag,
 								resno,
 								INT4OID,
 								-1,
+								InvalidOid,
 								0);
 		tle = makeTargetEntry((Expr *) expr,
 							  (AttrNumber) resno++,
@@ -1289,13 +1294,10 @@ expand_inherited_rtentry(PlannerInfo *root, RangeTblEntry *rte, Index rti)
 
 			newrc->rti = childRTindex;
 			newrc->prti = rti;
+			newrc->rowmarkId = oldrc->rowmarkId;
 			newrc->markType = oldrc->markType;
 			newrc->noWait = oldrc->noWait;
 			newrc->isParent = false;
-			/* junk attrs for children are not identified yet */
-			newrc->ctidAttNo = InvalidAttrNumber;
-			newrc->toidAttNo = InvalidAttrNumber;
-			newrc->wholeAttNo = InvalidAttrNumber;
 
 			root->rowMarks = lappend(root->rowMarks, newrc);
 		}
@@ -1348,6 +1350,7 @@ make_inh_translation_list(Relation oldrelation, Relation newrelation,
 		char	   *attname;
 		Oid			atttypid;
 		int32		atttypmod;
+		Oid			attcollation;
 		int			new_attno;
 
 		att = old_tupdesc->attrs[old_attno];
@@ -1360,6 +1363,7 @@ make_inh_translation_list(Relation oldrelation, Relation newrelation,
 		attname = NameStr(att->attname);
 		atttypid = att->atttypid;
 		atttypmod = att->atttypmod;
+		attcollation = att->attcollation;
 
 		/*
 		 * When we are generating the "translation list" for the parent table
@@ -1371,6 +1375,7 @@ make_inh_translation_list(Relation oldrelation, Relation newrelation,
 										 (AttrNumber) (old_attno + 1),
 										 atttypid,
 										 atttypmod,
+										 attcollation,
 										 0));
 			continue;
 		}
@@ -1413,6 +1418,7 @@ make_inh_translation_list(Relation oldrelation, Relation newrelation,
 									 (AttrNumber) (new_attno + 1),
 									 atttypid,
 									 atttypmod,
+									 attcollation,
 									 0));
 	}
 
@@ -1641,6 +1647,7 @@ adjust_appendrel_attrs_mutator(Node *node, AppendRelInfo *context)
 	Assert(!IsA(node, SpecialJoinInfo));
 	Assert(!IsA(node, AppendRelInfo));
 	Assert(!IsA(node, PlaceHolderInfo));
+	Assert(!IsA(node, MinMaxAggInfo));
 
 	/*
 	 * We have to process RestrictInfo nodes specially.  (Note: although
@@ -1682,13 +1689,13 @@ adjust_appendrel_attrs_mutator(Node *node, AppendRelInfo *context)
 
 		/*
 		 * Reset cached derivative fields, since these might need to have
-		 * different values when considering the child relation.
+		 * different values when considering the child relation.  Note we
+		 * don't reset left_ec/right_ec: each child variable is implicitly
+		 * equivalent to its parent, so still a member of the same EC if any.
 		 */
 		newinfo->eval_cost.startup = -1;
 		newinfo->norm_selec = -1;
 		newinfo->outer_selec = -1;
-		newinfo->left_ec = NULL;
-		newinfo->right_ec = NULL;
 		newinfo->left_em = NULL;
 		newinfo->right_em = NULL;
 		newinfo->scansel_cache = NIL;

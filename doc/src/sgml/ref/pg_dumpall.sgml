@@ -193,6 +193,26 @@ PostgreSQL documentation
      </varlistentry>
 
      <varlistentry>
+      <term><option>--no-security-label</option></term>
+      <listitem>
+       <para>
+        Do not dump security labels.
+       </para>
+      </listitem>
+     </varlistentry>
+
+     <varlistentry>
+      <term><option>--no-unlogged-table-data</option></term>
+      <listitem>
+       <para>
+        Do not dump the contents of unlogged tables.  This option has no
+        effect on whether or not the table definitions (schema) are dumped;
+        it only suppresses dumping the table data.
+       </para>
+      </listitem>
+     </varlistentry>
+
+     <varlistentry>
       <term><option>-r</option></term>
       <term><option>--roles-only</option></term>
       <listitem>
@@ -493,15 +513,6 @@ PostgreSQL documentation
        </para>
       </listitem>
      </varlistentry>
-     <varlistentry>
-      <term><option>--security-label</option></term>
-      <listitem>
-       <para>
-        With this option, it also outputs security labels of database
-        objects to be dumped, if labeled.
-       </para>
-      </listitem>
-     </varlistentry>
    </variablelist>
   </para>
  </refsect1>
@@ -552,7 +563,7 @@ PostgreSQL documentation
 
   <para>
    <application>pg_dumpall</application> requires all needed
-   tablespace directories to exist before the restore;  otherwise, 
+   tablespace directories to exist before the restore;  otherwise,
    database creation will fail for databases in non-default
    locations.
   </para>

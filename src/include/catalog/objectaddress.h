@@ -3,14 +3,14 @@
  * objectaddress.h
  *	  functions for working with object addresses
  *
- * Portions Copyright (c) 1996-2010, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2011, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/catalog/objectaddress.h
  *
  *-------------------------------------------------------------------------
  */
-#ifndef OBJECTADDRESS_H 
+#ifndef OBJECTADDRESS_H
 #define OBJECTADDRESS_H
 
 #include "nodes/parsenodes.h"

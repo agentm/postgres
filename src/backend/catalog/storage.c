@@ -3,7 +3,7 @@
  * storage.c
  *	  code to create and destroy physical storage for relations
  *
- * Portions Copyright (c) 1996-2010, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2011, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -74,6 +74,7 @@ static PendingRelDelete *pendingDeletes = NULL; /* head of linked list */
 typedef struct xl_smgr_create
 {
 	RelFileNode rnode;
+	ForkNumber	forkNum;
 } xl_smgr_create;
 
 typedef struct xl_smgr_truncate
@@ -95,32 +96,37 @@ typedef struct xl_smgr_truncate
  * transaction aborts later on, the storage will be destroyed.
  */
 void
-RelationCreateStorage(RelFileNode rnode, bool istemp)
+RelationCreateStorage(RelFileNode rnode, char relpersistence)
 {
 	PendingRelDelete *pending;
-	XLogRecPtr	lsn;
-	XLogRecData rdata;
-	xl_smgr_create xlrec;
 	SMgrRelation srel;
-	BackendId	backend = istemp ? MyBackendId : InvalidBackendId;
+	BackendId	backend;
+	bool		needs_wal;
+
+	switch (relpersistence)
+	{
+		case RELPERSISTENCE_TEMP:
+			backend = MyBackendId;
+			needs_wal = false;
+			break;
+		case RELPERSISTENCE_UNLOGGED:
+			backend = InvalidBackendId;
+			needs_wal = false;
+			break;
+		case RELPERSISTENCE_PERMANENT:
+			backend = InvalidBackendId;
+			needs_wal = true;
+			break;
+		default:
+			elog(ERROR, "invalid relpersistence: %c", relpersistence);
+			return;			/* placate compiler */
+	}
 
 	srel = smgropen(rnode, backend);
 	smgrcreate(srel, MAIN_FORKNUM, false);
 
-	if (!istemp)
-	{
-		/*
-		 * Make an XLOG entry reporting the file creation.
-		 */
-		xlrec.rnode = rnode;
-
-		rdata.data = (char *) &xlrec;
-		rdata.len = sizeof(xlrec);
-		rdata.buffer = InvalidBuffer;
-		rdata.next = NULL;
-
-		lsn = XLogInsert(RM_SMGR_ID, XLOG_SMGR_CREATE, &rdata);
-	}
+	if (needs_wal)
+		log_smgrcreate(&srel->smgr_rnode.node, MAIN_FORKNUM);
 
 	/* Add the relation to the list of stuff to delete at abort */
 	pending = (PendingRelDelete *)
@@ -131,6 +137,29 @@ RelationCreateStorage(RelFileNode rnode, bool istemp)
 	pending->nestLevel = GetCurrentTransactionNestLevel();
 	pending->next = pendingDeletes;
 	pendingDeletes = pending;
+}
+
+/*
+ * Perform XLogInsert of a XLOG_SMGR_CREATE record to WAL.
+ */
+void
+log_smgrcreate(RelFileNode *rnode, ForkNumber forkNum)
+{
+	xl_smgr_create xlrec;
+	XLogRecData rdata;
+
+	/*
+	 * Make an XLOG entry reporting the file creation.
+	 */
+	xlrec.rnode = *rnode;
+	xlrec.forkNum = forkNum;
+
+	rdata.data = (char *) &xlrec;
+	rdata.len = sizeof(xlrec);
+	rdata.buffer = InvalidBuffer;
+	rdata.next = NULL;
+
+	XLogInsert(RM_SMGR_ID, XLOG_SMGR_CREATE, &rdata);
 }
 
 /*
@@ -253,7 +282,7 @@ RelationTruncate(Relation rel, BlockNumber nblocks)
 	 * failure to truncate, that might spell trouble at WAL replay, into a
 	 * certain PANIC.
 	 */
-	if (!rel->rd_istemp)
+	if (RelationNeedsWAL(rel))
 	{
 		/*
 		 * Make an XLOG entry reporting the file truncation.
@@ -462,7 +491,7 @@ smgr_redo(XLogRecPtr lsn, XLogRecord *record)
 		SMgrRelation reln;
 
 		reln = smgropen(xlrec->rnode, InvalidBackendId);
-		smgrcreate(reln, MAIN_FORKNUM, true);
+		smgrcreate(reln, xlrec->forkNum, true);
 	}
 	else if (info == XLOG_SMGR_TRUNCATE)
 	{
@@ -507,7 +536,7 @@ smgr_desc(StringInfo buf, uint8 xl_info, char *rec)
 	if (info == XLOG_SMGR_CREATE)
 	{
 		xl_smgr_create *xlrec = (xl_smgr_create *) rec;
-		char	   *path = relpathperm(xlrec->rnode, MAIN_FORKNUM);
+		char	   *path = relpathperm(xlrec->rnode, xlrec->forkNum);
 
 		appendStringInfo(buf, "file create: %s", path);
 		pfree(path);

@@ -3,7 +3,7 @@
  * arrayfuncs.c
  *	  Support functions for arrays.
  *
- * Portions Copyright (c) 1996-2010, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2011, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -202,7 +202,7 @@ array_in(PG_FUNCTION_ARGS)
 			ereport(ERROR,
 					(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
 					 errmsg("number of array dimensions (%d) exceeds the maximum allowed (%d)",
-							ndim, MAXDIM)));
+							ndim + 1, MAXDIM)));
 
 		for (q = p; isdigit((unsigned char) *q) || (*q == '-') || (*q == '+'); q++);
 		if (q == p)				/* no digits? */
@@ -481,7 +481,7 @@ ArrayCount(const char *str, int *dim, char typdelim)
 							ereport(ERROR,
 									(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
 									 errmsg("number of array dimensions (%d) exceeds the maximum allowed (%d)",
-											nest_level, MAXDIM)));
+											nest_level + 1, MAXDIM)));
 						temp[nest_level] = 0;
 						nest_level++;
 						if (ndim < nest_level)
@@ -2500,6 +2500,7 @@ array_set_slice(ArrayType *array,
 	{
 		/*
 		 * here we must allow for possibility of slice larger than orig array
+		 * and/or not adjacent to orig array subscripts
 		 */
 		int			oldlb = ARR_LBOUND(array)[0];
 		int			oldub = oldlb + ARR_DIMS(array)[0] - 1;
@@ -2508,10 +2509,12 @@ array_set_slice(ArrayType *array,
 		char	   *oldarraydata = ARR_DATA_PTR(array);
 		bits8	   *oldarraybitmap = ARR_NULLBITMAP(array);
 
+		/* count/size of old array entries that will go before the slice */
 		itemsbefore = Min(slicelb, oldub + 1) - oldlb;
 		lenbefore = array_nelems_size(oldarraydata, 0, oldarraybitmap,
 									  itemsbefore,
 									  elmlen, elmbyval, elmalign);
+		/* count/size of old array entries that will be replaced by slice */
 		if (slicelb > sliceub)
 		{
 			nolditems = 0;
@@ -2525,7 +2528,8 @@ array_set_slice(ArrayType *array,
 											nolditems,
 											elmlen, elmbyval, elmalign);
 		}
-		itemsafter = oldub - sliceub;
+		/* count/size of old array entries that will go after the slice */
+		itemsafter = oldub + 1 - Max(sliceub + 1, oldlb);
 		lenafter = olddatasize - lenbefore - olditemsize;
 	}
 
@@ -2998,7 +3002,7 @@ deconstruct_array(ArrayType *array,
 	nelems = ArrayGetNItems(ARR_NDIM(array), ARR_DIMS(array));
 	*elemsp = elems = (Datum *) palloc(nelems * sizeof(Datum));
 	if (nullsp)
-		*nullsp = nulls = (bool *) palloc(nelems * sizeof(bool));
+		*nullsp = nulls = (bool *) palloc0(nelems * sizeof(bool));
 	else
 		nulls = NULL;
 	*nelemsp = nelems;
@@ -3023,8 +3027,6 @@ deconstruct_array(ArrayType *array,
 		else
 		{
 			elems[i] = fetch_att(p, elmbyval, elmlen);
-			if (nulls)
-				nulls[i] = false;
 			p = att_addlength_pointer(p, elmlen, p);
 			p = (char *) att_align_nominal(p, elmalign);
 		}
@@ -3040,6 +3042,49 @@ deconstruct_array(ArrayType *array,
 			}
 		}
 	}
+}
+
+/*
+ * array_contains_nulls --- detect whether an array has any null elements
+ *
+ * This gives an accurate answer, whereas testing ARR_HASNULL only tells
+ * if the array *might* contain a null.
+ */
+bool
+array_contains_nulls(ArrayType *array)
+{
+	int			nelems;
+	bits8	   *bitmap;
+	int			bitmask;
+
+	/* Easy answer if there's no null bitmap */
+	if (!ARR_HASNULL(array))
+		return false;
+
+	nelems = ArrayGetNItems(ARR_NDIM(array), ARR_DIMS(array));
+
+	bitmap = ARR_NULLBITMAP(array);
+
+	/* check whole bytes of the bitmap byte-at-a-time */
+	while (nelems >= 8)
+	{
+		if (*bitmap != 0xFF)
+			return true;
+		bitmap++;
+		nelems -= 8;
+	}
+
+	/* check last partial byte */
+	bitmask = 1;
+	while (nelems > 0)
+	{
+		if ((*bitmap & bitmask) == 0)
+			return true;
+		bitmask <<= 1;
+		nelems--;
+	}
+
+	return false;
 }
 
 
@@ -3262,6 +3307,7 @@ array_cmp(FunctionCallInfo fcinfo)
 {
 	ArrayType  *array1 = PG_GETARG_ARRAYTYPE_P(0);
 	ArrayType  *array2 = PG_GETARG_ARRAYTYPE_P(1);
+	Oid			collation = PG_GET_COLLATION();
 	int			ndims1 = ARR_NDIM(array1);
 	int			ndims2 = ARR_NDIM(array2);
 	int		   *dims1 = ARR_DIMS(array1);
@@ -3296,7 +3342,8 @@ array_cmp(FunctionCallInfo fcinfo)
 	 */
 	typentry = (TypeCacheEntry *) fcinfo->flinfo->fn_extra;
 	if (typentry == NULL ||
-		typentry->type_id != element_type)
+		typentry->type_id != element_type ||
+		typentry->cmp_proc_finfo.fn_collation != collation)
 	{
 		typentry = lookup_type_cache(element_type,
 									 TYPECACHE_CMP_PROC_FINFO);
@@ -3306,6 +3353,7 @@ array_cmp(FunctionCallInfo fcinfo)
 			   errmsg("could not identify a comparison function for type %s",
 					  format_type_be(element_type))));
 		fcinfo->flinfo->fn_extra = (void *) typentry;
+		typentry->cmp_proc_finfo.fn_collation = collation;
 	}
 	typlen = typentry->typlen;
 	typbyval = typentry->typbyval;
@@ -3445,6 +3493,117 @@ array_cmp(FunctionCallInfo fcinfo)
 	PG_FREE_IF_COPY(array2, 1);
 
 	return result;
+}
+
+
+/*-----------------------------------------------------------------------------
+ * array hashing
+ *		Hash the elements and combine the results.
+ *----------------------------------------------------------------------------
+ */
+
+Datum
+hash_array(PG_FUNCTION_ARGS)
+{
+	ArrayType  *array = PG_GETARG_ARRAYTYPE_P(0);
+	int			ndims = ARR_NDIM(array);
+	int		   *dims = ARR_DIMS(array);
+	Oid			element_type = ARR_ELEMTYPE(array);
+	uint32		result = 0;
+	int			nitems;
+	TypeCacheEntry *typentry;
+	int			typlen;
+	bool		typbyval;
+	char		typalign;
+	char	   *ptr;
+	bits8	   *bitmap;
+	int			bitmask;
+	int			i;
+	FunctionCallInfoData locfcinfo;
+
+	/*
+	 * We arrange to look up the hash function only once per series of calls,
+	 * assuming the element type doesn't change underneath us.  The typcache
+	 * is used so that we have no memory leakage when being used as an index
+	 * support function.
+	 */
+	typentry = (TypeCacheEntry *) fcinfo->flinfo->fn_extra;
+	if (typentry == NULL ||
+		typentry->type_id != element_type)
+	{
+		typentry = lookup_type_cache(element_type,
+									 TYPECACHE_HASH_PROC_FINFO);
+		if (!OidIsValid(typentry->hash_proc_finfo.fn_oid))
+			ereport(ERROR,
+					(errcode(ERRCODE_UNDEFINED_FUNCTION),
+					 errmsg("could not identify a hash function for type %s",
+							format_type_be(element_type))));
+		fcinfo->flinfo->fn_extra = (void *) typentry;
+	}
+	typlen = typentry->typlen;
+	typbyval = typentry->typbyval;
+	typalign = typentry->typalign;
+
+	/*
+	 * apply the hash function to each array element.
+	 */
+	InitFunctionCallInfoData(locfcinfo, &typentry->hash_proc_finfo, 1,
+							 NULL, NULL);
+
+	/* Loop over source data */
+	nitems = ArrayGetNItems(ndims, dims);
+	ptr = ARR_DATA_PTR(array);
+	bitmap = ARR_NULLBITMAP(array);
+	bitmask = 1;
+
+	for (i = 0; i < nitems; i++)
+	{
+		uint32		elthash;
+
+		/* Get element, checking for NULL */
+		if (bitmap && (*bitmap & bitmask) == 0)
+		{
+			/* Treat nulls as having hashvalue 0 */
+			elthash = 0;
+		}
+		else
+		{
+			Datum		elt;
+
+			elt = fetch_att(ptr, typbyval, typlen);
+			ptr = att_addlength_pointer(ptr, typlen, ptr);
+			ptr = (char *) att_align_nominal(ptr, typalign);
+
+			/* Apply the hash function */
+			locfcinfo.arg[0] = elt;
+			locfcinfo.argnull[0] = false;
+			locfcinfo.isnull = false;
+			elthash = DatumGetUInt32(FunctionCallInvoke(&locfcinfo));
+		}
+
+		/* advance bitmap pointer if any */
+		if (bitmap)
+		{
+			bitmask <<= 1;
+			if (bitmask == 0x100)
+			{
+				bitmap++;
+				bitmask = 1;
+			}
+		}
+
+		/*
+		 * Combine hash values of successive elements by rotating the previous
+		 * value left 1 bit, then XOR'ing in the new element's hash value.
+		 */
+		result = (result << 1) | (result >> 31);
+		result ^= elthash;
+	}
+
+	/* Avoid leaking memory when handed toasted input. */
+	PG_FREE_IF_COPY(array, 0);
+
+	PG_RETURN_UINT32(result);
 }
 
 
@@ -4548,7 +4707,7 @@ array_fill_internal(ArrayType *dims, ArrayType *lbs,
 				 errmsg("wrong range of array subscripts"),
 				 errdetail("Lower bound of dimension array must be one.")));
 
-	if (ARR_HASNULL(dims))
+	if (array_contains_nulls(dims))
 		ereport(ERROR,
 				(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
 				 errmsg("dimension values cannot be null")));
@@ -4580,7 +4739,7 @@ array_fill_internal(ArrayType *dims, ArrayType *lbs,
 					 errmsg("wrong range of array subscripts"),
 				  errdetail("Lower bound of dimension array must be one.")));
 
-		if (ARR_HASNULL(lbs))
+		if (array_contains_nulls(lbs))
 			ereport(ERROR,
 					(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
 					 errmsg("dimension values cannot be null")));

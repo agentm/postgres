@@ -3,7 +3,7 @@
  * nbtinsert.c
  *	  Item insertion in Lehman and Yao btrees for Postgres.
  *
- * Portions Copyright (c) 1996-2010, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2011, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -21,6 +21,7 @@
 #include "miscadmin.h"
 #include "storage/bufmgr.h"
 #include "storage/lmgr.h"
+#include "storage/predicate.h"
 #include "utils/inval.h"
 #include "utils/tqual.h"
 
@@ -174,6 +175,14 @@ top:
 
 	if (checkUnique != UNIQUE_CHECK_EXISTING)
 	{
+		/*
+		 * The only conflict predicate locking cares about for indexes is when
+		 * an index tuple insert conflicts with an existing lock.  Since the
+		 * actual location of the insert is hard to predict because of the
+		 * random search used to prevent O(N^2) performance when there are many
+		 * duplicate entries, we can just use the "first valid" page.
+		 */
+		CheckForSerializableConflictIn(rel, NULL, buf);
 		/* do the insertion */
 		_bt_findinsertloc(rel, &buf, &offset, natts, itup_scankey, itup, heapRel);
 		_bt_insertonpg(rel, buf, stack, itup, offset, false);
@@ -696,6 +705,9 @@ _bt_insertonpg(Relation rel,
 		/* split the buffer into left and right halves */
 		rbuf = _bt_split(rel, buf, firstright,
 						 newitemoff, itemsz, itup, newitemonleft);
+		PredicateLockPageSplit(rel,
+							   BufferGetBlockNumber(buf),
+							   BufferGetBlockNumber(rbuf));
 
 		/*----------
 		 * By here,
@@ -766,7 +778,7 @@ _bt_insertonpg(Relation rel,
 		}
 
 		/* XLOG stuff */
-		if (!rel->rd_istemp)
+		if (RelationNeedsWAL(rel))
 		{
 			xl_btree_insert xlrec;
 			BlockNumber xldownlink;
@@ -1165,7 +1177,7 @@ _bt_split(Relation rel, Buffer buf, OffsetNumber firstright,
 	}
 
 	/* XLOG stuff */
-	if (!rel->rd_istemp)
+	if (RelationNeedsWAL(rel))
 	{
 		xl_btree_split xlrec;
 		uint8		xlinfo;
@@ -1914,7 +1926,7 @@ _bt_newroot(Relation rel, Buffer lbuf, Buffer rbuf)
 	MarkBufferDirty(metabuf);
 
 	/* XLOG stuff */
-	if (!rel->rd_istemp)
+	if (RelationNeedsWAL(rel))
 	{
 		xl_btree_newroot xlrec;
 		XLogRecPtr	recptr;

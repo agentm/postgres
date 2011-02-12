@@ -2,7 +2,7 @@
  * oracle_compat.c
  *	Oracle compatible functions.
  *
- * Copyright (c) 1996-2010, PostgreSQL Global Development Group
+ * Copyright (c) 1996-2011, PostgreSQL Global Development Group
  *
  *	Author: Edmund Mergl <E.Mergl@bawue.de>
  *	Multibyte enhancement: Tatsuo Ishii <ishii@postgresql.org>
@@ -47,7 +47,8 @@ lower(PG_FUNCTION_ARGS)
 	text	   *result;
 
 	out_string = str_tolower(VARDATA_ANY(in_string),
-							 VARSIZE_ANY_EXHDR(in_string));
+							 VARSIZE_ANY_EXHDR(in_string),
+							 PG_GET_COLLATION());
 	result = cstring_to_text(out_string);
 	pfree(out_string);
 
@@ -77,7 +78,8 @@ upper(PG_FUNCTION_ARGS)
 	text	   *result;
 
 	out_string = str_toupper(VARDATA_ANY(in_string),
-							 VARSIZE_ANY_EXHDR(in_string));
+							 VARSIZE_ANY_EXHDR(in_string),
+							 PG_GET_COLLATION());
 	result = cstring_to_text(out_string);
 	pfree(out_string);
 
@@ -110,7 +112,8 @@ initcap(PG_FUNCTION_ARGS)
 	text	   *result;
 
 	out_string = str_initcap(VARDATA_ANY(in_string),
-							 VARSIZE_ANY_EXHDR(in_string));
+							 VARSIZE_ANY_EXHDR(in_string),
+							 PG_GET_COLLATION());
 	result = cstring_to_text(out_string);
 	pfree(out_string);
 

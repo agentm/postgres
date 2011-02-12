@@ -3,7 +3,7 @@
  * postgres.c
  *	  POSTGRES C Backend Interface
  *
- * Portions Copyright (c) 1996-2010, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2011, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -19,10 +19,11 @@
 
 #include "postgres.h"
 
+#include <fcntl.h>
+#include <limits.h>
+#include <signal.h>
 #include <time.h>
 #include <unistd.h>
-#include <signal.h>
-#include <fcntl.h>
 #include <sys/socket.h>
 #ifdef HAVE_SYS_SELECT_H
 #include <sys/select.h>
@@ -118,6 +119,12 @@ static long max_stack_depth_bytes = 100 * 1024L;
  */
 char	   *stack_base_ptr = NULL;
 
+/*
+ * On IA64 we also have to remember the register stack base.
+ */
+#if defined(__ia64__) || defined(__ia64)
+char	   *register_stack_base_ptr = NULL;
+#endif
 
 /*
  * Flag to mark SIGHUP. Whenever the main loop comes around it
@@ -2896,15 +2903,23 @@ ProcessInterrupts(void)
 					(errcode(ERRCODE_ADMIN_SHUTDOWN),
 					 errmsg("terminating autovacuum process due to administrator command")));
 		else if (RecoveryConflictPending && RecoveryConflictRetryable)
+		{
+			pgstat_report_recovery_conflict(RecoveryConflictReason);
 			ereport(FATAL,
 					(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
 			  errmsg("terminating connection due to conflict with recovery"),
 					 errdetail_recovery_conflict()));
+		}
 		else if (RecoveryConflictPending)
+		{
+			/* Currently there is only one non-retryable recovery conflict */
+			Assert(RecoveryConflictReason == PROCSIG_RECOVERY_CONFLICT_DATABASE);
+			pgstat_report_recovery_conflict(RecoveryConflictReason);
 			ereport(FATAL,
-					(errcode(ERRCODE_ADMIN_SHUTDOWN),
+					(errcode(ERRCODE_DATABASE_DROPPED),
 			  errmsg("terminating connection due to conflict with recovery"),
 					 errdetail_recovery_conflict()));
+		}
 		else
 			ereport(FATAL,
 					(errcode(ERRCODE_ADMIN_SHUTDOWN),
@@ -2949,6 +2964,7 @@ ProcessInterrupts(void)
 			RecoveryConflictPending = false;
 			DisableNotifyInterrupt();
 			DisableCatchupInterrupt();
+			pgstat_report_recovery_conflict(RecoveryConflictReason);
 			if (DoingCommandRead)
 				ereport(FATAL,
 						(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
@@ -2980,6 +2996,37 @@ ProcessInterrupts(void)
 	}
 	/* If we get here, do nothing (probably, QueryCancelPending was reset) */
 }
+
+
+/*
+ * IA64-specific code to fetch the AR.BSP register for stack depth checks.
+ *
+ * We currently support gcc and icc here.
+ */
+#if defined(__ia64__) || defined(__ia64)
+
+#ifdef __INTEL_COMPILER
+#include <asm/ia64regs.h>
+#endif
+
+static __inline__ char *
+ia64_get_bsp(void)
+{
+	char	   *ret;
+
+#ifndef __INTEL_COMPILER
+	/* the ;; is a "stop", seems to be required before fetching BSP */
+	__asm__ __volatile__(
+		";;\n"
+		"	mov	%0=ar.bsp	\n"
+:		"=r"(ret));
+#else
+  ret = (char *) __getReg(_IA64_REG_AR_BSP);
+#endif
+  return ret;
+}
+
+#endif /* IA64 */
 
 
 /*
@@ -3021,9 +3068,33 @@ check_stack_depth(void)
 		ereport(ERROR,
 				(errcode(ERRCODE_STATEMENT_TOO_COMPLEX),
 				 errmsg("stack depth limit exceeded"),
-		 errhint("Increase the configuration parameter \"max_stack_depth\", "
-		   "after ensuring the platform's stack depth limit is adequate.")));
+				 errhint("Increase the configuration parameter \"max_stack_depth\" (currently %dkB), "
+						 "after ensuring the platform's stack depth limit is adequate.",
+						 max_stack_depth)));
 	}
+
+	/*
+	 * On IA64 there is a separate "register" stack that requires its own
+	 * independent check.  For this, we have to measure the change in the
+	 * "BSP" pointer from PostgresMain to here.  Logic is just as above,
+	 * except that we know IA64's register stack grows up.
+	 *
+	 * Note we assume that the same max_stack_depth applies to both stacks.
+	 */
+#if defined(__ia64__) || defined(__ia64)
+	stack_depth = (long) (ia64_get_bsp() - register_stack_base_ptr);
+
+	if (stack_depth > max_stack_depth_bytes &&
+		register_stack_base_ptr != NULL)
+	{
+		ereport(ERROR,
+				(errcode(ERRCODE_STATEMENT_TOO_COMPLEX),
+				 errmsg("stack depth limit exceeded"),
+				 errhint("Increase the configuration parameter \"max_stack_depth\" (currently %dkB), "
+						 "after ensuring the platform's stack depth limit is adequate.",
+						 max_stack_depth)));
+	}
+#endif /* IA64 */
 }
 
 /* GUC assign hook for max_stack_depth */
@@ -3433,6 +3504,9 @@ PostgresMain(int argc, char *argv[], const char *username)
 
 	/* Set up reference point for stack depth checking */
 	stack_base_ptr = &stack_base;
+#if defined(__ia64__) || defined(__ia64)
+	register_stack_base_ptr = ia64_get_bsp();
+#endif
 
 	/* Compute paths, if we didn't inherit them from postmaster */
 	if (my_exec_path[0] == '\0')
@@ -3931,8 +4005,9 @@ PostgresMain(int argc, char *argv[], const char *username)
 				/* Set statement_timestamp() */
 				SetCurrentStatementStartTimestamp();
 
-				/* Tell the collector what we're doing */
+				/* Report query to various monitoring facilities. */
 				pgstat_report_activity("<FASTPATH> function call");
+				set_ps_display("<FASTPATH>", false);
 
 				/* start an xact for this function invocation */
 				start_xact_command();
@@ -4106,7 +4181,7 @@ PostgresMain(int argc, char *argv[], const char *username)
 /*
  * Obtain platform stack depth limit (in bytes)
  *
- * Return -1 if unlimited or not known
+ * Return -1 if unknown
  */
 long
 get_stack_depth_rlimit(void)
@@ -4122,7 +4197,10 @@ get_stack_depth_rlimit(void)
 		if (getrlimit(RLIMIT_STACK, &rlim) < 0)
 			val = -1;
 		else if (rlim.rlim_cur == RLIM_INFINITY)
-			val = -1;
+			val = LONG_MAX;
+		/* rlim_cur is probably of an unsigned type, so check for overflow */
+		else if (rlim.rlim_cur >= LONG_MAX)
+			val = LONG_MAX;
 		else
 			val = rlim.rlim_cur;
 	}

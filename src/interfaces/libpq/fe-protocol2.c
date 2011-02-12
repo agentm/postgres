@@ -3,7 +3,7 @@
  * fe-protocol2.c
  *	  functions that are specific to frontend/backend protocol version 2
  *
- * Portions Copyright (c) 1996-2010, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2011, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -541,6 +541,10 @@ pqParseInput2(PGconn *conn)
 				case 'H':		/* Start Copy Out */
 					conn->asyncStatus = PGASYNC_COPY_OUT;
 					break;
+					/*
+					 * Don't need to process CopyBothResponse here because
+					 * it never arrives from the server during protocol 2.0.
+					 */
 				default:
 					printfPQExpBuffer(&conn->errorMessage,
 									  libpq_gettext(

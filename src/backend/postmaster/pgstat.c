@@ -11,7 +11,7 @@
  *			- Add a pgstat config column to pg_database, so this
  *			  entire thing can be enabled/disabled on a per db basis.
  *
- *	Copyright (c) 2001-2010, PostgreSQL Global Development Group
+ *	Copyright (c) 2001-2011, PostgreSQL Global Development Group
  *
  *	src/backend/postmaster/pgstat.c
  * ----------
@@ -57,6 +57,7 @@
 #include "storage/ipc.h"
 #include "storage/pg_shmem.h"
 #include "storage/pmsignal.h"
+#include "storage/procsignal.h"
 #include "utils/guc.h"
 #include "utils/memutils.h"
 #include "utils/ps_status.h"
@@ -278,6 +279,7 @@ static void pgstat_recv_analyze(PgStat_MsgAnalyze *msg, int len);
 static void pgstat_recv_bgwriter(PgStat_MsgBgWriter *msg, int len);
 static void pgstat_recv_funcstat(PgStat_MsgFuncstat *msg, int len);
 static void pgstat_recv_funcpurge(PgStat_MsgFuncpurge *msg, int len);
+static void pgstat_recv_recoveryconflict(PgStat_MsgRecoveryConflict *msg, int len);
 
 
 /* ------------------------------------------------------------
@@ -1314,6 +1316,25 @@ pgstat_report_analyze(Relation rel, bool adopt_counts,
 	pgstat_send(&msg, sizeof(msg));
 }
 
+/* --------
+ * pgstat_report_recovery_conflict() -
+ *
+ *  Tell the collector about a Hot Standby recovery conflict.
+ * --------
+ */
+void
+pgstat_report_recovery_conflict(int reason)
+{
+	PgStat_MsgRecoveryConflict msg;
+
+	if (pgStatSock == PGINVALID_SOCKET || !pgstat_track_counts)
+		return;
+
+	pgstat_setheader(&msg.m_hdr, PGSTAT_MTYPE_RECOVERYCONFLICT);
+	msg.m_databaseid = MyDatabaseId;
+	msg.m_reason = reason;
+	pgstat_send(&msg, sizeof(msg));
+}
 
 /* ----------
  * pgstat_ping() -
@@ -3053,6 +3074,10 @@ PgstatCollectorMain(int argc, char *argv[])
 					pgstat_recv_funcpurge((PgStat_MsgFuncpurge *) &msg, len);
 					break;
 
+				case PGSTAT_MTYPE_RECOVERYCONFLICT:
+					pgstat_recv_recoveryconflict((PgStat_MsgRecoveryConflict *) &msg, len);
+					break;
+
 				default:
 					break;
 			}
@@ -3129,6 +3154,13 @@ pgstat_get_db_entry(Oid databaseid, bool create)
 		result->n_tuples_updated = 0;
 		result->n_tuples_deleted = 0;
 		result->last_autovac_time = 0;
+		result->n_conflict_tablespace = 0;
+		result->n_conflict_lock = 0;
+		result->n_conflict_snapshot = 0;
+		result->n_conflict_bufferpin = 0;
+		result->n_conflict_startup_deadlock = 0;
+
+		result->stat_reset_timestamp = GetCurrentTimestamp();
 
 		memset(&hash_ctl, 0, sizeof(hash_ctl));
 		hash_ctl.keysize = sizeof(Oid);
@@ -3408,6 +3440,12 @@ pgstat_read_statsfile(Oid onlydb, bool permanent)
 	 * load an existing statsfile.
 	 */
 	memset(&globalStats, 0, sizeof(globalStats));
+
+	/*
+	 * Set the current timestamp (will be kept only in case we can't load an
+	 * existing statsfile.
+	 */
+	globalStats.stat_reset_timestamp = GetCurrentTimestamp();
 
 	/*
 	 * Try to open the status file. If it doesn't exist, the backends simply
@@ -4006,10 +4044,23 @@ pgstat_recv_resetcounter(PgStat_MsgResetcounter *msg, int len)
 
 	dbentry->tables = NULL;
 	dbentry->functions = NULL;
+
+	/*
+	 * Reset database-level stats too.  This should match the initialization
+	 * code in pgstat_get_db_entry().
+	 */
 	dbentry->n_xact_commit = 0;
 	dbentry->n_xact_rollback = 0;
 	dbentry->n_blocks_fetched = 0;
 	dbentry->n_blocks_hit = 0;
+	dbentry->n_tuples_returned = 0;
+	dbentry->n_tuples_fetched = 0;
+	dbentry->n_tuples_inserted = 0;
+	dbentry->n_tuples_updated = 0;
+	dbentry->n_tuples_deleted = 0;
+	dbentry->last_autovac_time = 0;
+
+	dbentry->stat_reset_timestamp = GetCurrentTimestamp();
 
 	memset(&hash_ctl, 0, sizeof(hash_ctl));
 	hash_ctl.keysize = sizeof(Oid);
@@ -4042,6 +4093,7 @@ pgstat_recv_resetsharedcounter(PgStat_MsgResetsharedcounter *msg, int len)
 	{
 		/* Reset the global background writer statistics for the cluster. */
 		memset(&globalStats, 0, sizeof(globalStats));
+		globalStats.stat_reset_timestamp = GetCurrentTimestamp();
 	}
 
 	/*
@@ -4066,6 +4118,8 @@ pgstat_recv_resetsinglecounter(PgStat_MsgResetsinglecounter *msg, int len)
 	if (!dbentry)
 		return;
 
+	/* Set the reset timestamp for the whole database */
+	dbentry->stat_reset_timestamp = GetCurrentTimestamp();
 
 	/* Remove object if it exists, ignore it if not */
 	if (msg->m_resettype == RESET_TABLE)
@@ -4188,7 +4242,47 @@ pgstat_recv_bgwriter(PgStat_MsgBgWriter *msg, int len)
 	globalStats.buf_written_clean += msg->m_buf_written_clean;
 	globalStats.maxwritten_clean += msg->m_maxwritten_clean;
 	globalStats.buf_written_backend += msg->m_buf_written_backend;
+	globalStats.buf_fsync_backend += msg->m_buf_fsync_backend;
 	globalStats.buf_alloc += msg->m_buf_alloc;
+}
+
+/* ----------
+ * pgstat_recv_recoveryconflict() -
+ *
+ *  Process as RECOVERYCONFLICT message.
+ * ----------
+ */
+static void
+pgstat_recv_recoveryconflict(PgStat_MsgRecoveryConflict *msg, int len)
+{
+	PgStat_StatDBEntry *dbentry;
+	dbentry = pgstat_get_db_entry(msg->m_databaseid, true);
+
+	switch (msg->m_reason)
+	{
+		case PROCSIG_RECOVERY_CONFLICT_DATABASE:
+			/*
+			 * Since we drop the information about the database as soon
+			 * as it replicates, there is no point in counting these
+			 * conflicts.
+			 */
+			break;
+		case PROCSIG_RECOVERY_CONFLICT_TABLESPACE:
+			dbentry->n_conflict_tablespace++;
+			break;
+		case PROCSIG_RECOVERY_CONFLICT_LOCK:
+			dbentry->n_conflict_lock++;
+			break;
+		case PROCSIG_RECOVERY_CONFLICT_SNAPSHOT:
+			dbentry->n_conflict_snapshot++;
+			break;
+		case PROCSIG_RECOVERY_CONFLICT_BUFFERPIN:
+			dbentry->n_conflict_bufferpin++;
+			break;
+		case PROCSIG_RECOVERY_CONFLICT_STARTUP_DEADLOCK:
+			dbentry->n_conflict_startup_deadlock++;
+			break;
+	}
 }
 
 /* ----------

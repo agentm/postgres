@@ -49,6 +49,7 @@
 #define GZCLOSE(fh) fclose(fh)
 #define GZWRITE(p, s, n, fh) (fwrite(p, s, n, fh) * (s))
 #define GZREAD(p, s, n, fh) fread(p, s, n, fh)
+/* this is just the redefinition of a libz constant */
 #define Z_DEFAULT_COMPRESSION (-1)
 
 typedef struct _z_stream
@@ -130,12 +131,6 @@ typedef void (*ClonePtr) (struct _archiveHandle * AH);
 typedef void (*DeClonePtr) (struct _archiveHandle * AH);
 
 typedef size_t (*CustomOutPtr) (struct _archiveHandle * AH, const void *buf, size_t len);
-
-typedef struct _outputContext
-{
-	void	   *OF;
-	int			gzOut;
-} OutputContext;
 
 typedef enum
 {
@@ -266,7 +261,11 @@ typedef struct _archiveHandle
 	DumpId		maxDumpId;		/* largest DumpId among all TOC entries */
 
 	struct _tocEntry *currToc;	/* Used when dumping data */
-	int			compression;	/* Compression requested on open */
+	int			compression;	/* Compression requested on open
+								 * Possible values for compression:
+								 *  -1   Z_DEFAULT_COMPRESSION
+								 *   0	COMPRESSION_NONE
+								 *  1-9	levels for gzip compression */
 	ArchiveMode mode;			/* File mode - r or w */
 	void	   *formatData;		/* Header data specific to file format */
 
@@ -321,6 +320,8 @@ typedef struct _tocEntry
 	struct _tocEntry *par_next; /* these are NULL if not in either list */
 	bool		created;		/* set for DATA member if TABLE was created */
 	int			depCount;		/* number of dependencies not yet restored */
+	DumpId	   *revDeps;		/* dumpIds of objects depending on this one */
+	int			nRevDeps;		/* number of such dependencies */
 	DumpId	   *lockDeps;		/* dumpIds of objects this one needs lock on */
 	int			nLockDeps;		/* number of such dependencies */
 } TocEntry;
@@ -369,6 +370,7 @@ extern void EndRestoreBlobs(ArchiveHandle *AH);
 extern void InitArchiveFmt_Custom(ArchiveHandle *AH);
 extern void InitArchiveFmt_Files(ArchiveHandle *AH);
 extern void InitArchiveFmt_Null(ArchiveHandle *AH);
+extern void InitArchiveFmt_Directory(ArchiveHandle *AH);
 extern void InitArchiveFmt_Tar(ArchiveHandle *AH);
 
 extern bool isValidTarHeader(char *header);

@@ -3,7 +3,7 @@
  * parse_func.c
  *		handle function calls in parser
  *
- * Portions Copyright (c) 1996-2010, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2011, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -78,6 +78,7 @@ ParseFuncOrColumn(ParseState *pstate, List *funcname, List *fargs,
 	bool		retset;
 	int			nvargs;
 	FuncDetailCode fdresult;
+	Oid			funccollid;
 
 	/*
 	 * Most of the rest of the parser just assumes that functions do not have
@@ -343,6 +344,12 @@ ParseFuncOrColumn(ParseState *pstate, List *funcname, List *fargs,
 	/* perform the necessary typecasting of arguments */
 	make_fn_arguments(pstate, fargs, actual_arg_types, declared_arg_types);
 
+	/* XXX: If we knew which functions required collation information,
+	 * we could selectively set the last argument to true here. */
+	funccollid = select_common_collation(pstate, fargs, false);
+	if (!OidIsValid(funccollid))
+		funccollid = get_typcollation(rettype);
+
 	/*
 	 * If it's a variadic function call, transform the last nvargs arguments
 	 * into an array --- unless it's an "any" variadic.
@@ -383,6 +390,7 @@ ParseFuncOrColumn(ParseState *pstate, List *funcname, List *fargs,
 		funcexpr->funcretset = retset;
 		funcexpr->funcformat = COERCE_EXPLICIT_CALL;
 		funcexpr->args = fargs;
+		funcexpr->collid = funccollid;
 		funcexpr->location = location;
 
 		retval = (Node *) funcexpr;
@@ -396,6 +404,7 @@ ParseFuncOrColumn(ParseState *pstate, List *funcname, List *fargs,
 		aggref->aggtype = rettype;
 		/* args, aggorder, aggdistinct will be set by transformAggregateCall */
 		aggref->aggstar = agg_star;
+		aggref->collid = funccollid;
 		/* agglevelsup will be set by transformAggregateCall */
 		aggref->location = location;
 
@@ -453,6 +462,7 @@ ParseFuncOrColumn(ParseState *pstate, List *funcname, List *fargs,
 		/* winref will be set by transformWindowFuncCall */
 		wfunc->winstar = agg_star;
 		wfunc->winagg = (fdresult == FUNCDETAIL_AGGREGATE);
+		wfunc->collid = funccollid;
 		wfunc->location = location;
 
 		/*
@@ -985,8 +995,13 @@ func_get_detail(List *funcname,
 		 * can't write "foo[] (something)" as a function call.  In theory
 		 * someone might want to invoke it as "_foo (something)" but we have
 		 * never supported that historically, so we can insist that people
-		 * write it as a normal cast instead.  Lack of historical support is
-		 * also the reason for not considering composite-type casts here.
+		 * write it as a normal cast instead.
+		 *
+		 * We also reject the specific case of COERCEVIAIO for a composite
+		 * source type and a string-category target type.  This is a case that
+		 * find_coercion_pathway() allows by default, but experience has shown
+		 * that it's too commonly invoked by mistake.  So, again, insist that
+		 * people use cast syntax if they want to do that.
 		 *
 		 * NB: it's important that this code does not exceed what coerce_type
 		 * can do, because the caller will try to apply coerce_type if we
@@ -1017,8 +1032,23 @@ func_get_detail(List *funcname,
 					cpathtype = find_coercion_pathway(targetType, sourceType,
 													  COERCION_EXPLICIT,
 													  &cfuncid);
-					iscoercion = (cpathtype == COERCION_PATH_RELABELTYPE ||
-								  cpathtype == COERCION_PATH_COERCEVIAIO);
+					switch (cpathtype)
+					{
+						case COERCION_PATH_RELABELTYPE:
+							iscoercion = true;
+							break;
+						case COERCION_PATH_COERCEVIAIO:
+							if ((sourceType == RECORDOID ||
+								 ISCOMPLEX(sourceType)) &&
+								TypeCategory(targetType) == TYPCATEGORY_STRING)
+								iscoercion = false;
+							else
+								iscoercion = true;
+							break;
+						default:
+							iscoercion = false;
+							break;
+					}
 				}
 
 				if (iscoercion)
@@ -1283,7 +1313,7 @@ FuncNameAsType(List *funcname)
 	Oid			result;
 	Type		typtup;
 
-	typtup = LookupTypeName(NULL, makeTypeNameFromNameList(funcname), NULL);
+	typtup = LookupTypeName(NULL, makeTypeNameFromNameList(funcname), NULL, NULL);
 	if (typtup == NULL)
 		return InvalidOid;
 
@@ -1360,6 +1390,7 @@ ParseComplexProjection(ParseState *pstate, char *funcname, Node *first_arg,
 			fselect->fieldnum = i + 1;
 			fselect->resulttype = att->atttypid;
 			fselect->resulttypmod = att->atttypmod;
+			fselect->resultcollation = att->attcollation;
 			return (Node *) fselect;
 		}
 	}
@@ -1469,7 +1500,7 @@ LookupTypeNameOid(const TypeName *typename)
 	Oid			result;
 	Type		typtup;
 
-	typtup = LookupTypeName(NULL, typename, NULL);
+	typtup = LookupTypeName(NULL, typename, NULL, NULL);
 	if (typtup == NULL)
 		ereport(ERROR,
 				(errcode(ERRCODE_UNDEFINED_OBJECT),

@@ -3,7 +3,7 @@
  * nodeFuncs.h
  *		Various general-purpose manipulations of Node trees
  *
- * Portions Copyright (c) 1996-2010, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2011, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/nodes/nodeFuncs.h
@@ -27,6 +27,8 @@
 
 extern Oid	exprType(Node *expr);
 extern int32 exprTypmod(Node *expr);
+extern Oid	exprCollation(Node *expr);
+extern Oid coercion_expression_result_collation(Oid resulttype, Node *arg);
 extern bool exprIsLengthCoercion(Node *expr, int32 *coercedTypmod);
 extern bool expression_returns_set(Node *clause);
 

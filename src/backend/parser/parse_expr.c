@@ -3,7 +3,7 @@
  * parse_expr.c
  *	  handle expressions in parser
  *
- * Portions Copyright (c) 1996-2010, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2011, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -65,6 +65,7 @@ static Node *transformWholeRowRef(ParseState *pstate, RangeTblEntry *rte,
 static Node *transformIndirection(ParseState *pstate, Node *basenode,
 					 List *indirection);
 static Node *transformTypeCast(ParseState *pstate, TypeCast *tc);
+static Node *transformCollateClause(ParseState *pstate, CollateClause *c);
 static Node *make_row_comparison_op(ParseState *pstate, List *opname,
 					   List *largs, List *rargs, int location);
 static Node *make_row_distinct_op(ParseState *pstate, List *opname,
@@ -146,6 +147,12 @@ transformExpr(ParseState *pstate, Node *expr)
 			{
 				TypeCast   *tc = (TypeCast *) expr;
 
+				if (tc->typeName->collnames)
+					ereport(ERROR,
+							(errcode(ERRCODE_SYNTAX_ERROR),
+							 errmsg("COLLATE clause not allowed in cast target"),
+							 parser_errposition(pstate, tc->typeName->location)));
+
 				/*
 				 * If the subject of the typecast is an ARRAY[] construct and
 				 * the target type is an array type, we invoke
@@ -159,21 +166,19 @@ transformExpr(ParseState *pstate, Node *expr)
 					Oid			elementType;
 					int32		targetTypmod;
 
-					targetType = typenameTypeId(pstate, tc->typeName,
-												&targetTypmod);
+					typenameTypeIdAndMod(pstate, tc->typeName,
+										 &targetType, &targetTypmod);
+					/*
+					 * If target is a domain over array, work with the base
+					 * array type here.  transformTypeCast below will cast the
+					 * array type to the domain.  In the usual case that the
+					 * target is not a domain, transformTypeCast is a no-op.
+					 */
+					targetType = getBaseTypeAndTypmod(targetType,
+													  &targetTypmod);
 					elementType = get_element_type(targetType);
 					if (OidIsValid(elementType))
 					{
-						/*
-						 * tranformArrayExpr doesn't know how to check domain
-						 * constraints, so ask it to return the base type
-						 * instead. transformTypeCast below will cast it to
-						 * the domain. In the usual case that the target is
-						 * not a domain, transformTypeCast is a no-op.
-						 */
-						targetType = getBaseTypeAndTypmod(targetType,
-														  &targetTypmod);
-
 						tc = copyObject(tc);
 						tc->arg = transformArrayExpr(pstate,
 													 (A_ArrayExpr *) tc->arg,
@@ -186,6 +191,10 @@ transformExpr(ParseState *pstate, Node *expr)
 				result = transformTypeCast(pstate, tc);
 				break;
 			}
+
+		case T_CollateClause:
+			result = transformCollateClause(pstate, (CollateClause *) expr);
+			break;
 
 		case T_A_Expr:
 			{
@@ -425,6 +434,7 @@ transformIndirection(ParseState *pstate, Node *basenode, List *indirection)
 														   exprType(result),
 														   InvalidOid,
 														   exprTypmod(result),
+														   exprCollation(result),
 														   subscripts,
 														   NULL);
 			subscripts = NIL;
@@ -446,6 +456,7 @@ transformIndirection(ParseState *pstate, Node *basenode, List *indirection)
 												   exprType(result),
 												   InvalidOid,
 												   exprTypmod(result),
+												   exprCollation(result),
 												   subscripts,
 												   NULL);
 
@@ -1033,7 +1044,7 @@ transformAExprOf(ParseState *pstate, A_Expr *a)
 	ltype = exprType(lexpr);
 	foreach(telem, (List *) a->rexpr)
 	{
-		rtype = typenameTypeId(pstate, lfirst(telem), NULL);
+		rtype = typenameTypeId(pstate, lfirst(telem));
 		matched = (rtype == ltype);
 		if (matched)
 			break;
@@ -1269,6 +1280,7 @@ transformCaseExpr(ParseState *pstate, CaseExpr *c)
 		placeholder = makeNode(CaseTestExpr);
 		placeholder->typeId = exprType(arg);
 		placeholder->typeMod = exprTypmod(arg);
+		placeholder->collation = exprCollation(arg);
 	}
 	else
 		placeholder = NULL;
@@ -1352,6 +1364,8 @@ transformCaseExpr(ParseState *pstate, CaseExpr *c)
 								  ptype,
 								  "CASE/WHEN");
 	}
+
+	newc->casecollation = select_common_collation(pstate, resultexprs, true);
 
 	newc->location = c->location;
 
@@ -1463,6 +1477,7 @@ transformSubLink(ParseState *pstate, SubLink *sublink)
 			param->paramid = tent->resno;
 			param->paramtype = exprType((Node *) tent->expr);
 			param->paramtypmod = exprTypmod((Node *) tent->expr);
+			param->paramcollation = exprCollation((Node *) tent->expr);
 			param->location = -1;
 
 			right_list = lappend(right_list, param);
@@ -1706,6 +1721,7 @@ transformCoalesceExpr(ParseState *pstate, CoalesceExpr *c)
 	}
 
 	newc->args = newcoercedargs;
+	newc->coalescecollation = select_common_collation(pstate, newcoercedargs, true);
 	newc->location = c->location;
 	return (Node *) newc;
 }
@@ -1730,6 +1746,7 @@ transformMinMaxExpr(ParseState *pstate, MinMaxExpr *m)
 	}
 
 	newm->minmaxtype = select_common_type(pstate, newargs, funcname, NULL);
+	newm->collid = select_common_collation(pstate, newargs, false);
 
 	/* Convert arguments if necessary */
 	foreach(args, newargs)
@@ -1891,7 +1908,7 @@ transformXmlSerialize(ParseState *pstate, XmlSerialize *xs)
 													 XMLOID,
 													 "XMLSERIALIZE"));
 
-	targetType = typenameTypeId(pstate, xs->typeName, &targetTypmod);
+	typenameTypeIdAndMod(pstate, xs->typeName, &targetType, &targetTypmod);
 
 	xexpr->xmloption = xs->xmloption;
 	xexpr->location = xs->location;
@@ -2015,12 +2032,6 @@ transformCurrentOfExpr(ParseState *pstate, CurrentOfExpr *cexpr)
 
 /*
  * Construct a whole-row reference to represent the notation "relation.*".
- *
- * A whole-row reference is a Var with varno set to the correct range
- * table entry, and varattno == 0 to signal that it references the whole
- * tuple.  (Use of zero here is unclean, since it could easily be confused
- * with error cases, but it's not worth changing now.)  The vartype indicates
- * a rowtype; either a named composite type, or RECORD.
  */
 static Node *
 transformWholeRowRef(ParseState *pstate, RangeTblEntry *rte, int location)
@@ -2028,80 +2039,14 @@ transformWholeRowRef(ParseState *pstate, RangeTblEntry *rte, int location)
 	Var		   *result;
 	int			vnum;
 	int			sublevels_up;
-	Oid			toid;
 
 	/* Find the RTE's rangetable location */
-
 	vnum = RTERangeTablePosn(pstate, rte, &sublevels_up);
 
 	/* Build the appropriate referencing node */
+	result = makeWholeRowVar(rte, vnum, sublevels_up);
 
-	switch (rte->rtekind)
-	{
-		case RTE_RELATION:
-			/* relation: the rowtype is a named composite type */
-			toid = get_rel_type_id(rte->relid);
-			if (!OidIsValid(toid))
-				elog(ERROR, "could not find type OID for relation %u",
-					 rte->relid);
-			result = makeVar(vnum,
-							 InvalidAttrNumber,
-							 toid,
-							 -1,
-							 sublevels_up);
-			break;
-		case RTE_FUNCTION:
-			toid = exprType(rte->funcexpr);
-			if (type_is_rowtype(toid))
-			{
-				/* func returns composite; same as relation case */
-				result = makeVar(vnum,
-								 InvalidAttrNumber,
-								 toid,
-								 -1,
-								 sublevels_up);
-			}
-			else
-			{
-				/*
-				 * func returns scalar; instead of making a whole-row Var,
-				 * just reference the function's scalar output.  (XXX this
-				 * seems a tad inconsistent, especially if "f.*" was
-				 * explicitly written ...)
-				 */
-				result = makeVar(vnum,
-								 1,
-								 toid,
-								 -1,
-								 sublevels_up);
-			}
-			break;
-		case RTE_VALUES:
-			toid = RECORDOID;
-			/* returns composite; same as relation case */
-			result = makeVar(vnum,
-							 InvalidAttrNumber,
-							 toid,
-							 -1,
-							 sublevels_up);
-			break;
-		default:
-
-			/*
-			 * RTE is a join or subselect.	We represent this as a whole-row
-			 * Var of RECORD type.	(Note that in most cases the Var will be
-			 * expanded to a RowExpr during planning, but that is not our
-			 * concern here.)
-			 */
-			result = makeVar(vnum,
-							 InvalidAttrNumber,
-							 RECORDOID,
-							 -1,
-							 sublevels_up);
-			break;
-	}
-
-	/* location is not filled in by makeVar */
+	/* location is not filled in by makeWholeRowVar */
 	result->location = location;
 
 	/* mark relation as requiring whole-row SELECT access */
@@ -2126,7 +2071,7 @@ transformTypeCast(ParseState *pstate, TypeCast *tc)
 	int32		targetTypmod;
 	int			location;
 
-	targetType = typenameTypeId(pstate, tc->typeName, &targetTypmod);
+	typenameTypeIdAndMod(pstate, tc->typeName, &targetType, &targetTypmod);
 
 	if (inputType == InvalidOid)
 		return expr;			/* do nothing if NULL input */
@@ -2157,6 +2102,36 @@ transformTypeCast(ParseState *pstate, TypeCast *tc)
 }
 
 /*
+ * Handle an explicit COLLATE clause.
+ *
+ * Transform the argument, and look up the collation name.
+ */
+static Node *
+transformCollateClause(ParseState *pstate, CollateClause *c)
+{
+	CollateClause *newc;
+	Oid		argtype;
+
+	newc = makeNode(CollateClause);
+	newc->arg = (Expr *) transformExpr(pstate, (Node *) c->arg);
+
+	argtype = exprType((Node *) newc->arg);
+	/* The unknown type is not collatable, but coerce_type() takes
+	 * care of it separately, so we'll let it go here. */
+	if (!type_is_collatable(argtype) && argtype != UNKNOWNOID)
+		ereport(ERROR,
+				(errcode(ERRCODE_SYNTAX_ERROR),
+				 errmsg("collations are not supported by type %s",
+						format_type_be(argtype))));
+
+	newc->collOid = LookupCollation(pstate, c->collnames, c->location);
+	newc->collnames = c->collnames;
+	newc->location = c->location;
+
+	return (Node *) newc;
+}
+
+/*
  * Transform a "row compare-op row" construct
  *
  * The inputs are lists of already-transformed expressions.
@@ -2177,6 +2152,7 @@ make_row_comparison_op(ParseState *pstate, List *opname,
 	List	   *opexprs;
 	List	   *opnos;
 	List	   *opfamilies;
+	List	   *collids;
 	ListCell   *l,
 			   *r;
 	List	  **opfamily_lists;
@@ -2347,6 +2323,7 @@ make_row_comparison_op(ParseState *pstate, List *opname,
 	 * possibility that make_op inserted coercion operations.
 	 */
 	opnos = NIL;
+	collids = NIL;
 	largs = NIL;
 	rargs = NIL;
 	foreach(l, opexprs)
@@ -2354,6 +2331,7 @@ make_row_comparison_op(ParseState *pstate, List *opname,
 		OpExpr	   *cmp = (OpExpr *) lfirst(l);
 
 		opnos = lappend_oid(opnos, cmp->opno);
+		collids = lappend_oid(collids, cmp->collid);
 		largs = lappend(largs, linitial(cmp->args));
 		rargs = lappend(rargs, lsecond(cmp->args));
 	}
@@ -2362,6 +2340,7 @@ make_row_comparison_op(ParseState *pstate, List *opname,
 	rcexpr->rctype = rctype;
 	rcexpr->opnos = opnos;
 	rcexpr->opfamilies = opfamilies;
+	rcexpr->collids = collids;
 	rcexpr->largs = largs;
 	rcexpr->rargs = rargs;
 

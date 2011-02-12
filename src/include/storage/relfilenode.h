@@ -4,7 +4,7 @@
  *	  Physical access information for relations.
  *
  *
- * Portions Copyright (c) 1996-2010, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2011, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/storage/relfilenode.h
@@ -27,7 +27,8 @@ typedef enum ForkNumber
 	InvalidForkNumber = -1,
 	MAIN_FORKNUM = 0,
 	FSM_FORKNUM,
-	VISIBILITYMAP_FORKNUM
+	VISIBILITYMAP_FORKNUM,
+	INIT_FORKNUM	
 
 	/*
 	 * NOTE: if you add a new fork, change MAX_FORKNUM below and update the
@@ -35,7 +36,7 @@ typedef enum ForkNumber
 	 */
 } ForkNumber;
 
-#define MAX_FORKNUM		VISIBILITYMAP_FORKNUM
+#define MAX_FORKNUM		INIT_FORKNUM
 
 /*
  * RelFileNode must provide all that we need to know to physically access

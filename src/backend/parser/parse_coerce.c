@@ -3,7 +3,7 @@
  * parse_coerce.c
  *		handle type coercions/conversions for parser
  *
- * Portions Copyright (c) 1996-2010, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2011, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -15,6 +15,8 @@
 #include "postgres.h"
 
 #include "catalog/pg_cast.h"
+#include "catalog/pg_class.h"
+#include "catalog/pg_collation.h"
 #include "catalog/pg_inherits_fn.h"
 #include "catalog/pg_proc.h"
 #include "catalog/pg_type.h"
@@ -48,6 +50,7 @@ static Node *coerce_record_to_complex(ParseState *pstate, Node *node,
 						 CoercionForm cformat,
 						 int location);
 static bool is_complex_array(Oid typid);
+static bool typeIsOfTypedTable(Oid reltypeId, Oid reloftypeId);
 
 
 /*
@@ -214,6 +217,7 @@ coerce_type(ParseState *pstate, Node *node,
 
 		newcon->consttype = baseTypeId;
 		newcon->consttypmod = inputTypeMod;
+		newcon->constcollid = get_typcollation(newcon->consttype);
 		newcon->constlen = typeLen(targetType);
 		newcon->constbyval = typeByVal(targetType);
 		newcon->constisnull = con->constisnull;
@@ -274,6 +278,14 @@ coerce_type(ParseState *pstate, Node *node,
 												 location);
 		if (result)
 			return result;
+	}
+	if (IsA(node, CollateClause))
+	{
+		CollateClause *cc = (CollateClause *) node;
+
+		cc->arg = (Expr *) coerce_type(pstate, (Node *) cc->arg, inputTypeId, targetTypeId, targetTypeMod,
+									   ccontext, cformat, location);
+		return (Node *) cc;
 	}
 	pathtype = find_coercion_pathway(targetTypeId, inputTypeId, ccontext,
 									 &funcId);
@@ -371,7 +383,8 @@ coerce_type(ParseState *pstate, Node *node,
 		/* NB: we do NOT want a RelabelType here */
 		return node;
 	}
-	if (typeInheritsFrom(inputTypeId, targetTypeId))
+	if (typeInheritsFrom(inputTypeId, targetTypeId)
+		|| typeIsOfTypedTable(inputTypeId, targetTypeId))
 	{
 		/*
 		 * Input class type is a subclass of target, so generate an
@@ -482,7 +495,8 @@ can_coerce_type(int nargs, Oid *input_typeids, Oid *target_typeids,
 		/*
 		 * If input is a class type that inherits from target, accept
 		 */
-		if (typeInheritsFrom(inputTypeId, targetTypeId))
+		if (typeInheritsFrom(inputTypeId, targetTypeId)
+			|| typeIsOfTypedTable(inputTypeId, targetTypeId))
 			continue;
 
 		/*
@@ -714,6 +728,7 @@ build_coercion_expression(Node *node,
 		FuncExpr   *fexpr;
 		List	   *args;
 		Const	   *cons;
+		Oid			collation;
 
 		Assert(OidIsValid(funcId));
 
@@ -745,7 +760,9 @@ build_coercion_expression(Node *node,
 			args = lappend(args, cons);
 		}
 
-		fexpr = makeFuncExpr(funcId, targetTypeId, args, cformat);
+		collation = coercion_expression_result_collation(targetTypeId, node);
+
+		fexpr = makeFuncExpr(funcId, targetTypeId, args, collation, cformat);
 		fexpr->location = location;
 		return (Node *) fexpr;
 	}
@@ -1908,6 +1925,9 @@ find_coercion_pathway(Oid targetTypeId, Oid sourceTypeId,
 		 * array types.  If so, and if the element types have a suitable cast,
 		 * report that we can coerce with an ArrayCoerceExpr.
 		 *
+		 * Note that the source type can be a domain over array, but not the
+		 * target, because ArrayCoerceExpr won't check domain constraints.
+		 *
 		 * Hack: disallow coercions to oidvector and int2vector, which
 		 * otherwise tend to capture coercions that should go to "real" array
 		 * types.  We want those types to be considered "real" arrays for many
@@ -1921,7 +1941,7 @@ find_coercion_pathway(Oid targetTypeId, Oid sourceTypeId,
 			Oid			sourceElem;
 
 			if ((targetElem = get_element_type(targetTypeId)) != InvalidOid &&
-				(sourceElem = get_element_type(sourceTypeId)) != InvalidOid)
+				(sourceElem = get_base_element_type(sourceTypeId)) != InvalidOid)
 			{
 				CoercionPathType elempathtype;
 				Oid			elemfuncid;
@@ -2001,10 +2021,8 @@ find_typmod_coercion_function(Oid typeId,
 	targetType = typeidType(typeId);
 	typeForm = (Form_pg_type) GETSTRUCT(targetType);
 
-	/* Check for a varlena array type (and not a domain) */
-	if (typeForm->typelem != InvalidOid &&
-		typeForm->typlen == -1 &&
-		typeForm->typtype != TYPTYPE_DOMAIN)
+	/* Check for a varlena array type */
+	if (typeForm->typelem != InvalidOid && typeForm->typlen == -1)
 	{
 		/* Yes, switch our attention to the element type */
 		typeId = typeForm->typelem;
@@ -2044,4 +2062,152 @@ is_complex_array(Oid typid)
 	Oid			elemtype = get_element_type(typid);
 
 	return (OidIsValid(elemtype) && ISCOMPLEX(elemtype));
+}
+
+
+/*
+ * Check whether reltypeId is the row type of a typed table of type
+ * reloftypeId.  (This is conceptually similar to the subtype
+ * relationship checked by typeInheritsFrom().)
+ */
+static bool
+typeIsOfTypedTable(Oid reltypeId, Oid reloftypeId)
+{
+	Oid relid = typeidTypeRelid(reltypeId);
+	bool result = false;
+
+	if (relid)
+	{
+		HeapTuple	tp;
+		Form_pg_class reltup;
+
+		tp = SearchSysCache1(RELOID, ObjectIdGetDatum(relid));
+		if (!HeapTupleIsValid(tp))
+			elog(ERROR, "cache lookup failed for relation %u", relid);
+
+		reltup = (Form_pg_class) GETSTRUCT(tp);
+		if (reltup->reloftype == reloftypeId)
+			result = true;
+
+		ReleaseSysCache(tp);
+	}
+
+	return result;
+}
+
+
+/*
+ * select_common_collation() -- determine one collation to apply for
+ * an expression node, for evaluating the expression itself or to
+ * label the result of the expression node.
+ *
+ * none_ok means that it is permitted to return "no" collation.  It is
+ * then not possible to sort the result value of whatever expression
+ * is applying this.  none_ok = true reflects the rules of SQL
+ * standard clause "Result of data type combinations", none_ok = false
+ * reflects the rules of clause "Collation determination" (in some
+ * cases invoked via "Grouping operations").
+ */
+Oid
+select_common_collation(ParseState *pstate, List *exprs, bool none_ok)
+{
+	ListCell   *lc;
+
+	/*
+	 * Check if there are any explicit collation derivations.  If so,
+	 * they must all be the same.
+	 */
+	foreach(lc, exprs)
+	{
+		Node	   *pexpr = (Node *) lfirst(lc);
+		Oid			pcoll = exprCollation(pexpr);
+		bool		pexplicit = IsA(pexpr, CollateClause);
+
+		if (pcoll && pexplicit)
+		{
+			ListCell	*lc2;
+			for_each_cell(lc2, lnext(lc))
+			{
+				Node	   *nexpr = (Node *) lfirst(lc2);
+				Oid			ncoll = exprCollation(nexpr);
+				bool		nexplicit = IsA(nexpr, CollateClause);
+
+				if (!ncoll || !nexplicit)
+					continue;
+
+				if (ncoll != pcoll)
+					ereport(ERROR,
+							(errcode(ERRCODE_COLLATION_MISMATCH),
+							 errmsg("collation mismatch between explicit collations \"%s\" and \"%s\"",
+									get_collation_name(pcoll),
+									get_collation_name(ncoll)),
+							 parser_errposition(pstate, exprLocation(nexpr))));
+			}
+
+			return pcoll;
+		}
+	}
+
+	/*
+	 * Check if there are any implicit collation derivations.
+	 */
+	foreach(lc, exprs)
+	{
+		Node	   *pexpr = (Node *) lfirst(lc);
+		Oid			pcoll = exprCollation(pexpr);
+
+		if (pcoll && pcoll != DEFAULT_COLLATION_OID)
+		{
+			ListCell	*lc2;
+			for_each_cell(lc2, lnext(lc))
+			{
+				Node	   *nexpr = (Node *) lfirst(lc2);
+				Oid			ncoll = exprCollation(nexpr);
+
+				if (!ncoll || ncoll == DEFAULT_COLLATION_OID)
+					continue;
+
+				if (ncoll != pcoll)
+				{
+					if (none_ok)
+						return InvalidOid;
+					ereport(ERROR,
+							(errcode(ERRCODE_COLLATION_MISMATCH),
+							 errmsg("collation mismatch between implicit collations \"%s\" and \"%s\"",
+									get_collation_name(pcoll),
+									get_collation_name(ncoll)),
+							 errhint("You can override the collation by applying the COLLATE clause to one or both expressions."),
+							 parser_errposition(pstate, exprLocation(nexpr))));
+				}
+			}
+
+			return pcoll;
+		}
+	}
+
+	foreach(lc, exprs)
+	{
+		Node	   *pexpr = (Node *) lfirst(lc);
+		Oid			pcoll = exprCollation(pexpr);
+
+		if (pcoll == DEFAULT_COLLATION_OID)
+		{
+			ListCell	*lc2;
+			for_each_cell(lc2, lnext(lc))
+			{
+				Node	   *nexpr = (Node *) lfirst(lc2);
+				Oid			ncoll = exprCollation(nexpr);
+
+				if (ncoll != pcoll)
+					break;
+			}
+
+			return pcoll;
+		}
+	}
+
+	/*
+	 * Else use default
+	 */
+	return InvalidOid;
 }
