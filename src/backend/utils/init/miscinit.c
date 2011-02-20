@@ -46,6 +46,9 @@
 
 
 #define DIRECTORY_LOCK_FILE		"postmaster.pid"
+static pid_t GetPIDHoldingLock(int fileDescriptor,bool exclusiveLockFlag);
+static int AcquireLock(int fileDescriptor,bool exclusiveLockFlag,bool waitForLock);
+static void WriteLockFileContents(char *lockFilePath,int lockFileFD,bool isPostmasterFlag,pid_t processPid,char *dataDirectoryPath,long startTime,int portNumber,char * socketDirectory);
 
 ProcessingMode Mode = InitProcessing;
 
@@ -737,7 +740,7 @@ CreateLockFile(const char *filename, bool amPostmaster,
 		 * Think not to make the file protection weaker than 0600.	See
 		 * comments below.
 		 */
-		fd = open(filename, O_RDWR | O_CREAT | O_EXCL, 0600);
+                fd = open(filename, O_RDWR | O_CREAT | O_EXCL, 0600);
 		if (fd >= 0)
 			break;				/* Success; exit the retry loop */
 
@@ -754,7 +757,7 @@ CreateLockFile(const char *filename, bool amPostmaster,
 		 * Read the file to get the old owner's PID.  Note race condition
 		 * here: file might have been deleted since we tried to create it.
 		 */
-		fd = open(filename, O_RDONLY, 0600);
+		fd = open(filename, O_RDWR, 0600);
 		if (fd < 0)
 		{
 			if (errno == ENOENT)
@@ -769,8 +772,33 @@ CreateLockFile(const char *filename, bool amPostmaster,
 					(errcode_for_file_access(),
 					 errmsg("could not read lock file \"%s\": %m",
 							filename)));
-		close(fd);
-
+                if(isDDLock)
+                  {
+                    /* Acquire the advisory lock */
+                    int success = AcquireLock(fd,true,false);
+                    if(success<0)
+                      {
+                        /* We failed to acquire the exclusive lock, so some other postmaster or children are running */
+                        pid_t pidHoldingLock;
+                        
+                        pidHoldingLock = GetPIDHoldingLock(fd,true);
+                        if(pidHoldingLock < 0) 
+                          {
+                            /* no pid found? Perhaps we hit a race condition (the lock was released between here and lock acquisition), but fail out anyway*/
+                            ereport(FATAL,
+                                    (errcode(ERRCODE_LOCK_FILE_EXISTS),
+                                     errmsg("the lock file is locked"),
+                                     errhint("another server process is running")));
+                          }
+                        ereport(FATAL,
+                                (errcode(ERRCODE_LOCK_FILE_EXISTS),
+                                 errmsg("the lock file is locked by process ID %d",pidHoldingLock),
+                                 errhint("another server process is still running- please kill it before starting a new postmaster")));
+                        /* As long the file descriptor is open, the lock is held */
+                        /* Do not close(fd);*/
+                      }
+                  }
+                
 		buffer[len] = '\0';
 		encoded_pid = atoi(buffer);
 
@@ -842,7 +870,8 @@ CreateLockFile(const char *filename, bool amPostmaster,
 		 * not find the shmem ID values in it; we can't treat that as an
 		 * error.
 		 */
-		if (isDDLock)
+                if(0)
+		//if (isDDLock)
 		{
 			char	   *ptr = buffer;
 			unsigned long id1,
@@ -954,10 +983,113 @@ CreateLockFile(const char *filename, bool amPostmaster,
  * directory to DataDir, so we can just use a relative path.  This
  * helps ensure that we are locking the directory we should be.
  */
+
+/* We hold onto the lockFile for the life of the postmaster to hold onto the advisory locks. */
+static int lockFileFD = 0;
+
 void
 CreateDataDirLockFile(bool amPostmaster)
 {
-	CreateLockFile(DIRECTORY_LOCK_FILE, amPostmaster, true, DataDir);
+  /* OLD: CreateLockFile(DIRECTORY_LOCK_FILE, amPostmaster, true, DataDir); */
+  int success = 0;
+  char *lockFilePath = DIRECTORY_LOCK_FILE;
+  pid_t pidHoldingLock;
+
+  /* open the directory lock file- whether or not it already exists is irrelevant because we will check for file locks */
+  lockFileFD = open(DIRECTORY_LOCK_FILE, O_RDWR | O_CREAT, 0600);
+  if(lockFileFD<0)
+    {
+      if(errno == EACCES)
+        {
+          ereport(FATAL,
+                  (errcode_for_file_access(),
+                   errmsg("could not access the lock file \"%s\": %m,", lockFilePath)));
+        }
+      else
+        {
+          ereport(FATAL,
+                  (errmsg("could not access the lock file \"%s\": %m", lockFilePath)));
+        }
+    }
+
+  /* Acquire the shared advisory lock without blocking*/
+  success = AcquireLock(lockFileFD,false,false); 
+  if(success < 0)
+    {
+      /* We failed to acquire the read lock, which is unlikely because we no one should be holding an exclusive lock on it. Oh well, abort. */
+      ereport(FATAL,
+              (errmsg("failed to acquire shared lock on file \"%s\": %m",lockFilePath)));
+    }
+  
+  /* Determine if acquiring an exclusive (write) lock would be denied. If so, there is another postmaster or postgres child process running, so abort. */
+  pidHoldingLock = GetPIDHoldingLock(lockFileFD,true);
+  if(pidHoldingLock < 0)
+    {
+      /* checking for a lock failed */
+      ereport(FATAL,
+              (errmsg("failed to check for exclusive lock on file \"%s\": %m", lockFilePath)));
+    }
+  else if(pidHoldingLock > 0)
+    {
+      /* there is another process holding the lock, so we must abort starting a new postmaster */
+      ereport(FATAL,
+              (errmsg("another postgresql process is running in the data directory \"%s\" with pid %d",DataDir,pidHoldingLock),
+               errhint("kill the other server processes to start a new postgresql server")));
+    }
+  /*no process would block the lock, so we are cleared for starting a new postmaster*/
+  WriteLockFileContents(lockFilePath,lockFileFD,
+                        true,
+                        getpid(),
+                        DataDir,
+                        (long)MyStartTime,
+                        PostPortNumber,
+#ifdef HAVE_UNIX_SOCKETS
+                        (*UnixSocketDir != '\0') ? UnixSocketDir : DEFAULT_PGSOCKET_DIR
+#else
+                         ""
+#endif
+                        );
+  /*                                            
+   * Arrange for automatic removal of lockfile at proc_exit.
+   */
+
+  on_proc_exit(UnlinkLockFile, PointerGetDatum(strdup(lockFilePath)));
+}
+
+static void WriteLockFileContents(char *lockFilePath,int lockFileFD,bool isPostmasterFlag,pid_t processPid,char *dataDirectoryPath,long startTime,int portNumber,char * socketDirectoryPath)
+{
+  char writeBuffer[MAXPGPATH * 2 + 256];  
+  snprintf(writeBuffer,sizeof(writeBuffer),"%d\n%s\n%ld\n%d\n%s\n",
+           isPostmasterFlag ? (int) processPid : -((int) processPid),
+           dataDirectoryPath,
+           startTime,
+           portNumber,
+           socketDirectoryPath
+           );
+  errno = 0;
+  if (write(lockFileFD, writeBuffer, strlen(writeBuffer)) != strlen(writeBuffer))
+    {
+      int                     save_errno = errno;
+      close(lockFileFD);
+      unlink(lockFilePath);
+      /* if write didn't set errno, assume problem is no disk space */
+      errno = save_errno ? save_errno : ENOSPC;
+      ereport(FATAL,
+              (errcode_for_file_access(),
+               errmsg("could not write lock file \"%s\": %m", lockFilePath)));
+    }
+  if (pg_fsync(lockFileFD) != 0)
+    {
+      int                     save_errno = errno;
+
+      close(lockFileFD);
+      unlink(lockFilePath);
+      errno = save_errno;
+      ereport(FATAL,
+              (errcode_for_file_access(),
+               errmsg("could not write lock file \"%s\": %m", lockFilePath)));
+    }
+  return;
 }
 
 /*
@@ -1030,14 +1162,17 @@ AddToDataDirLockFile(int target_line, const char *str)
 	int			lineno;
 	char	   *ptr;
 	char		buffer[BLCKSZ];
+        int success;
 
-	fd = open(DIRECTORY_LOCK_FILE, O_RDWR | PG_BINARY, 0);
-	if (fd < 0)
+	fd = lockFileFD;
+        /* rewind the file handle to rewrite it */
+        success = lseek(lockFileFD,0,SEEK_SET);
+	if (success < 0)
 	{
 		ereport(LOG,
 				(errcode_for_file_access(),
-				 errmsg("could not open file \"%s\": %m",
-						DIRECTORY_LOCK_FILE)));
+				 errmsg("could not seek lock file \"%s\": %m",
+                                        DIRECTORY_LOCK_FILE)));
 		return;
 	}
 	len = read(fd, buffer, sizeof(buffer) - 1);
@@ -1092,13 +1227,6 @@ AddToDataDirLockFile(int target_line, const char *str)
 		return;
 	}
 	if (pg_fsync(fd) != 0)
-	{
-		ereport(LOG,
-				(errcode_for_file_access(),
-				 errmsg("could not write to file \"%s\": %m",
-						DIRECTORY_LOCK_FILE)));
-	}
-	if (close(fd) != 0)
 	{
 		ereport(LOG,
 				(errcode_for_file_access(),
@@ -1299,4 +1427,38 @@ pg_bindtextdomain(const char *domain)
 		pg_bind_textdomain_codeset(domain);
 	}
 #endif
+}
+
+/* We can also offer the option to block until the other postmaster is cleared away using F_SETLKW */
+static int AcquireLock(int fileDescriptor,bool exclusiveLockFlag,bool waitForLock)
+{
+  struct flock lock = { 
+    .l_type = exclusiveLockFlag ? F_WRLCK : F_RDLCK,
+    .l_start = 0,
+    .l_whence = SEEK_SET,
+    .l_len = 100 
+  };
+  return fcntl(fileDescriptor , waitForLock ? F_SETLKW : F_SETLK, &lock);
+}
+
+static pid_t GetPIDHoldingLock(int fileDescriptor,bool exclusiveLockFlag)
+{
+  struct flock lock = {
+    .l_type = exclusiveLockFlag ? F_WRLCK : F_RDLCK,
+    .l_start = 0,
+    .l_whence = SEEK_SET,
+    .l_len = 100,
+    .l_pid = 0
+  };
+  int success;
+
+  success = fcntl(fileDescriptor,F_GETLK,&lock);
+  if(success < 0)
+    {
+      return (pid_t)success;
+    }
+  if(lock.l_whence == SEEK_SET)
+    return lock.l_pid;
+  else
+    return -1;
 }

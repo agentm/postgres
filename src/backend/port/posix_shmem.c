@@ -161,9 +161,6 @@ InternalIpcMemoryCreate(const char ipcName[IPCNameLength], uint8 instanceId, Siz
 	/* Register on-exit routine to detach new segment before deleting */
 	on_shmem_exit(IpcMemoryDetach, PointerGetDatum(shmaddr));
 
-	/* Record instance ID in lockfile for data directory. */
-	RecordSharedMemoryInLockFile((unsigned long) instanceId, 0);
-	
 	POSIXSharedMemoryFD = fd;
 	return shmaddr;
 }
