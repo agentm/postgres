@@ -3635,7 +3635,7 @@ PostgresMain(int argc, char *argv[], const char *username)
 		/*
 		 * Create lockfile for data directory.
 		 */
-		CreateDataDirLockFile(false);
+		CreateDataDirLockFile(false,false);
 	}
 
 	/* Early initialization */
@@ -3653,6 +3653,16 @@ PostgresMain(int argc, char *argv[], const char *username)
 #else
 	InitProcess();
 #endif
+        if(IsUnderPostmaster)
+          {
+            /* acquire the lock file advisory lock (to eliminate multiple-postmaster race conditions) 
+             * postgresql backends (postmaster children) must acquire the read lock to signify that there are backends operating in the specific data directory
+             * this needs to be done after InitProcess because the function needs access to the shared memory proc array
+             */
+            AcquireDataDirLock();        
+          }
+
+
 
 	/* We need to allow SIGINT, etc during the initial transaction */
 	PG_SETMASK(&UnBlockSig);

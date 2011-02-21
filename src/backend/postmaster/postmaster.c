@@ -484,6 +484,7 @@ PostmasterMain(int argc, char *argv[])
 	char	   *userDoption = NULL;
 	bool		listen_addr_saved = false;
 	int			i;
+        bool blockOnStartupLockOption = false;
 
 	MyProcPid = PostmasterPid = getpid();
 
@@ -529,7 +530,7 @@ PostmasterMain(int argc, char *argv[])
 	 * tcop/postgres.c (the option sets should not conflict) and with the
 	 * common help() function in main/main.c.
 	 */
-	while ((opt = getopt(argc, argv, "A:B:c:D:d:EeFf:h:ijk:lN:nOo:Pp:r:S:sTt:W:-:")) != -1)
+	while ((opt = getopt(argc, argv, "A:bB:c:D:d:EeFf:h:ijk:lN:nOo:Pp:r:S:sTt:W:-:")) != -1)
 	{
 		switch (opt)
 		{
@@ -537,6 +538,9 @@ PostmasterMain(int argc, char *argv[])
 				SetConfigOption("debug_assertions", optarg, PGC_POSTMASTER, PGC_S_ARGV);
 				break;
 
+                        case 'b':
+                               blockOnStartupLockOption = true;
+                                break;
 			case 'B':
 				SetConfigOption("shared_buffers", optarg, PGC_POSTMASTER, PGC_S_ARGV);
 				break;
@@ -790,7 +794,7 @@ PostmasterMain(int argc, char *argv[])
 	 * For the same reason, it's best to grab the TCP socket(s) before the
 	 * Unix socket.
 	 */
-	CreateDataDirLockFile(true);
+	CreateDataDirLockFile(true,blockOnStartupLockOption);
 
 	/*
 	 * If timezone is not set, determine what the OS uses.	(In theory this

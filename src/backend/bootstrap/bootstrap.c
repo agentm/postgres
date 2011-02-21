@@ -352,7 +352,7 @@ AuxiliaryProcessMain(int argc, char *argv[])
 
 	/* If standalone, create lockfile for data directory */
 	if (!IsUnderPostmaster)
-		CreateDataDirLockFile(false);
+          CreateDataDirLockFile(false,false);
 
 	SetProcessingMode(BootstrapProcessing);
 	IgnoreSystemIndexes = true;

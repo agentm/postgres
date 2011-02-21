@@ -373,7 +373,8 @@ extern char *local_preload_libraries_string;
 #define LOCK_FILE_LINE_LISTEN_ADDR	6
 #define LOCK_FILE_LINE_SHMEM_KEY	7
 
-extern void CreateDataDirLockFile(bool amPostmaster);
+extern void CreateDataDirLockFile(bool amPostmaster,bool blockOptionFlag);
+extern void AcquireDataDirLock(void);
 extern void CreateSocketLockFile(const char *socketfile, bool amPostmaster);
 extern void TouchSocketLockFile(void);
 extern void AddToDataDirLockFile(int target_line, const char *str);
