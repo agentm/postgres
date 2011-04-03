@@ -632,6 +632,9 @@ pgstat_start(void)
 			/* Lose the postmaster's on-exit routines */
 			on_exit_reset();
 
+			/* Hold on to the data directory lock for all long as we live.*/
+			AcquireDataDirLock();
+			
 			/* Drop our connection to postmaster's shared memory, as well */
 			PGSharedMemoryDetach();
 

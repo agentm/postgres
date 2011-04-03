@@ -368,6 +368,9 @@ StartAutoVacLauncher(void)
 			/* Lose the postmaster's on-exit routines */
 			on_exit_reset();
 
+                        /* Hold on to the data directory lock until this process dies. */
+                        AcquireDataDirLock();
+
 			AutoVacLauncherMain(0, NULL);
 			break;
 #endif

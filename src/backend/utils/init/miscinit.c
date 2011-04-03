@@ -52,6 +52,7 @@ static pid_t GetPIDHoldingLock(int fileDescriptor,bool exclusiveLockFlag);
 static int AcquireLock(int fileDescriptor,bool exclusiveLockFlag,bool waitForLock);
 static int ReleaseLock(int fileDescriptor);
 void AcquireDataDirLock();
+pid_t GetPIDHoldingDataDirLock();
 static void WriteLockFileContents(char *lockFilePath,int lockFileFD,bool isPostmasterFlag,pid_t processPid,char *dataDirectoryPath,long startTime,int portNumber,char * socketDirectory);
 
 /* enum used by CreateLockFile to report its success or error condition */
@@ -659,28 +660,8 @@ GetUserNameFromId(Oid roleid)
  * A data-directory lockfile can optionally contain a third line, containing
  * the key and ID for the shared memory block used by this postmaster.
  *
- * On successful lockfile creation, a proc_exit callback to remove the
- * lockfile is automatically created.
  *-------------------------------------------------------------------------
  */
-
-/*
- * proc_exit callback to remove a lockfile.
- */
-static void
-UnlinkLockFile(int status, Datum filename)
-{
-	char	   *fname = (char *) DatumGetPointer(filename);
-
-	if (fname != NULL)
-	{
-		if (unlink(fname) != 0)
-		{
-			/* Should we complain if the unlink fails? */
-		}
-		free(fname);
-	}
-}
 
 /* We hold onto the lockFile for the life of the process to hold onto the advisory locks. */
 static int DataDirLockFileFD = 0;
@@ -808,7 +789,7 @@ CreateLockFile(char *lockFilePath,bool amPostmaster,int *lockFileRetDescriptor,b
                          ""
 #endif
                         );
-  /* There is no need to remove the lock file because the locks synchronize access, not the existence of the file*/
+  /* There is no need to remove the lock file because the locks synchronize access, not the existence of the file. */
 
   if(lockFileRetDescriptor != NULL)
     *lockFileRetDescriptor = lockFileFD;
@@ -848,6 +829,13 @@ static void WriteLockFileContents(char *lockFilePath,int lockFileFD,bool isPostm
     }
   return;
 }
+
+/* Called by pg_ctl to determine when the postmaster is shutdown. */
+pid_t GetPIDHoldingDataDirLock(void)
+{
+	return GetPIDHoldingLock(DataDirLockFileFD,true);
+}
+
 
 /*
  * Called by backends when they startup to signify that the data directory is in use

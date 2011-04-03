@@ -26,6 +26,7 @@
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <fcntl.h>
 
 #ifdef HAVE_SYS_RESOURCE_H
 #include <sys/time.h>
@@ -268,27 +269,49 @@ get_pgpid(void)
 {
 	FILE	   *pidf;
 	long		pid;
+        struct flock lock = {
+          .l_type =  F_WRLCK,
+          .l_start = 0,
+          .l_whence = SEEK_SET,
+          .l_len = 100,
+          .l_pid = 0
+        };
+        int success;
 
 	pidf = fopen(pid_file, "r");
-	if (pidf == NULL)
-	{
-		/* No pid file, not an error on startup */
-		if (errno == ENOENT)
-			return 0;
-		else
-		{
-			write_stderr(_("%s: could not open PID file \"%s\": %s\n"),
-						 progname, pid_file, strerror(errno));
-			exit(1);
-		}
-	}
-	if (fscanf(pidf, "%ld", &pid) != 1)
-	{
-		write_stderr(_("%s: invalid data in PID file \"%s\"\n"),
-					 progname, pid_file);
-		exit(1);
-	}
+
+        /* Attempt to acquire an exclusive lock. If that fails, we know that an existing backend is still holding a read lock. See src/backend/utils/init/miscinit.c for more details. */
+        if(pidf == NULL)
+          {
+            if(errno == ENOENT)
+              {
+                /* No lock file found. */
+                return 0;
+              }
+            else 
+              {
+                write_stderr(_("%s: could not open PID file \"%s\": %s\n"),
+                             progname,pid_file,strerror(errno));
+                exit(1);
+              }
+          }
+        success = fcntl(fileno(pidf),F_GETLK,&lock);
 	fclose(pidf);
+        if(success < 0)
+          {
+            /* Failed syscall */
+            write_stderr(_("%s: failed to test lock status: %s"),progname,strerror(errno));
+            exit(1);
+          }
+        if(lock.l_whence == SEEK_SET)
+          /* There is a pid holding a lock. */
+          return lock.l_pid;
+        else if(lock.l_type == F_UNLCK)
+          /* No lock would block exclusive access. */
+          return 0;
+        else
+          return -1;
+
 	return (pgpid_t) pid;
 }
 
